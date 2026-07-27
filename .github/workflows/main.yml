@@ -144,6 +144,80 @@ jobs:
               os.makedirs(HERMES_HOME, exist_ok=True)
               json.dump(pool, open(POOL, "w"), indent=1)
 
+          def probe(provider, mid):
+              # Fire a REAL 1-token completion. Catalog presence does NOT mean
+              # the model is callable on your plan (free tier can SEE premier/
+              # labs models in /models but gets 4xx when calling them).
+              # Returns False only on a definitive 4xx = "not usable on this
+              # plan/key". 429 (busy) and 5xx/network issues fail open.
+              base = BASE if provider == "nvidia" else "https://api.mistral.ai/v1"
+              keys = KEY_NAMES if provider == "nvidia" else MISTRAL_KEY_NAMES
+              if not keys:
+                  return False
+              body = json.dumps({"model": mid, "max_tokens": 1,
+                                 "messages": [{"role": "user", "content": "hi"}]}).encode()
+              req = urllib.request.Request(base + "/chat/completions", data=body,
+                  headers={"Authorization": "Bearer " + os.environ[keys[0]],
+                           "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as r:
+                      r.read()
+                  return True
+              except urllib.error.HTTPError as e:
+                  return e.code == 429 or e.code >= 500
+              except Exception:
+                  return True
+
+          def prune_pool(pool):
+              # Two-stage check so bad models can never poison pool-auto:
+              #  1. LIVE catalog — drops retired/EOL models (HTTP 410).
+              #  2. probe() — drops models your PLAN cannot actually call.
+              # Fail-open: if a catalog fetch fails, stage 1 keeps entries.
+              live = {}
+              try:
+                  if KEY_NAMES:
+                      live["nvidia"] = set(fetch_models(BASE, KEY_NAMES[0]))
+              except Exception:
+                  pass
+              try:
+                  if MISTRAL_KEY_NAMES:
+                      live["mistral"] = set(fetch_models("https://api.mistral.ai/v1", MISTRAL_KEY_NAMES[0]))
+              except Exception:
+                  pass
+              kept, removed = [], []
+              for it in pool:
+                  # a provider with ZERO working keys has zero deployments:
+                  # its pool entries are useless, drop them
+                  keys_for = KEY_NAMES if it["provider"] == "nvidia" else MISTRAL_KEY_NAMES
+                  if not keys_for:
+                      removed.append(it["id"])
+                      continue
+                  cat = live.get(it["provider"])
+                  if cat is not None and it["id"] not in cat:
+                      removed.append(it["id"])
+                      continue
+                  if probe(it["provider"], it["id"]):
+                      kept.append(it)
+                  else:
+                      removed.append(it["id"])
+                  time.sleep(1.1)  # respect the 1 req/sec free-tier limit
+              return kept, removed
+
+          def auto_prune_loop():
+              # every 30 min: drop models retired MID-RUN and hot-reload router
+              while True:
+                  time.sleep(1800)
+                  try:
+                      kept, removed = prune_pool(load_pool())
+                      if removed and kept:
+                          save_pool(kept)
+                          write_config(kept)
+                          subprocess.Popen(["docker", "restart", "litellm"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          print("auto-pruned dead/EOL models: " + ", ".join(removed), flush=True)
+                  except Exception as e:
+                      print("auto-prune error: " + str(e), flush=True)
+
           def write_config(pool):
               L = ["model_list:"]
               def dep(alias, provider, mid):
@@ -156,6 +230,10 @@ jobs:
                       L.append('      model: "%s%s"' % (prefix, mid))
                       L.append("      api_key: os.environ/" + k)
                       L.append("      rpm: " + rpm)
+                      # tokens-per-minute budget: with pre-call checks on, the
+                      # router SKIPS keys whose TPM quota is spent this minute
+                      # instead of firing a request that will 429
+                      L.append("      tpm: " + ("400000" if provider == "nvidia" else "500000"))
               for it in pool:
                   # each selected model is callable by its own name...
                   dep(it["id"], it["provider"], it["id"])
@@ -170,7 +248,18 @@ jobs:
                     "  allowed_fails: 1",
                     "  cooldown_time: 30",
                     "  enable_pre_call_checks: true",
-                    "  timeout: 90"]
+                    "  timeout: 90",
+                    # NVIDIA NIM sometimes returns HTTP 400 for INFRA problems
+                    # ("DEGRADED function cannot be invoked") which is really a
+                    # deployment-specific outage, not a bad request. Retry
+                    # BadRequestError too so rotation moves to a healthy
+                    # model/key instead of instantly failing the user's turn.
+                    "  retry_policy:",
+                    "    BadRequestErrorRetries: 4",
+                    "    TimeoutErrorRetries: 5",
+                    "    RateLimitErrorRetries: 5",
+                    "    InternalServerErrorRetries: 5",
+                    "    ContentPolicyViolationErrorRetries: 2"]
               # NO fallbacks: the router NEVER silently swaps to a different
               # model. Rate limits are handled by rotating API keys of the
               # SAME model: 1 fail -> that key cools 30s -> next key, 5 retries.
@@ -367,7 +456,8 @@ jobs:
           }
           fetch('/api/models').then(r=>r.json()).then(d=>{
             catN=d.nvidia;catM=d.mistral||[];keys=d.keys||{};
-            d.pool.forEach(x=>pool.set(x.id,x.provider||'nvidia'));
+            d.pool.forEach(x=>{const cat=(x.provider==='mistral')?catM:catN;
+              if(!cat.length||cat.includes(x.id))pool.set(x.id,x.provider||'nvidia')});
             renderStats();render();info();
             document.getElementById('sub').textContent=d.errors.length?d.errors.join(' | ')
               :'Live \u00b7 catalog loaded';
@@ -526,7 +616,13 @@ jobs:
 
           if __name__ == "__main__":
               if "--init" in sys.argv:
-                  write_config(load_pool()); sys.exit(0)
+                  pool, removed = prune_pool(load_pool())
+                  if removed:
+                      save_pool(pool)
+                      print("pruned dead/EOL models: " + ", ".join(removed))
+                  write_config(pool); sys.exit(0)
+              import threading
+              threading.Thread(target=auto_prune_loop, daemon=True).start()
               app.run(host="0.0.0.0", port=7000, threaded=True)
           PYEOF
 
@@ -560,30 +656,49 @@ jobs:
             exit 1
           fi
 
-          # ── split bulk NVIDIA_KEYS (one per line; commas also OK) ──
+          # ── split + VALIDATE bulk NVIDIA_KEYS (one per line; commas also OK) ──
+          # every key is auth-checked against the live API; keys that return
+          # 401/403 (revoked/banned/typo) are DROPPED so they never poison the
+          # rotation pool. 429/timeouts do NOT drop a key (fail-open).
           : > /tmp/litellm.env
-          n=0
+          n=0; bad_n=0
           while IFS= read -r k; do
             k=$(echo "$k" | tr -d ' \r')
             [ -z "$k" ] && continue
-            n=$((n+1))
-            echo "NVIDIA_KEY_${n}=${k}" >> /tmp/litellm.env
+            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+              -H "Authorization: Bearer ${k}" https://integrate.api.nvidia.com/v1/models)
+            if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+              bad_n=$((bad_n+1))
+              echo "::warning::Dropping NVIDIA key #$((n+bad_n)) — auth check failed (HTTP $code)"
+            else
+              n=$((n+1))
+              echo "NVIDIA_KEY_${n}=${k}" >> /tmp/litellm.env
+            fi
+            sleep 1
           done < <(printf '%s\n' "$NVIDIA_KEYS" | tr ',' '\n')
-          echo "Loaded $n NVIDIA key(s)"
+          echo "NVIDIA keys: $n valid, $bad_n dropped"
           if [ "$n" -eq 0 ]; then
-            echo "::error::NVIDIA_KEYS secret is empty — add at least one key"
+            echo "::error::No working NVIDIA key — secret is empty or every key failed the auth check"
             exit 1
           fi
 
-          # ── split bulk MISTRAL_KEYS (one per line; commas also OK; optional) ──
-          m=0
+          # ── split + VALIDATE bulk MISTRAL_KEYS (one per line; commas also OK; optional) ──
+          m=0; bad_m=0
           while IFS= read -r k; do
             k=$(echo "$k" | tr -d ' \r')
             [ -z "$k" ] && continue
-            m=$((m+1))
-            echo "MISTRAL_KEY_${m}=${k}" >> /tmp/litellm.env
+            code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' \
+              -H "Authorization: Bearer ${k}" https://api.mistral.ai/v1/models)
+            if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+              bad_m=$((bad_m+1))
+              echo "::warning::Dropping Mistral key #$((m+bad_m)) — auth check failed (HTTP $code)"
+            else
+              m=$((m+1))
+              echo "MISTRAL_KEY_${m}=${k}" >> /tmp/litellm.env
+            fi
+            sleep 1
           done < <(printf '%s\n' "$MISTRAL_KEYS" | tr ',' '\n')
-          echo "Loaded $m Mistral key(s)"
+          echo "Mistral keys: $m valid, $bad_m dropped"
 
           # make the split keys visible to this shell + panel process
           set -a; source /tmp/litellm.env; set +a
@@ -628,7 +743,20 @@ jobs:
           fi
 
           # generate litellm config from YOUR pool (nothing hardcoded)
+          # --init also PRUNES models the provider has retired (HTTP 410 EOL)
           python3 /tmp/panel/app.py --init
+          if ! pool_ok; then
+            echo "::warning::All saved models are dead/EOL — pick a fresh pool: $PANEL_URL"
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              -d text="⚠️ All your saved models were retired by the provider — pool auto-cleaned. Open the panel and apply a fresh pool: ${PANEL_URL}" > /dev/null || true
+            for i in $(seq 1 240); do
+              pool_ok && break
+              sleep 15
+            done
+            pool_ok || { echo "::error::No model pool selected within 60 minutes"; exit 1; }
+            python3 /tmp/panel/app.py --init
+          fi
 
           docker rm -f litellm 2>/dev/null || true
           docker run -d --name litellm --network host \
