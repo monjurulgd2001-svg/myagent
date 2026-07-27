@@ -1,0 +1,885 @@
+name: Hermes Agent — Telegram + Slack + NVIDIA/Mistral Pool
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: hermes-agent
+  cancel-in-progress: false
+
+env:
+  RUN_MINUTES: 330
+  HERMES_HOME: /home/runner/.hermes
+  DATA_REPO: monjurulgd2001-svg/harmesprivatestorage
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ── 1. Pull persisted data from private repo ──
+      - name: Pull data repo
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          date +%s > /tmp/job_start
+          mkdir -p "$HERMES_HOME"
+          git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
+          if [ -d /tmp/data ]; then
+            rm -f /tmp/data/.env
+            rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
+            find "$HERMES_HOME" -name "*.gh-chunk.000" | while read -r first; do
+              base="${first%.gh-chunk.000}"
+              cat "${base}".gh-chunk.* > "$base"
+              rm -f "${base}".gh-chunk.*
+              echo "Reassembled: $base"
+            done
+          fi
+
+      # ── 2. Install Hermes Agent ──
+      - name: Install Hermes Agent
+        run: |
+          rm -rf "$HERMES_HOME/hermes-agent"
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # ── 3. Start SearXNG (free web search) ──
+      - name: Start SearXNG
+        run: |
+          mkdir -p /tmp/searxng
+          cat > /tmp/searxng/settings.yml <<'EOF'
+          use_default_settings: true
+          server:
+            secret_key: "hermes-searxng-secret"
+            limiter: false
+          search:
+            formats:
+              - html
+              - json
+          EOF
+          docker run -d --name searxng -p 8080:8080 \
+            -v /tmp/searxng:/etc/searxng \
+            searxng/searxng:latest
+          echo "Waiting for SearXNG..."
+          for i in $(seq 1 30); do
+            if curl -s "http://localhost:8080/search?q=test&format=json" | grep -q results; then
+              echo "SearXNG is ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "SearXNG failed to start"; exit 1
+
+      # ── 4. Start Camoufox (stealth browser, NON-headless via virtual display) ──
+      - name: Start Camoufox
+        run: |
+          # Xvfb = virtual display so the browser runs fully HEADED on the runner
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+          pip install -U "camoufox[geoip]" pyvirtualdisplay
+          python3 -m camoufox fetch
+          mkdir -p "$HERMES_HOME/browser-profile"
+          nohup python3 -c "
+          from camoufox.server import launch_server
+          launch_server(
+              headless='virtual',  # real headed browser inside a virtual display
+              port=9222, ws_path='hermes',
+              persistent_context=True,
+              user_data_dir='/home/runner/.hermes/browser-profile',
+              os='windows',
+          )
+          " > /tmp/camoufox.log 2>&1 &
+          echo "Waiting for Camoufox (headed/virtual)..."
+          for i in $(seq 1 30); do
+            if grep -q 'ws://' /tmp/camoufox.log 2>/dev/null; then
+              echo 'Camoufox ready (non-headless, virtual display)'; break
+            fi
+            sleep 3
+          done
+          cat /tmp/camoufox.log || true
+
+      # ── 5. Write model pool control panel ──
+      - name: Write control panel
+        run: |
+          pip install -q flask
+          mkdir -p /tmp/panel
+          cat > /tmp/panel/app.py <<'PYEOF'
+          import os, json, subprocess, sys, time, hmac, secrets, urllib.request, urllib.error
+          from flask import Flask, request, jsonify, make_response
+
+          app = Flask(__name__)
+          TOKEN = os.environ.get("PANEL_TOKEN", "")
+          if len(TOKEN) < 8:
+              print("FATAL: PANEL_TOKEN missing or too short (min 8 chars)")
+              sys.exit(1)
+          SESSION = secrets.token_hex(32)          # random per-run session cookie
+          FAILS = {"n": 0, "until": 0.0}           # brute-force lockout state
+          HERMES_HOME = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
+          POOL = os.path.join(HERMES_HOME, "pool.json")
+          CFG = "/tmp/litellm.yaml"
+          KEY_NAMES = sorted(k for k in os.environ if k.startswith("NVIDIA_KEY_") and os.environ[k])
+          MISTRAL_KEY_NAMES = sorted(k for k in os.environ if k.startswith("MISTRAL_KEY_") and os.environ[k])
+          MISTRAL_MODELS = ["mistral-large-latest", "mistral-medium-latest",
+                            "mistral-small-latest", "codestral-latest"]
+          BASE = "https://integrate.api.nvidia.com/v1"
+
+          def authed():
+              return hmac.compare_digest(request.cookies.get("s") or "", SESSION)
+
+          def deny():
+              return "Not Found", 404
+
+          def fetch_models(base, key):
+              r = urllib.request.Request(base + "/models",
+                  headers={"Authorization": "Bearer " + os.environ[key]})
+              with urllib.request.urlopen(r, timeout=30) as resp:
+                  return sorted(set(m["id"] for m in json.load(resp)["data"]))
+
+          def load_pool():
+              try:
+                  return [x for x in json.load(open(POOL)) if x.get("provider") in ("nvidia", "mistral")]
+              except Exception:
+                  return []
+
+          def save_pool(pool):
+              os.makedirs(HERMES_HOME, exist_ok=True)
+              json.dump(pool, open(POOL, "w"), indent=1)
+
+          def write_config(pool):
+              L = ["model_list:"]
+              def dep(alias, provider, mid):
+                  keys = KEY_NAMES if provider == "nvidia" else MISTRAL_KEY_NAMES
+                  prefix = "nvidia_nim/" if provider == "nvidia" else "mistral/"
+                  rpm = "40" if provider == "nvidia" else "30"
+                  for k in keys:
+                      L.append('  - model_name: "%s"' % alias)
+                      L.append("    litellm_params:")
+                      L.append('      model: "%s%s"' % (prefix, mid))
+                      L.append("      api_key: os.environ/" + k)
+                      L.append("      rpm: " + rpm)
+              for it in pool:
+                  # each selected model is callable by its own name...
+                  dep(it["id"], it["provider"], it["id"])
+                  # ...AND is a deployment of the auto-rotating "pool-auto" group:
+                  # every request to pool-auto round-robins across ALL selected
+                  # models x ALL keys automatically (no manual switching)
+                  dep("pool-auto", it["provider"], it["id"])
+              L += ["router_settings:",
+                    "  routing_strategy: simple-shuffle",
+                    "  num_retries: 5",
+                    "  retry_after: 5",
+                    "  allowed_fails: 1",
+                    "  cooldown_time: 30",
+                    "  enable_pre_call_checks: true",
+                    "  timeout: 90"]
+              # NO fallbacks: the router NEVER silently swaps to a different
+              # model. Rate limits are handled by rotating API keys of the
+              # SAME model: 1 fail -> that key cools 30s -> next key, 5 retries.
+              L += ["litellm_settings:",
+                    "  drop_params: true",
+                    "  request_timeout: 90"]
+              open(CFG, "w").write("\n".join(L) + "\n")
+
+          LOGIN = """<!doctype html><html><head><meta charset=utf-8>
+          <meta name=viewport content="width=device-width,initial-scale=1">
+          <title>Hermes Panel</title>
+          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+          <style>
+          :root{--bg:#070a12;--card:rgba(20,26,40,.72);--line:rgba(148,163,184,.14);--txt:#e8eef7;--dim:#8b98ad;--acc:#2dd4bf;--acc2:#8b5cf6}
+          *{box-sizing:border-box;margin:0}
+          body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}
+          .orb{position:fixed;border-radius:50%;filter:blur(90px);opacity:.5;pointer-events:none;animation:drift 16s ease-in-out infinite alternate}
+          .o1{width:480px;height:480px;background:radial-gradient(circle,#0d9488,transparent 70%);top:-140px;left:-120px}
+          .o2{width:520px;height:520px;background:radial-gradient(circle,#6d28d9,transparent 70%);bottom:-180px;right:-140px;animation-delay:-8s}
+          @keyframes drift{from{transform:translate(0,0) scale(1)}to{transform:translate(50px,36px) scale(1.12)}}
+          .box{position:relative;background:var(--card);backdrop-filter:blur(22px);border:1px solid var(--line);border-radius:22px;padding:44px 40px;width:370px;text-align:center;box-shadow:0 40px 90px rgba(0,0,0,.55);animation:up .5s cubic-bezier(.2,.9,.3,1.2)}
+          @keyframes up{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:none}}
+          .logo{width:60px;height:60px;margin:0 auto 18px;border-radius:18px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:flex;align-items:center;justify-content:center;font-size:28px;box-shadow:0 12px 34px rgba(45,212,191,.35)}
+          h1{font-size:19px;font-weight:800;letter-spacing:-.02em}
+          .tag{color:var(--dim);font-size:12.5px;margin:6px 0 26px}
+          .field{position:relative;margin-bottom:16px}
+          input{width:100%;background:rgba(8,12,22,.85);border:1px solid var(--line);border-radius:12px;color:var(--txt);padding:14px 46px 14px 15px;font-size:15px;outline:none;transition:.2s;font-family:inherit}
+          input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(45,212,191,.14)}
+          .eye{position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;color:var(--dim);font-size:16px;user-select:none}
+          button{width:100%;border:0;border-radius:12px;padding:14px;font-size:15px;font-weight:700;font-family:inherit;background:linear-gradient(135deg,var(--acc),#14b8a6);color:#032620;cursor:pointer;transition:.2s;box-shadow:0 10px 26px rgba(45,212,191,.28)}
+          button:hover{transform:translateY(-1px);filter:brightness(1.08)}
+          button:disabled{opacity:.55;cursor:wait;transform:none}
+          #err{color:#f87171;font-size:13px;min-height:18px;margin-top:14px}
+          .shake{animation:shake .4s}
+          @keyframes shake{20%,60%{transform:translateX(-7px)}40%,80%{transform:translateX(7px)}}
+          .foot{margin-top:22px;color:var(--dim);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+          </style></head><body>
+          <div class="orb o1"></div><div class="orb o2"></div>
+          <div class=box id=box>
+            <div class=logo>&#9884;</div>
+            <h1>Hermes Command Deck</h1>
+            <div class=tag>Model pool &amp; router control</div>
+            <form onsubmit="go(event)">
+              <div class=field>
+                <input type=password id=pw placeholder="Panel password" autofocus autocomplete=off>
+                <span class=eye onclick="tgl()" id=eye>&#128065;</span>
+              </div>
+              <button id=btn>Unlock console</button>
+            </form>
+            <div id=err></div>
+            <div class=foot>secured &middot; session-scoped &middot; rate-limited</div>
+          </div>
+          <script>
+          function tgl(){const p=document.getElementById('pw');p.type=p.type==='password'?'text':'password'}
+          async function go(e){e.preventDefault();
+            const b=document.getElementById('btn');b.disabled=true;b.textContent='Verifying...';
+            const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({password:document.getElementById('pw').value})})
+              .then(x=>x.json()).catch(()=>({ok:false,msg:'network error'}));
+            if(r.ok)location.reload();
+            else{b.disabled=false;b.textContent='Unlock console';
+              document.getElementById('err').textContent=r.msg;
+              const bx=document.getElementById('box');bx.classList.remove('shake');void bx.offsetWidth;bx.classList.add('shake');}
+          }
+          </script></body></html>"""
+
+          HTML = """<!doctype html><html><head><meta charset=utf-8>
+          <meta name=viewport content="width=device-width,initial-scale=1">
+          <title>Hermes Command Deck</title>
+          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+          <style>
+          :root{--bg:#070a12;--card:rgba(19,25,39,.66);--line:rgba(148,163,184,.13);--txt:#e8eef7;--dim:#8b98ad;--acc:#2dd4bf;--acc2:#8b5cf6;--ok:#34d399;--bad:#f87171;--warn:#fbbf24;--mono:'JetBrains Mono',ui-monospace,monospace}
+          *{box-sizing:border-box;margin:0}
+          body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--txt);padding-bottom:104px}
+          .orb{position:fixed;border-radius:50%;filter:blur(100px);opacity:.4;pointer-events:none;z-index:0;animation:drift 18s ease-in-out infinite alternate}
+          .o1{width:560px;height:560px;background:radial-gradient(circle,#0d9488,transparent 70%);top:-200px;left:-160px}
+          .o2{width:600px;height:600px;background:radial-gradient(circle,#6d28d9,transparent 70%);bottom:-240px;right:-180px;animation-delay:-9s}
+          @keyframes drift{from{transform:translate(0,0)}to{transform:translate(46px,30px)}}
+          nav{position:sticky;top:0;z-index:6;display:flex;align-items:center;gap:14px;padding:14px 26px;background:rgba(7,10,18,.8);backdrop-filter:blur(18px);border-bottom:1px solid var(--line)}
+          .logo{width:38px;height:38px;border-radius:12px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:flex;align-items:center;justify-content:center;font-size:19px;box-shadow:0 8px 22px rgba(45,212,191,.3)}
+          nav h1{font-size:16px;font-weight:800;letter-spacing:-.02em}
+          nav .crumb{font-size:11px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
+          .pill{margin-left:auto;display:flex;align-items:center;gap:8px;background:rgba(52,211,153,.09);border:1px solid rgba(52,211,153,.25);color:var(--ok);font-size:12px;font-weight:600;padding:6px 14px;border-radius:99px;max-width:46vw;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+          .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);animation:pulse 1.6s infinite}
+          @keyframes pulse{50%{opacity:.35}}
+          .wrap{position:relative;z-index:1;padding:22px 26px;max-width:860px;margin:0 auto}
+          .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:18px}
+          .stat{background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:16px;padding:16px 18px;position:relative;overflow:hidden;transition:.25s}
+          .stat:hover{transform:translateY(-2px);border-color:rgba(45,212,191,.3)}
+          .stat .bar{position:absolute;top:0;left:0;right:0;height:2.5px}
+          .stat .k{font-size:11px;color:var(--dim);letter-spacing:.09em;text-transform:uppercase;display:flex;align-items:center;gap:7px}
+          .stat .dot{width:8px;height:8px;border-radius:50%}
+          .stat .dot.on{background:var(--ok);box-shadow:0 0 10px var(--ok)}
+          .stat .dot.off{background:var(--bad);box-shadow:0 0 10px var(--bad)}
+          .stat .v{font-size:30px;font-weight:800;font-family:var(--mono);margin-top:6px;letter-spacing:-.03em}
+          .stat .s{font-size:11.5px;color:var(--dim);margin-top:2px}
+          .card{background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:0 26px 60px rgba(0,0,0,.35)}
+          .chead{display:flex;align-items:center;gap:10px;padding:15px 20px;border-bottom:1px solid var(--line)}
+          .chead h2{font-size:14px;font-weight:700}
+          .badge{background:rgba(139,92,246,.14);color:#c4b5fd;border:1px solid rgba(139,92,246,.3);font-size:11.5px;font-weight:600;padding:2px 11px;border-radius:99px;font-family:var(--mono)}
+          .chip{margin-left:auto;font-size:12px;font-weight:600;color:var(--dim);border:1px solid var(--line);background:transparent;border-radius:99px;padding:5px 14px;cursor:pointer;font-family:inherit;transition:.2s}
+          .chip.on{color:var(--acc);border-color:rgba(45,212,191,.4);background:rgba(45,212,191,.08)}
+          .sbox{position:relative;border-bottom:1px solid var(--line)}
+          .sbox .ico{position:absolute;left:18px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:14px}
+          .search{width:100%;background:rgba(8,12,22,.5);border:none;color:var(--txt);padding:13px 18px 13px 44px;font-size:13.5px;outline:none;font-family:inherit}
+          .search::placeholder{color:#5b6779}
+          .list{max-height:56vh;overflow-y:auto;padding:8px}
+          .list::-webkit-scrollbar{width:9px}
+          .list::-webkit-scrollbar-thumb{background:rgba(148,163,184,.18);border-radius:99px}
+          .row{display:flex;align-items:center;gap:12px;padding:9px 12px;border-radius:12px;margin:2px 0;border:1px solid transparent;transition:.15s}
+          .row:hover{background:rgba(148,163,184,.06)}
+          .row.sel{background:rgba(45,212,191,.07);border-color:rgba(45,212,191,.22)}
+          .row input{accent-color:var(--acc);width:16px;height:16px;flex:none;cursor:pointer}
+          .vend{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;border-radius:6px;background:rgba(139,92,246,.14);color:#c4b5fd;flex:none;font-family:var(--mono)}
+          .name{flex:1;font-size:13px;font-family:var(--mono);word-break:break-all}
+          .tbtn{background:rgba(148,163,184,.08);color:#9fb3c8;border:1px solid var(--line);border-radius:9px;padding:5px 14px;font-size:12px;font-weight:600;cursor:pointer;flex:none;font-family:inherit;transition:.2s}
+          .tbtn:hover{border-color:var(--acc);color:var(--acc);background:rgba(45,212,191,.08)}
+          .lat{font-size:11px;font-weight:600;padding:3px 9px;border-radius:99px;flex:none;white-space:nowrap;font-family:var(--mono)}
+          .lat.ok{background:rgba(52,211,153,.12);color:var(--ok);border:1px solid rgba(52,211,153,.3)}
+          .lat.bad{background:rgba(248,113,113,.1);color:var(--bad);border:1px solid rgba(248,113,113,.3);cursor:help}
+          .lat.tst{background:rgba(251,191,36,.1);color:var(--warn);border:1px solid rgba(251,191,36,.3)}
+          .skel{height:38px;border-radius:12px;margin:6px 4px;background:linear-gradient(90deg,rgba(148,163,184,.06) 25%,rgba(148,163,184,.14) 50%,rgba(148,163,184,.06) 75%);background-size:200% 100%;animation:sh 1.2s infinite}
+          @keyframes sh{from{background-position:200% 0}to{background-position:-200% 0}}
+          footer{position:fixed;left:0;right:0;bottom:0;z-index:6;background:rgba(7,10,18,.88);backdrop-filter:blur(18px);border-top:1px solid var(--line)}
+          .prog{height:3px;background:linear-gradient(90deg,var(--acc),var(--acc2));width:0%;transition:width .3s}
+          .fin{display:flex;gap:12px;align-items:center;padding:13px 26px;max-width:860px;margin:0 auto}
+          .info{flex:1;color:var(--dim);font-size:13px}
+          .info b{color:var(--txt);font-family:var(--mono)}
+          .btn{border:0;border-radius:12px;padding:13px 24px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:.2s}
+          .btn.primary{background:linear-gradient(135deg,var(--acc),#14b8a6);color:#032620;box-shadow:0 10px 26px rgba(45,212,191,.3)}
+          .btn.primary:hover{transform:translateY(-1px);filter:brightness(1.08)}
+          .btn.ghost{background:rgba(148,163,184,.08);color:var(--txt);border:1px solid var(--line)}
+          .btn.ghost:hover{border-color:var(--acc);color:var(--acc)}
+          #toasts{position:fixed;top:70px;right:20px;z-index:9;display:flex;flex-direction:column;gap:10px}
+          .toast{background:rgba(19,25,39,.94);backdrop-filter:blur(14px);border:1px solid var(--line);border-left:3px solid var(--acc);padding:12px 16px;border-radius:12px;font-size:13px;max-width:380px;box-shadow:0 16px 40px rgba(0,0,0,.5);animation:tin .3s cubic-bezier(.2,.9,.3,1.2)}
+          .toast.bad{border-left-color:var(--bad)}
+          @keyframes tin{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}
+          </style></head><body>
+          <div class="orb o1"></div><div class="orb o2"></div>
+          <nav>
+            <div class=logo>&#9884;</div>
+            <div><h1>Hermes Command Deck</h1><div class=crumb>model pool &middot; litellm router</div></div>
+            <div class=pill><span class=dot></span><span id=sub>Loading catalog...</span></div>
+          </nav>
+          <div class=wrap>
+            <div class=grid id=stats>
+              <div class=skel></div><div class=skel></div><div class=skel></div><div class=skel></div>
+            </div>
+            <div class=card style="margin-bottom:18px">
+              <div class=chead>
+                <h2>&#128225; NVIDIA NIM Catalog</h2><span class=badge id=cntN>&ndash;</span>
+                <button class=chip id=selchip onclick="selOnlyTgl()">Selected only</button>
+              </div>
+              <div class=sbox><span class=ico>&#128269;</span>
+                <input class=search placeholder="Filter models... try 'instruct' or 'llama'" oninput="filt(this.value)"></div>
+              <div class=list id=nvidia>
+                <div class=skel></div><div class=skel></div><div class=skel></div><div class=skel></div><div class=skel></div>
+              </div>
+            </div>
+            <div class=card>
+              <div class=chead>
+                <h2>&#127756; Mistral Catalog</h2><span class=badge id=cntM>&ndash;</span>
+              </div>
+              <div class=list id=mistral style="max-height:34vh">
+                <div class=skel></div><div class=skel></div>
+              </div>
+            </div>
+          </div>
+          <footer>
+            <div class=prog id=prog></div>
+            <div class=fin>
+              <div class=info id=info><b>0</b> models selected</div>
+              <button class="btn ghost" onclick="testSelected()">&#9889; Test selected</button>
+              <button class="btn primary" onclick="applyPool()">Apply pool &rarr;</button>
+            </div>
+          </footer>
+          <div id=toasts></div>
+          <script>
+          let catN=[],catM=[],pool=new Map(),results={},filter='',selOnly=false,keys={};
+          function toast(m,bad){const w=document.getElementById('toasts');
+            const t=document.createElement('div');t.className='toast'+(bad?' bad':'');
+            t.textContent=(bad?'\u2715 ':'\u2713 ')+m;w.appendChild(t);
+            setTimeout(()=>{t.style.opacity='0';t.style.transition='.4s';setTimeout(()=>t.remove(),400)},5600)}
+          function renderStats(){
+            const rows=Object.entries(keys).map(([p,n])=>`
+              <div class=stat><div class=bar style="background:linear-gradient(90deg,${n>0?'var(--ok)':'var(--bad)'},transparent)"></div>
+                <div class=k><span class="dot ${n>0?'on':'off'}"></span>${p}</div>
+                <div class=v>${n}</div><div class=s>API key${n===1?'':'s'} loaded</div></div>`).join('');
+            document.getElementById('stats').innerHTML=rows+`
+              <div class=stat><div class=bar style="background:linear-gradient(90deg,var(--acc2),transparent)"></div>
+                <div class=k>Catalog</div><div class=v>${catN.length+catM.length}</div><div class=s>models available</div></div>
+              <div class=stat><div class=bar style="background:linear-gradient(90deg,var(--acc),transparent)"></div>
+                <div class=k>Active pool</div><div class=v id=poolstat>${pool.size}</div><div class=s>rotating via pool-auto</div></div>`;
+          }
+          fetch('/api/models').then(r=>r.json()).then(d=>{
+            catN=d.nvidia;catM=d.mistral||[];keys=d.keys||{};
+            d.pool.forEach(x=>pool.set(x.id,x.provider||'nvidia'));
+            renderStats();render();info();
+            document.getElementById('sub').textContent=d.errors.length?d.errors.join(' | ')
+              :'Live \u00b7 catalog loaded';
+            if(d.errors.length)toast(d.errors.join(' | '),true);
+          });
+          function rowHtml(m,p){
+            const r=results[m],sel=pool.has(m),v=p==='mistral'?'mistral':(m.includes('/')?m.split('/')[0]:'nim');
+            const chip=!r?'':r.loading?'<span class="lat tst">testing\u2026</span>'
+              :r.ok?`<span class="lat ok">${r.ms} ms</span>`
+              :`<span class="lat bad" title="${(r.msg||'').replace(/"/g,'&quot;')}">\u2715 ${(r.msg||'fail').slice(0,24)}</span>`;
+            return `<div class="row ${sel?'sel':''}">
+              <input type=checkbox ${sel?'checked':''} onchange="tog('${m}','${p}')">
+              <span class=vend>${v}</span>
+              <span class=name>${m}</span>${chip}
+              <button class=tbtn onclick="testModel('${m}','${p}')">Test</button></div>`;
+          }
+          function render(){
+            const f=filter.toLowerCase();
+            let items=catN.filter(m=>m.toLowerCase().includes(f));
+            if(selOnly)items=items.filter(m=>pool.has(m));
+            document.getElementById('cntN').textContent=catN.length;
+            document.getElementById('nvidia').innerHTML=items.map(m=>rowHtml(m,'nvidia')).join('')
+              ||'<div style="padding:22px;color:#8b98ad;text-align:center">No models match</div>';
+            document.getElementById('cntM').textContent=catM.length;
+            let mitems=catM.filter(m=>m.toLowerCase().includes(f));
+            if(selOnly)mitems=mitems.filter(m=>pool.has(m));
+            document.getElementById('mistral').innerHTML=catM.length
+              ?(mitems.map(m=>rowHtml(m,'mistral')).join('')
+                ||'<div style="padding:22px;color:#8b98ad;text-align:center">No models match</div>')
+              :'<div style="padding:22px;color:#8b98ad;text-align:center">No MISTRAL_KEYS secret configured \u2014 add it to enable this section</div>';
+          }
+          function filt(v){filter=v;render()}
+          function selOnlyTgl(){selOnly=!selOnly;document.getElementById('selchip').classList.toggle('on',selOnly);render()}
+          function tog(m,p){pool.has(m)?pool.delete(m):pool.set(m,p);render();info();
+            const el=document.getElementById('poolstat');if(el)el.textContent=pool.size}
+          function info(){document.getElementById('info').innerHTML='<b>'+pool.size+'</b> model'+(pool.size===1?'':'s')+' in rotating pool'}
+          function prog(p){document.getElementById('prog').style.width=p+'%'}
+          async function testModel(m,p){
+            results[m]={loading:true};render();
+            const r=await fetch('/api/test',{method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({id:m,provider:p})}).then(x=>x.json())
+              .catch(e=>({ok:false,ms:0,msg:'timeout / connection dropped'}));
+            results[m]=r;render();
+            toast(m+' \u2014 '+(r.ok?r.ms+' ms':r.msg),!r.ok);
+            return r;
+          }
+          async function testSelected(){
+            const items=[...pool.entries()];
+            if(!items.length)return toast('Nothing selected',true);
+            toast('Testing '+items.length+' model(s)\u2026');
+            let ok=0,done=0;
+            for(const [m,p] of items){const r=await testModel(m,p);if(r.ok)ok++;done++;prog(Math.round(done/items.length*100))}
+            toast('Done: '+ok+'/'+items.length+' working',ok<items.length);
+            setTimeout(()=>prog(0),1500);
+          }
+          function applyPool(){
+            const sel=[...pool.entries()].map(([id,provider])=>({provider,id}));
+            if(!sel.length)return toast('Select at least 1 model',true);
+            toast('Applying pool\u2026');prog(60);
+            fetch('/api/pool',{method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({pool:sel})}).then(r=>r.json())
+              .then(d=>{prog(100);toast('Pool saved ('+d.count+'). Router restarting ~10s. All '+d.count+' models now auto-rotate via pool-auto \u2014 no manual switching needed.');setTimeout(()=>prog(0),1500)})
+              .catch(e=>{prog(0);toast('Failed: '+e,true)});
+          }
+          </script></body></html>"""
+
+          @app.route("/")
+          def home():
+              return (HTML, 200) if authed() else (LOGIN, 200)
+
+          @app.route("/login", methods=["POST"])
+          def login():
+              now = time.time()
+              if now < FAILS["until"]:
+                  return jsonify({"ok": False, "msg": "Too many attempts — wait 60s"})
+              pw = (request.get_json(silent=True) or {}).get("password", "")
+              if hmac.compare_digest(pw, TOKEN):
+                  FAILS["n"] = 0
+                  r = make_response(jsonify({"ok": True}))
+                  r.set_cookie("s", SESSION, httponly=True, secure=True,
+                               samesite="Lax", max_age=6 * 3600)
+                  return r
+              FAILS["n"] += 1
+              if FAILS["n"] >= 5:
+                  FAILS["until"] = now + 60
+                  FAILS["n"] = 0
+              time.sleep(1)
+              return jsonify({"ok": False, "msg": "Wrong password"})
+
+          @app.route("/api/models")
+          def models():
+              if not authed(): return deny()
+              out = {"nvidia": [], "mistral": [], "errors": [], "pool": load_pool(),
+                     "keys": {"NVIDIA NIM": len(KEY_NAMES),
+                              "Mistral": len(MISTRAL_KEY_NAMES)}}
+              if KEY_NAMES:
+                  # live catalog from NVIDIA NIM API
+                  try: out["nvidia"] = fetch_models(BASE, KEY_NAMES[0])
+                  except Exception as e: out["errors"].append("nvidia: " + str(e))
+              else:
+                  out["errors"].append("no NVIDIA keys configured")
+              if MISTRAL_KEY_NAMES:
+                  # live catalog from Mistral API; fall back to built-in list
+                  try: out["mistral"] = fetch_models("https://api.mistral.ai/v1", MISTRAL_KEY_NAMES[0])
+                  except Exception as e:
+                      out["mistral"] = MISTRAL_MODELS
+                      out["errors"].append("mistral: " + str(e) + " (showing built-in list)")
+              return jsonify(out)
+
+          @app.route("/api/test", methods=["POST"])
+          def test_model():
+              if not authed(): return deny()
+              data = request.get_json()
+              mid = data["id"]
+              provider = data.get("provider", "nvidia")
+              if provider == "mistral":
+                  base, keys = "https://api.mistral.ai/v1", MISTRAL_KEY_NAMES
+              else:
+                  base, keys = BASE, KEY_NAMES
+              if not keys:
+                  return jsonify({"ok": False, "ms": 0, "msg": "no API keys for " + provider})
+              body = json.dumps({"model": mid, "max_tokens": 5,
+                  "messages": [{"role": "user", "content": "Say OK"}]}).encode()
+              req = urllib.request.Request(base + "/chat/completions", data=body,
+                  headers={"Authorization": "Bearer " + os.environ[keys[0]],
+                           "Content-Type": "application/json"})
+              t0 = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=45) as r:
+                      json.load(r)
+                  return jsonify({"ok": True, "ms": int((time.time()-t0)*1000), "msg": "works"})
+              except urllib.error.HTTPError as e:
+                  try:
+                      err = json.loads(e.read().decode())
+                      msg = (err.get("error") or {}).get("message") or err.get("title") or str(err)
+                  except Exception:
+                      msg = "HTTP %d" % e.code
+                  return jsonify({"ok": False, "ms": int((time.time()-t0)*1000), "msg": str(msg)[:200]})
+              except Exception as e:
+                  return jsonify({"ok": False, "ms": int((time.time()-t0)*1000), "msg": str(e)[:200]})
+
+          @app.route("/api/pool", methods=["POST"])
+          def set_pool():
+              if not authed(): return deny()
+              pool = [x for x in request.get_json()["pool"] if x.get("provider") in ("nvidia", "mistral")]
+              if not pool:
+                  return jsonify({"ok": False, "count": 0})
+              save_pool(pool)
+              write_config(pool)
+              # fire-and-forget restart: respond immediately, don't block the request
+              subprocess.Popen(["docker", "restart", "litellm"],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              return jsonify({"ok": True, "count": len(pool)})
+
+          if __name__ == "__main__":
+              if "--init" in sys.argv:
+                  write_config(load_pool()); sys.exit(0)
+              app.run(host="0.0.0.0", port=7000, threaded=True)
+          PYEOF
+
+          # sanitize pool: drop any old ollama entries from backup; default if empty
+          python3 - <<'PY'
+          import json, os
+          home = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
+          p = os.path.join(home, "pool.json")
+          try:
+              pool = [x for x in json.load(open(p)) if x.get("provider") in ("nvidia", "mistral")]
+          except Exception:
+              pool = []
+          # NO hardcoded default model — pool stays empty until YOU pick one
+          os.makedirs(home, exist_ok=True)
+          json.dump(pool, open(p, "w"), indent=1)
+          print("pool:", [x["id"] for x in pool] or "EMPTY (waiting for panel selection)")
+          PY
+
+      # ── 6. Start LiteLLM router + panel + tunnel ──
+      - name: Start LiteLLM router and control panel
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
+          MISTRAL_KEYS: ${{ secrets.MISTRAL_KEYS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          # ── hard fail if PANEL_TOKEN is missing or too short ──
+          if [ -z "$PANEL_TOKEN" ] || [ ${#PANEL_TOKEN} -lt 8 ]; then
+            echo "::error::PANEL_TOKEN secret is missing or shorter than 8 chars — set it in Settings → Secrets"
+            exit 1
+          fi
+
+          # ── split bulk NVIDIA_KEYS (one per line; commas also OK) ──
+          : > /tmp/litellm.env
+          n=0
+          while IFS= read -r k; do
+            k=$(echo "$k" | tr -d ' \r')
+            [ -z "$k" ] && continue
+            n=$((n+1))
+            echo "NVIDIA_KEY_${n}=${k}" >> /tmp/litellm.env
+          done < <(printf '%s\n' "$NVIDIA_KEYS" | tr ',' '\n')
+          echo "Loaded $n NVIDIA key(s)"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::NVIDIA_KEYS secret is empty — add at least one key"
+            exit 1
+          fi
+
+          # ── split bulk MISTRAL_KEYS (one per line; commas also OK; optional) ──
+          m=0
+          while IFS= read -r k; do
+            k=$(echo "$k" | tr -d ' \r')
+            [ -z "$k" ] && continue
+            m=$((m+1))
+            echo "MISTRAL_KEY_${m}=${k}" >> /tmp/litellm.env
+          done < <(printf '%s\n' "$MISTRAL_KEYS" | tr ',' '\n')
+          echo "Loaded $m Mistral key(s)"
+
+          # make the split keys visible to this shell + panel process
+          set -a; source /tmp/litellm.env; set +a
+
+          # start control panel FIRST (inherits this step's env)
+          nohup python3 /tmp/panel/app.py > /tmp/panel.log 2>&1 &
+          sleep 3
+          # verify panel is up (login page must load)
+          curl -fs http://localhost:7000/ >/dev/null || { cat /tmp/panel.log; exit 1; }
+
+          # cloudflare quick tunnel for the panel
+          sudo curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:7000 > /tmp/tunnel.log 2>&1 &
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -n1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then echo "Tunnel failed"; cat /tmp/tunnel.log; exit 1; fi
+          PANEL_URL="${URL}"
+          echo "PANEL_URL=$PANEL_URL" >> "$GITHUB_ENV"
+
+          # ── NO default model: if no pool saved yet, WAIT for your selection ──
+          POOL_FILE="$HERMES_HOME/pool.json"
+          pool_ok() { python3 -c "import json,sys; sys.exit(0 if json.load(open('$POOL_FILE')) else 1)" 2>/dev/null; }
+          if ! pool_ok; then
+            echo "::warning::No model pool saved — open the panel and apply a pool: $PANEL_URL"
+            TG_API="https://api.telegram.org"
+            curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              -d text="⚠️ No model pool selected yet. Open the panel, tick your models and press Apply: ${PANEL_URL} (password = PANEL_TOKEN secret). Waiting up to 60 min..." > /dev/null || true
+            for i in $(seq 1 240); do
+              pool_ok && break
+              sleep 15
+            done
+            pool_ok || { echo "::error::No model pool selected within 60 minutes"; exit 1; }
+            echo "Pool selected via panel."
+          fi
+
+          # generate litellm config from YOUR pool (nothing hardcoded)
+          python3 /tmp/panel/app.py --init
+
+          docker rm -f litellm 2>/dev/null || true
+          docker run -d --name litellm --network host \
+            --env-file /tmp/litellm.env \
+            -v /tmp/litellm.yaml:/app/config.yaml \
+            ghcr.io/berriai/litellm:main-latest \
+            --config /app/config.yaml --port 4000
+
+          rm -f /tmp/litellm.env   # keys now live only in container/process env
+
+          echo "Waiting for LiteLLM..."
+          for i in $(seq 1 30); do
+            curl -fs http://localhost:4000/v1/models >/dev/null 2>&1 && break
+            sleep 3
+          done
+          curl -fs http://localhost:4000/v1/models || { docker logs litellm; exit 1; }
+
+          echo "=================================================="
+          echo "🎛️  MODEL POOL CONTROL PANEL:"
+          echo ""
+          echo "    $PANEL_URL"
+          echo ""
+          echo "    (password = your PANEL_TOKEN secret)"
+          echo "=================================================="
+          echo "::notice title=🎛️ Model Pool Panel::$PANEL_URL (password = PANEL_TOKEN secret)"
+
+      # ── 7. Write .env (Telegram + Slack) ──
+      - name: Write .env
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          SLACK_USER_ID: ${{ secrets.SLACK_USER_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          mkdir -p "$HERMES_HOME"
+          cat > "$HERMES_HOME/.env" <<EOF
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          TELEGRAM_ALLOWED_USERS=${TELEGRAM_USER_ID}
+          SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+          SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+          SLACK_ALLOWED_USERS=${SLACK_USER_ID}
+          SEARXNG_URL=http://localhost:8080
+          CAMOUFOX_URL=ws://127.0.0.1:9222/hermes
+          GROQ_API_KEY=${GROQ_API_KEY}
+          EOF
+
+      # ── 8. Standing instructions for the agent (auto save-to-file) ──
+      - name: Write agent instructions
+        run: |
+          mkdir -p "$HERMES_HOME/work"
+          cat > "$HOME/AGENTS.md" <<'EOF'
+          # Standing instructions
+          - For any long or multi-step task (scraping, research, data
+            collection, comparisons), IMMEDIATELY append each intermediate
+            result to a file under ~/.hermes/work/ as you go. Never keep
+            results only in the conversation.
+          - Use one file per task, named by date and topic
+            (e.g. ~/.hermes/work/2026-07-25-price-scrape.md).
+          - When the task finishes, tell the user the file path.
+          - These files are backed up automatically; treat them as the
+            source of truth for task results.
+          EOF
+          echo "Agent instructions written to $HOME/AGENTS.md"
+
+      # ── 9. Configure Hermes (active model comes ONLY from YOUR pool) ──
+      - name: Configure Hermes
+        run: |
+          hermes config unset providers.nvidia.base_url || true
+          hermes config unset providers.nvidia.api_key_env || true
+          hermes config unset providers.nim.base_url || true
+          hermes config unset providers.nim.api_key_env || true
+          hermes config set model.provider custom
+          hermes config set model.base_url "http://localhost:4000/v1"
+          hermes config set model.api_key "sk-local"
+          # ★ default = "pool-auto": the router alias that auto-rotates across
+          #   ALL models YOU selected in the panel (never a hardcoded model)
+          hermes config set model.default "pool-auto"
+          echo "Active model: pool-auto (rotates across your whole selected pool)"
+          hermes config set model.context_length 65536
+          hermes config set web.search_backend searxng
+          hermes config set tts.provider edge
+          hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
+          hermes doctor || true
+          echo "── Final model config ──"
+          hermes config get model || true
+
+      # ── 10. Hermes WebUI (visual chat panel, password-protected) ──
+      - name: Start Hermes WebUI
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+        run: |
+          # community panel with built-in password auth — safe behind a public tunnel
+          git clone --depth 1 https://github.com/nesquena/hermes-webui.git /tmp/hermes-webui \
+            || { echo "::warning::Hermes WebUI clone failed — skipping visual panel"; exit 0; }
+          cd /tmp/hermes-webui
+          export HERMES_WEBUI_PASSWORD="$PANEL_TOKEN"   # same password as model panel
+          export HERMES_WEBUI_PORT=8787
+          export HERMES_WEBUI_HOST=127.0.0.1
+          export HERMES_WEBUI_AUTO_INSTALL=1
+          ./ctl.sh start \
+            || { echo "::warning::Hermes WebUI failed to start — skipping"; tail -n 50 "$HERMES_HOME/webui.log" 2>/dev/null || true; exit 0; }
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:8787/ >/dev/null 2>&1 && break
+            sleep 3
+          done
+
+          # second cloudflare quick tunnel just for the WebUI
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8787 > /tmp/webui-tunnel.log 2>&1 &
+          WEBUI_URL=""
+          for i in $(seq 1 30); do
+            WEBUI_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/webui-tunnel.log | head -n1 || true)
+            [ -n "$WEBUI_URL" ] && break
+            sleep 2
+          done
+          if [ -z "$WEBUI_URL" ]; then
+            echo "::warning::WebUI tunnel failed — panel only reachable inside runner"
+            exit 0
+          fi
+          echo "WEBUI_URL=$WEBUI_URL" >> "$GITHUB_ENV"
+          echo "=================================================="
+          echo "🖥️  HERMES WEBUI (visual chat panel):"
+          echo ""
+          echo "    $WEBUI_URL"
+          echo ""
+          echo "    (password = your PANEL_TOKEN secret)"
+          echo "=================================================="
+          echo "::notice title=🖥️ Hermes WebUI::$WEBUI_URL (password = PANEL_TOKEN secret)"
+
+      # ── 11. Background backup loop (every 30 min -> backup branch) ──
+      - name: Start backup loop
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          cat > /tmp/sync.sh <<'EOF'
+          #!/bin/bash
+          while true; do
+            sleep 1800
+            rm -rf /tmp/backup && mkdir -p /tmp/backup
+            rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' \
+              --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
+              --exclude='browser-profile/shader-cache' \
+              "$HERMES_HOME/" /tmp/backup/
+            cd /tmp/backup
+            find . -type f -size +90M | while read -r f; do
+              split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+              rm -f "$f"
+            done
+            git init -q -b backup
+            git config user.email "bot@hermes" && git config user.name "hermes-bot"
+            git add -A && git commit -q -m "backup $(date -u +%FT%TZ)" || true
+            git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" backup 2>/dev/null || true
+            echo "Backup pushed at $(date)"
+          done
+          EOF
+          chmod +x /tmp/sync.sh
+          HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" \
+            nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
+
+      # ── 12. Notify start on Telegram (includes panel links) ──
+      - name: Notify start
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          TG_API="https://api.telegram.org"
+          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_USER_ID}" \
+            -d text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
+          🎛️ Model panel: ${PANEL_URL}
+          🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
+          🔑 Password: your PANEL_TOKEN secret
+          Use /model in Telegram or !model in Slack to switch models" > /dev/null
+
+      # ── 13. Run gateway with time budget + anti-stuck watchdog ──
+      - name: Run Hermes gateway
+        run: |
+          # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
+          # auto-restart it — no more force-stopping the whole Action run
+          cat > /tmp/watchdog.sh <<'EOF'
+          #!/bin/bash
+          fails=0
+          while true; do
+            sleep 60
+            if curl -fs -m 15 http://localhost:4000/v1/models >/dev/null 2>&1; then
+              fails=0
+            else
+              fails=$((fails+1))
+              echo "$(date) LiteLLM health check failed ($fails/3)"
+              if [ "$fails" -ge 3 ]; then
+                echo "$(date) Router stuck — restarting litellm container"
+                docker restart litellm >/dev/null 2>&1 || true
+                fails=0
+              fi
+            fi
+          done
+          EOF
+          chmod +x /tmp/watchdog.sh
+          nohup /tmp/watchdog.sh > /tmp/watchdog.log 2>&1 &
+
+          JOB_START=$(cat /tmp/job_start)
+          END=$(( JOB_START + RUN_MINUTES * 60 ))
+          while true; do
+            NOW=$(date +%s)
+            REMAIN=$(( (END - NOW) / 60 ))
+            if [ "$REMAIN" -le 2 ]; then
+              echo "Time budget exhausted"; break
+            fi
+            # keep "pool-auto" as default on every gateway (re)start — it
+            # always reflects the CURRENT pool you applied from the panel
+            hermes config set model.default "pool-auto" || true
+            echo "Starting gateway (${REMAIN}m remaining)..."
+            timeout -k 60 "${REMAIN}m" hermes gateway || true
+            echo "Gateway exited, restarting in 10s..."
+            sleep 10
+          done
+
+      # ── 14. Final push to data repo (main) ──
+      - name: Final data push
+        if: always()
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          rm -rf /tmp/final && mkdir -p /tmp/final
+          rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' \
+            --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
+            --exclude='browser-profile/shader-cache' \
+            "$HERMES_HOME/" /tmp/final/ || true
+          cd /tmp/final
+          find . -type f -size +90M | while read -r f; do
+            split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+            rm -f "$f"
+          done
+          cat > .gitignore <<'EOF'
+          .env
+          *.log
+          EOF
+          git init -q -b main
+          git config user.email "bot@hermes" && git config user.name "hermes-bot"
+          git add -A && git commit -q -m "final save $(date -u +%FT%TZ)" || true
+          git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" main
+
+      # ── 15. Notify failure ──
+      - name: Notify failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          TG_API="https://api.telegram.org"
+          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_USER_ID}" \
+            -d text="🔴 Hermes Agent run FAILED — check Actions logs" > /dev/null
