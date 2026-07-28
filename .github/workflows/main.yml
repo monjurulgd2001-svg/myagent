@@ -212,7 +212,7 @@ jobs:
                       if removed and kept:
                           save_pool(kept)
                           write_config(kept)
-                          subprocess.Popen(["docker", "restart", "litellm"],
+                          subprocess.Popen(["docker", "restart", "-t", "2", "litellm"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           print("auto-pruned dead/EOL models: " + ", ".join(removed), flush=True)
                   except Exception as e:
@@ -266,6 +266,14 @@ jobs:
               L += ["litellm_settings:",
                     "  drop_params: true",
                     "  request_timeout: 90"]
+              # LiteLLM's per-worker parallel-request counter LEAKS: it counts
+              # requests in but never back out (github.com/BerriAI/litellm
+              # issues #27900 / #20256), so any small limit is eventually hit
+              # (39 -> 272 -> 472 out of 32). Raise the ceiling so high that a
+              # 5.5h run can never reach it; the watchdog restart is the
+              # backstop if it somehow does.
+              L += ["general_settings:",
+                    "  global_max_parallel_requests: 100000"]
               open(CFG, "w").write("\n".join(L) + "\n")
 
           LOGIN = """<!doctype html><html><head><meta charset=utf-8>
@@ -610,7 +618,7 @@ jobs:
               save_pool(pool)
               write_config(pool)
               # fire-and-forget restart: respond immediately, don't block the request
-              subprocess.Popen(["docker", "restart", "litellm"],
+              subprocess.Popen(["docker", "restart", "-t", "2", "litellm"],
                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               return jsonify({"ok": True, "count": len(pool)})
 
@@ -759,11 +767,15 @@ jobs:
           fi
 
           docker rm -f litellm 2>/dev/null || true
+          # --num_workers 4: each router worker caps at ~32 concurrent
+          # requests ("Worker local total request limit reached"). Agentic
+          # retry bursts can exceed one worker's cap, so run 4 workers
+          # (GitHub runners have 4 vCPUs) = ~128 concurrent requests.
           docker run -d --name litellm --network host \
             --env-file /tmp/litellm.env \
             -v /tmp/litellm.yaml:/app/config.yaml \
-            ghcr.io/berriai/litellm:main-latest \
-            --config /app/config.yaml --port 4000
+            ghcr.io/berriai/litellm:main-stable \
+            --config /app/config.yaml --port 4000 --num_workers 4
 
           rm -f /tmp/litellm.env   # keys now live only in container/process env
 
@@ -942,6 +954,19 @@ jobs:
           fails=0
           while true; do
             sleep 60
+            # ZOMBIE detection: LiteLLM's per-worker request counter can LEAK
+            # (climbs 39 -> 80 -> 272 and never resets). The catalog endpoint
+            # still answers, so a plain health check passes while every real
+            # completion gets 500 "Worker local total request limit reached".
+            # Restart immediately when that error shows up in recent logs.
+            if docker logs litellm --since 90s 2>&1 | grep -q "Worker local total request limit reached"; then
+              echo "$(date) Router counter leak detected — restarting litellm container"
+              # -t 2: kill fast. Default docker restart waits 10s for graceful
+              # stop; that downtime is what burns the gateway's quick retries.
+              docker restart -t 2 litellm >/dev/null 2>&1 || true
+              fails=0
+              continue
+            fi
             if curl -fs -m 15 http://localhost:4000/v1/models >/dev/null 2>&1; then
               fails=0
             else
@@ -949,7 +974,7 @@ jobs:
               echo "$(date) LiteLLM health check failed ($fails/3)"
               if [ "$fails" -ge 3 ]; then
                 echo "$(date) Router stuck — restarting litellm container"
-                docker restart litellm >/dev/null 2>&1 || true
+                docker restart -t 2 litellm >/dev/null 2>&1 || true
                 fails=0
               fi
             fi
@@ -971,8 +996,12 @@ jobs:
             hermes config set model.default "pool-auto" || true
             echo "Starting gateway (${REMAIN}m remaining)..."
             timeout -k 60 "${REMAIN}m" hermes gateway || true
-            echo "Gateway exited, restarting in 10s..."
-            sleep 10
+            # 60s (not 10s): Telegram holds the previous gateway's getUpdates
+            # session open for up to ~1 min after a crash. Restarting too fast
+            # causes "Conflict: terminated by other getUpdates request" and a
+            # fatal polling-conflict loop.
+            echo "Gateway exited, restarting in 60s..."
+            sleep 60
           done
 
       # ── 14. Final push to data repo (main) ──
