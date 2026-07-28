@@ -15,7 +15,7 @@ env:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 370
 
     steps:
       # ── 1. Pull persisted data from private repo ──
