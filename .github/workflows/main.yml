@@ -3,6 +3,12 @@ name: Hermes Agent — Telegram + Slack + NVIDIA/Mistral Pool
 on:
   workflow_dispatch:
 
+# actions:write lets the last step dispatch the NEXT run (24/7 chaining)
+# using the built-in GITHUB_TOKEN - no extra secret needed.
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: hermes-agent
   cancel-in-progress: false
@@ -15,7 +21,7 @@ env:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 370
+    timeout-minutes: 350
 
     steps:
       # ── 1. Pull persisted data from private repo ──
@@ -28,6 +34,22 @@ jobs:
           git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
           if [ -d /tmp/data ]; then
             rm -f /tmp/data/.env
+            # RESTORE FROM BACKUP BRANCH TOO: the 30-min backup loop pushes to
+            # the 'backup' branch, while the final push (end of run) goes to
+            # 'main'. If the previous run crashed / was cancelled / hit the
+            # timeout, the final push never ran — the freshest memory + work
+            # files exist ONLY on 'backup'. Compare timestamps and overlay
+            # whichever is newer, so the bot's brain survives dirty shutdowns.
+            main_ts=$(cd /tmp/data && git log -1 --format=%ct 2>/dev/null || echo 0)
+            git clone --depth 1 -b backup "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/databk 2>/dev/null || true
+            if [ -d /tmp/databk ]; then
+              bk_ts=$(cd /tmp/databk && git log -1 --format=%ct 2>/dev/null || echo 0)
+              if [ "$bk_ts" -gt "$main_ts" ]; then
+                echo "backup branch is newer than main — restoring latest data from backup"
+                rm -f /tmp/databk/.env
+                rsync -a --exclude='.git' /tmp/databk/ /tmp/data/
+              fi
+            fi
             rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
             find "$HERMES_HOME" -name "*.gh-chunk.000" | while read -r first; do
               base="${first%.gh-chunk.000}"
@@ -103,7 +125,20 @@ jobs:
           pip install -q flask
           mkdir -p /tmp/panel
           cat > /tmp/panel/app.py <<'PYEOF'
-          import os, json, subprocess, sys, time, hmac, secrets, urllib.request, urllib.error
+          import os, json, subprocess, sys, time, hmac, secrets, urllib.request, urllib.error, urllib.parse
+
+          def tg_notify(text):
+              # best-effort Telegram alert; never crash the panel over it
+              try:
+                  tk = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                  uid = os.environ.get("TELEGRAM_USER_ID", "")
+                  if tk and uid:
+                      urllib.request.urlopen(
+                          "https://api.telegram.org/bot" + tk + "/sendMessage",
+                          data=urllib.parse.urlencode({"chat_id": uid, "text": text}).encode(),
+                          timeout=10)
+              except Exception:
+                  pass
           from flask import Flask, request, jsonify, make_response
 
           app = Flask(__name__)
@@ -215,6 +250,7 @@ jobs:
                           subprocess.Popen(["docker", "restart", "-t", "2", "litellm"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                           print("auto-pruned dead/EOL models: " + ", ".join(removed), flush=True)
+                          tg_notify("🪦 Hermes: auto-pruned dead model(s) mid-run: " + ", ".join(removed) + ". Pool keeps running with the rest.")
                   except Exception as e:
                       print("auto-prune error: " + str(e), flush=True)
 
@@ -685,6 +721,11 @@ jobs:
             sleep 1
           done < <(printf '%s\n' "$NVIDIA_KEYS" | tr ',' '\n')
           echo "NVIDIA keys: $n valid, $bad_n dropped"
+          if [ "$bad_n" -gt 0 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              -d text="🚨 Hermes: ${bad_n} NVIDIA key(s) dead (auth failed) - ${n} still working" > /dev/null || true
+          fi
           if [ "$n" -eq 0 ]; then
             echo "::error::No working NVIDIA key — secret is empty or every key failed the auth check"
             exit 1
@@ -707,6 +748,11 @@ jobs:
             sleep 1
           done < <(printf '%s\n' "$MISTRAL_KEYS" | tr ',' '\n')
           echo "Mistral keys: $m valid, $bad_m dropped"
+          if [ "$bad_m" -gt 0 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              -d text="🚨 Hermes: ${bad_m} Mistral key(s) dead (auth failed) - ${m} still working" > /dev/null || true
+          fi
 
           # make the split keys visible to this shell + panel process
           set -a; source /tmp/litellm.env; set +a
@@ -823,6 +869,17 @@ jobs:
           mkdir -p "$HERMES_HOME/work"
           cat > "$HOME/AGENTS.md" <<'EOF'
           # Standing instructions
+          - CRITICAL: THIS MACHINE IS WIPED after every run (fresh VM each
+            time). ONLY files under ~/.hermes/ survive via automatic backup.
+            Create ALL projects, scripts, credential/account files, downloads,
+            and outputs under ~/.hermes/work/ — NEVER in ~, /tmp, or any other
+            path. If you just created files elsewhere, move them into
+            ~/.hermes/work/ immediately. Anything outside ~/.hermes/ WILL BE
+            LOST when the run ends.
+          - When the user sends/uploads a file in chat, IMMEDIATELY copy it
+            into ~/.hermes/work/ and do all reading/editing on THAT copy.
+            Platform uploads land in a temporary cache that gets auto-deleted;
+            the ~/.hermes/work/ copy is the only one that survives.
           - For any long or multi-step task (scraping, research, data
             collection, comparisons), IMMEDIATELY append each intermediate
             result to a file under ~/.hermes/work/ as you go. Never keep
@@ -850,7 +907,17 @@ jobs:
           hermes config set model.default "pool-auto"
           echo "Active model: pool-auto (rotates across your whole selected pool)"
           hermes config set model.context_length 65536
+          # Survive router restarts: the LiteLLM counter-leak forces a fast
+          # container restart (~10-20s blip). Default api_max_retries=3 gives
+          # the gateway only ~7s of retry budget, so turns were DYING inside
+          # the blip. 8 retries with exponential backoff spans well past any
+          # restart window — the turn just waits and continues.
+          hermes config set agent.api_max_retries 8
           hermes config set web.search_backend searxng
+          # Edge TTS needs the edge-tts package on the machine — an earlier
+          # run failed with "edge-tts: command not found". Free Microsoft
+          # voices (400+ incl. Bangla bn-BD), no API key needed.
+          pip install -q edge-tts || true
           hermes config set tts.provider edge
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
           hermes doctor || true
@@ -947,6 +1014,49 @@ jobs:
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
         run: |
+          # Shared virtual display :99 for the AGENT's GUI work (screenshots,
+          # Qt apps, image tools). The browser's own virtual display is private
+          # to it — without this, scrot/GUI apps fail with "Can't open X
+          # display". Every terminal the agent opens inherits DISPLAY=:99.
+          if ! pgrep -f "Xvfb :99" >/dev/null; then
+            Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
+            sleep 2
+          fi
+          export DISPLAY=:99
+
+          # SMART SESSION RESET: keep the conversation ALIVE across runs.
+          # sessions.json is the gateway routing index (chat -> active session
+          # id). We check each active session's real context size in state.db
+          # and detach ONLY if it is genuinely bloated (>45k tokens). Otherwise
+          # the bot continues the SAME conversation after a re-run — no
+          # amnesia, no manual /new. If anything fails, we keep continuity.
+          python3 - <<'PYSESS'
+          import os, re, sqlite3
+          home = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
+          idx = os.path.join(home, "sessions", "sessions.json")
+          db = os.path.join(home, "state.db")
+          try:
+              if os.path.exists(idx) and os.path.exists(db):
+                  raw = open(idx, encoding="utf-8").read()
+                  ids = set(re.findall(r"\d{8}_\d{6}_[0-9a-f]+", raw))
+                  worst = 0
+                  if ids:
+                      conn = sqlite3.connect(db)
+                      for sid in ids:
+                          row = conn.execute(
+                              "SELECT COALESCE(SUM(token_count),0) FROM messages WHERE session_id=?",
+                              (sid,)).fetchone()
+                          worst = max(worst, row[0] or 0)
+                      conn.close()
+                  if worst > 45000:
+                      os.remove(idx)
+                      print("session context ~%d tokens -> bloated, starting fresh this run" % worst)
+                  else:
+                      print("session context ~%d tokens -> continuing previous conversation" % worst)
+          except Exception as e:
+              print("session check skipped (keeping continuity):", e)
+          PYSESS
+
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
           # auto-restart it — no more force-stopping the whole Action run
           cat > /tmp/watchdog.sh <<'EOF'
@@ -1029,7 +1139,28 @@ jobs:
           git add -A && git commit -q -m "final save $(date -u +%FT%TZ)" || true
           git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" main
 
-      # ── 15. Notify failure ──
+      # ── 15. Start next run (24/7 chaining) ──
+      # Dispatches a fresh run of THIS workflow when the current one ends.
+      # The concurrency group makes the new run QUEUE until this one exits,
+      # so two gateways never overlap (no Telegram polling conflict).
+      # Cancelling a run manually BREAKS the chain (if: !cancelled()) -
+      # cancel = stop for good, let it finish = runs 24/7.
+      - name: Start next run (24/7 chain)
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WF_FILE="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"
+          WF_FILE="${WF_FILE%%@*}"
+          echo "Chaining next run of ${WF_FILE} on ${GITHUB_REF_NAME}..."
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" \
+            && echo "Next run queued OK" || echo "::warning::Could not queue next run"
+
+      # ── 16. Notify failure ──
       - name: Notify failure
         if: failure()
         env:
