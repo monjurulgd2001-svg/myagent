@@ -996,6 +996,27 @@ jobs:
           HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" \
             nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
 
+      # ── 11.5. Start Live Screen (noVNC) ──
+      - name: Start Live Screen
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox
+          if ! pgrep -f "Xvfb :99" >/dev/null; then
+            Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
+            sleep 2
+          fi
+          DISPLAY=:99 fluxbox > /tmp/fluxbox.log 2>&1 &
+          x11vnc -display :99 -nopw -forever -shared -bg -rfbport 5900
+          websockify --web /usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > /tmp/novnc-tunnel.log 2>&1 &
+          NOVNC_URL=""
+          for i in $(seq 1 30); do
+            NOVNC_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/novnc-tunnel.log | head -n1 || true)
+            [ -n "$NOVNC_URL" ] && break
+            sleep 2
+          done
+          echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
+          echo "Live Screen URL: $NOVNC_URL"
+
       # ── 12. Notify start on Telegram (includes panel links) ──
       - name: Notify start
         env:
@@ -1008,6 +1029,7 @@ jobs:
             -d text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
+          📺 Live Screen: ${NOVNC_URL:-failed to start}
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models" > /dev/null
 
