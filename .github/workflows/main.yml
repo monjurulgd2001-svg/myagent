@@ -83,10 +83,86 @@ jobs:
         run: |
           # Shared virtual display :99 — the browser AND all the agent's GUI
           # work render here, so the LIVE VIEW (below) shows everything.
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xdotool tint2 feh pcmanfm xterm
           Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
           sleep 2
           export DISPLAY=:99
+
+          # fluxbox config: show toolbar + taskbar
+          mkdir -p ~/.fluxbox
+          cat > ~/.fluxbox/init <<'FLUX'
+          session.screen0.toolbar.visible: true
+          session.screen0.toolbar.tools: pipemenu, iconbar, systemtray, clock
+          session.screen0.toolbar.position: bottom
+          session.screen0.toolbar.height: 30
+          session.screen0.toolbar.alpha: 220
+          session.screen0.toolbar.borderColor: #333333
+          session.screen0.slitlist.file: ~/.fluxbox/slitlist
+          session.screen0.tabs.usePixmap: false
+          session.screen0.rootCommand: feh --bg-color "#0a0a1a" &
+          FLUX
+
+          # fluxbox theme: dark modern look
+          cat > ~/.fluxbox/theme <<'THEME'
+          ! this is a minimal theme override
+          toolbar*: font: DejaVu Sans:size=10
+          toolbar*: color: #e0e0e0
+          toolbar*: backgroundColor: #1a1a2e
+          toolbar*: borderColor: #16213e
+          THEME
+
+          fluxbox > /tmp/fluxbox.log 2>&1 &
+          sleep 3
+          xterm -geometry 100x30 -bg "#0a0a1a" -fg "#00ff41" -title "Hermes Agent" -e "echo 'Hermes Agent Terminal'; echo '---'; while true; do sleep 60; done" > /tmp/xterm.log 2>&1 &
+          sleep 2
+
+          # tint2 taskbar (bottom panel like Windows)
+          cat > /tmp/tint2rc <<'TINT2'
+          # Backgrounds
+          bg_color = #1a1a2e
+          bg_color_hover = #0f3460
+          bg_active = #e94560
+          border_width = 0
+          border_sides = TRLB
+          corner_size = 0
+          border_color = #1a1a2e
+          # Panel
+          panel_margin = 0 0
+          panel_padding = 4 0 4
+          panel_size = 100% 32
+          panel_position = bottom center horizontal
+          panel_dock = 0
+          panel_layer = top
+          panel_window_name = panel
+          # Clock
+          time1_format = %H:%M
+          time1_font = DejaVu Sans:size=11
+          time2_format = %a %d %b
+          time2_font = DejaVu Sans:size=8
+          clock_font_color = #e0e0e0 100
+          clock_padding = 8 4
+          clock_background = #16213e
+          # Taskbar
+          taskbar_mode = single_desktop
+          taskbar_padding = 2 2 4
+          taskbar_background_id = 1
+          taskbar_active_background_id = 2
+          task_icon = 1
+          task_text = 1
+          task_centered = 1
+          task_maximum_size = 200 35
+          task_font = DejaVu Sans:size=9
+          task_font_color = #aaaaaa 100
+          task_active_font_color = #ffffff 100
+          # Systray
+          systray_padding = 4 4 4
+          systray_background_id = 1
+          TINT2
+          tint2 -c /tmp/tint2rc > /tmp/tint2.log 2>&1 &
+          sleep 1
+
+          # wallpaper: dark gradient
+          feh --bg-color "#0a0a1a" 2>/dev/null || true
           pip install -U "camoufox[geoip]" pyvirtualdisplay
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
@@ -108,6 +184,42 @@ jobs:
             sleep 3
           done
           cat /tmp/camoufox.log || true
+          export DISPLAY=:99
+          sleep 2
+          xdotool search --name "" windowactivate --sync 2>/dev/null || true
+          xdotool key --clearmodifiers F11 2>/dev/null || true
+          sleep 1
+
+          # desktop icons via pcmanfm
+          export DISPLAY=:99
+          pcmanfm --desktop --profile=lxde 2>/dev/null &
+          sleep 2
+
+          # desktop shortcuts
+          mkdir -p ~/Desktop
+          cat > ~/Desktop/终端.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Terminal
+          Exec=xterm
+          Icon=utilities-terminal
+          Type=Application
+          EOF
+          cat > ~/Desktop/浏览器.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Camoufox
+          Exec=xdg-open http://localhost:9222
+          Icon=firefox
+          Type=Application
+          EOF
+          cat > ~/Desktop/文件管理器.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Files
+          Exec=pcmanfm
+          Icon=system-file-manager
+          Type=Application
+          EOF
+          chmod +x ~/Desktop/*.desktop
+          xdotool key super+d 2>/dev/null || true
 
           # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
           # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
