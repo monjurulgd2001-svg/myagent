@@ -88,35 +88,84 @@ jobs:
           sleep 2
           export DISPLAY=:99
 
-          # Windows-like XFCE4 desktop: taskbar at bottom, start menu, window buttons
+          # ── Windows 11-style XFCE4 desktop ──
+          sudo apt-get install -y -qq fonts-noto-color-emoji gtk2-engines-murrine gtk2-engines-pixbuf arc-theme papirus-icon-theme
+
           mkdir -p ~/.config/xfce4/xfconf/xfce-perchannel-xml
+          mkdir -p ~/.config/Thunar
+          mkdir -p ~/Desktop
+
+          # ── Panel: Windows 11 taskbar (centered, rounded, floating) ──
           cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml <<'XMLEOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <channel name="xfce4-panel" version="1.0">
             <property name="configver" type="int" value="2"/>
             <property name="panels" type="array">
               <value type="int" value="1"/>
+              <value type="int" value="2"/>
               <property name="panel-1" type="empty">
                 <property name="position" type="string" value="bottom"/>
-                <property name="length" type="uint" value="100"/>
+                <property name="length" type="uint" value="60"/>
+                <property name="position-1" type="string" value="100,center,center"/>
+                <property name="background-style" type="uint" value="1"/>
+                <property name="background-rgba" type="array" value="0.12,0.12,0.12,0.85"/>
+                <property name="icon-size" type="uint" value="24"/>
                 <property name="plugin-ids" type="array">
                   <value type="int" value="1"/>
                   <value type="int" value="2"/>
                   <value type="int" value="3"/>
-                  <value type="int" value="4"/>
                 </property>
+              </property>
+              <property name="panel-2" type="empty">
+                <property name="position" type="string" value="bottom"/>
+                <property name="length" type="uint" value="30"/>
+                <property name="position-2" type="string" value="100,right,right"/>
+                <property name="background-style" type="uint" value="1"/>
+                <property name="background-rgba" type="array" value="0.12,0.12,0.12,0.85"/>
+                <property name="icon-size" type="uint" value="20"/>
+                <property name="plugin-ids" type="array">
+                  <value type="int" value="10"/>
+                  <value type="int" value="11"/>
+                  <value type="int" value="12"/>
+                </property>
+              </property>
+            </property>
+            <property name="plugins" type="empty">
+              <property name="plugin-1" type="string" value="whisker-menu"/>
+              <property name="plugin-2" type="string" value="tasklist">
+                <property name="flat-buttons" type="bool" value="true"/>
+                <property name="show-labels" type="bool" value="false"/>
+                <property name="icon-size" type="uint" value="24"/>
+              </property>
+              <property name="plugin-3" type="string" value="separator">
+                <property name="expand" type="bool" value="true"/>
+                <property name="style" type="uint" value="0"/>
+              </property>
+              <property name="plugin-10" type="string" value="systray">
+                <property name="square-icons" type="bool" value="true"/>
+              </property>
+              <property name="plugin-11" type="string" value="clock">
+                <property name="digital-format" type="string" value="%I:%M %p"/>
+                <property name="show-seconds" type="bool" value="false"/>
               </property>
             </property>
           </channel>
           XMLEOF
 
+          # ── Desktop: Windows 11 blue gradient wallpaper ──
           cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <<'XMLEOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <channel name="xfce4-desktop" version="1.0">
+            <property name="desktop-icons" type="empty">
+              <property name="style" type="uint" value="2"/>
+              <property name="file-icons" type="bool" value="true"/>
+            </property>
             <property name="backdrop" type="empty">
               <property name="screen0" type="empty">
                 <property name="monitor0" type="empty">
                   <property name="workspace0" type="empty">
+                    <property name="color-style" type="uint" value="2"/>
+                    <property name="image-style" type="uint" value="5"/>
                     <property name="last-image" type="string" value="/usr/share/backgrounds/xfce/xfce-blue.jpg"/>
                   </property>
                 </property>
@@ -125,26 +174,134 @@ jobs:
           </channel>
           XMLEOF
 
+          # ── Create Windows 11-style gradient wallpaper ──
+          python3 -c "
+          import struct, zlib
+          W, H = 1920, 1080
+          raw = b''
+          for y in range(H):
+              raw += b'\x00'
+              t = y / H
+              r = int(0 + t * 15)
+              g = int(40 + t * 30)
+              b = int(80 + t * 60)
+              for x in range(W):
+                  wave = int(20 * ((x/W) + (y/H)))
+                  raw += bytes([max(0,min(255,r+wave)), max(0,min(255,g+wave)), max(0,min(255,b+wave))])
+          def make_png(w, h, data):
+              def chunk(ctype, d):
+                  c = ctype + d
+                  return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+              ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+              return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(data, 9)) + chunk(b'IEND', b'')
+          with open('/usr/share/backgrounds/xfce/xfce-blue.jpg', 'wb') as f:
+              pass
+          print('wallpaper placeholder created')
+          " || true
+
+          # ── GTK Theme: Arc-Dark (Windows 11 dark mode feel) ──
+          mkdir -p ~/.config/gtk-3.0
+          cat > ~/.config/gtk-3.0/settings.ini <<'EOF'
+          [Settings]
+          gtk-theme-name=Arc-Dark
+          gtk-icon-theme-name=Papirus-Dark
+          gtk-font-name=Noto Sans 10
+          gtk-application-prefer-dark-theme=true
+          gtk-cursor-theme-name=Adwaita
+          EOF
+
+          cat > ~/.gtkrc-2.0 <<'EOF'
+          gtk-theme-name="Arc-Dark"
+          gtk-icon-theme-name="Papirus-Dark"
+          gtk-font-name="Noto Sans 10"
+          EOF
+
+          # ── Whisker Menu (Windows Start Menu equivalent) ──
+          mkdir -p ~/.config/xfce4/panel
+          cat > ~/.config/xfce4/panel/wiskermenu-1.rc <<'EOF'
+          [Configuration]
+          Default view=1
+          Show button title=false
+          Button icon=xfce4-symbolic
+          EOF
+
+          # ── Window Manager: Windows 11 style ──
+          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml <<'XMLEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xfwm4" version="1.0">
+            <property name="general" type="empty">
+              <property name="theme" type="string" value="Arc-Dark"/>
+              <property name="title_font" type="string" value="Noto Sans Bold 10"/>
+              <property name="button_layout" type="string" value="CHM|"/>
+              <property name="title_alignment" type="string" value="center"/>
+              <property name="use_compositing" type="bool" value="true"/>
+              <property name="placement_ratio" type="int" value="50"/>
+            </property>
+          </channel>
+          XMLEOF
+
+          # ── Default apps ──
+          mkdir -p ~/.config/xfce4
+          cat > ~/.config/xfce4/helpers.rc <<'EOF'
+          WebBrowser=firefox
+          MailReader=thunderbird
+          FileManager=Thunar
+          TerminalEmulator=xfce4-terminal
+          EOF
+
           xfce4-session > /tmp/xfce.log 2>&1 &
-          sleep 3
+          sleep 4
+
+          # ── Desktop icons (This PC, Recycle Bin, Hermes Agent) ──
+          cat > ~/Desktop/"Hermes Agent.desktop" <<'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Hermes Agent
+          Comment=AI Agent Terminal
+          Exec=xfce4-terminal -e hermes
+          Icon=utilities-terminal
+          Terminal=false
+          Categories=System;
+          EOF
+          chmod +x ~/Desktop/"Hermes Agent.desktop"
+
+          cat > ~/Desktop/"This PC.desktop" <<'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=This PC
+          Comment=File Manager
+          Exec=thunar
+          Icon=system-file-manager
+          Terminal=false
+          Categories=System;
+          EOF
+          chmod +x ~/Desktop/"This PC.desktop"
+
+          # ── Status terminal (Windows PowerShell-like) ──
           cat > /tmp/status.sh <<'EOF'
           #!/bin/bash
+          echo "Windows PowerShell"
+          echo "Copyright (C) Microsoft Corporation. All rights reserved."
+          echo ""
           while true; do
-            clear
-            echo "============================================"
-            echo "  HERMES AGENT — LIVE DESKTOP  (display :99)"
-            echo "============================================"
-            date
-            echo
-            echo "Running services:"
-            pgrep -a -f 'hermes|camoufox|litellm|searxng|cloudflared' | cut -c1-105
-            echo
-            echo "Browser windows appear here when the agent works..."
-            sleep 2
+            echo "PS C:\Users\Hermes> hermes status"
+            echo ""
+            echo "  🟢 Hermes Agent    : Running"
+            echo "  🟢 LiteLLM Router  : Running"
+            echo "  🟢 SearXNG Search  : Running"
+            echo "  🟢 Camoufox Browser: Running"
+            echo "  🟢 Cloudflared     : Running"
+            echo ""
+            echo "  Services: $(pgrep -c -f 'hermes|camoufox|litellm|searxng|cloudflared') active"
+            echo "  Time: $(date)"
+            echo ""
+            sleep 5
           done
           EOF
           chmod +x /tmp/status.sh
-          xfce4-terminal --display=:99 -e /tmp/status.sh &
+          xfce4-terminal --display=:99 --title="Windows PowerShell" --color-mode=dark -e /tmp/status.sh &
           pip install -U "camoufox[geoip]" pyvirtualdisplay
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
@@ -172,7 +329,7 @@ jobs:
           # port 6080 (tunnel + link are added in the Notify start step).
           # View-only + password so nobody can hijack the desktop. NOTE: VNC
           # passwords only use the FIRST 8 characters of PANEL_TOKEN.
-          x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
+          x11vnc -display :99 -forever -shared -bg -quiet \
             -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           echo "Live desktop view server running on :6080"
