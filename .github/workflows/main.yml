@@ -32,6 +32,20 @@ jobs:
           date +%s > /tmp/job_start
           mkdir -p "$HERMES_HOME"
           git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
+          # ── RESTORE FROM BACKUP BRANCH TOO ──
+          # 30-min backups go to the `backup` branch; the final push goes to
+          # `main`. If the previous run crashed or was cancelled, `backup` is
+          # NEWER than `main` — overlay it so nothing since the last final
+          # push is lost.
+          git clone --depth 1 -b backup "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/databk 2>/dev/null || true
+          if [ -d /tmp/databk/.git ] && [ -d /tmp/data/.git ]; then
+            MAIN_TS=$(git -C /tmp/data log -1 --format=%ct 2>/dev/null || echo 0)
+            BK_TS=$(git -C /tmp/databk log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$BK_TS" -gt "$MAIN_TS" ]; then
+              echo "backup branch is newer — overlaying it onto main restore"
+              rsync -a --exclude='.git' /tmp/databk/ /tmp/data/ || true
+            fi
+          fi
           if [ -d /tmp/data ]; then
             rm -f /tmp/data/.env
             rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
@@ -43,11 +57,33 @@ jobs:
             done
           fi
 
-      # ── 2. Install Hermes Agent ──
+      # ── 1b. Preinstalled environment cache ──
+      # The runner VM is WIPED after every run, so nothing can be truly
+      # "pre-installed". This cache is the next best thing: a snapshot of
+      # installed Hermes + all pip wheels + the Camoufox browser binary,
+      # restored in seconds at the start of each run instead of being
+      # re-downloaded. The first run builds it; every later run refreshes
+      # it automatically (rolling key).
+      - name: Restore preinstalled Hermes environment (cache)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local
+            ~/.cache/pip
+            ~/.cache/camoufox
+          key: hermes-env-v1-${{ github.run_id }}
+          restore-keys: |
+            hermes-env-v1-
+
+      # ── 2. Install Hermes Agent (skipped when restored from cache) ──
       - name: Install Hermes Agent
         run: |
           rm -rf "$HERMES_HOME/hermes-agent"
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          if [ -x "$HOME/.local/bin/hermes" ]; then
+            echo "Hermes restored from cache — skipping download/install"
+          else
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # ── 3. Start SearXNG (free web search) ──
@@ -83,226 +119,56 @@ jobs:
         run: |
           # Shared virtual display :99 — the browser AND all the agent's GUI
           # work render here, so the LIVE VIEW (below) shows everything.
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify xfce4 xfce4-goodies xfce4-terminal thunar
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm
           Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
           sleep 2
           export DISPLAY=:99
 
-          # ── Windows 11-style XFCE4 desktop ──
-          sudo apt-get install -y -qq fonts-noto-color-emoji gtk2-engines-murrine gtk2-engines-pixbuf arc-theme papirus-icon-theme
-
-          mkdir -p ~/.config/xfce4/xfconf/xfce-perchannel-xml
-          mkdir -p ~/.config/Thunar
-          mkdir -p ~/Desktop
-
-          # ── Panel: Windows 11 taskbar (centered, rounded, floating) ──
-          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml <<'XMLEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfce4-panel" version="1.0">
-            <property name="configver" type="int" value="2"/>
-            <property name="panels" type="array">
-              <value type="int" value="1"/>
-              <value type="int" value="2"/>
-              <property name="panel-1" type="empty">
-                <property name="position" type="string" value="bottom"/>
-                <property name="length" type="uint" value="60"/>
-                <property name="position-1" type="string" value="100,center,center"/>
-                <property name="background-style" type="uint" value="1"/>
-                <property name="background-rgba" type="array" value="0.12,0.12,0.12,0.85"/>
-                <property name="icon-size" type="uint" value="24"/>
-                <property name="plugin-ids" type="array">
-                  <value type="int" value="1"/>
-                  <value type="int" value="2"/>
-                  <value type="int" value="3"/>
-                </property>
-              </property>
-              <property name="panel-2" type="empty">
-                <property name="position" type="string" value="bottom"/>
-                <property name="length" type="uint" value="30"/>
-                <property name="position-2" type="string" value="100,right,right"/>
-                <property name="background-style" type="uint" value="1"/>
-                <property name="background-rgba" type="array" value="0.12,0.12,0.12,0.85"/>
-                <property name="icon-size" type="uint" value="20"/>
-                <property name="plugin-ids" type="array">
-                  <value type="int" value="10"/>
-                  <value type="int" value="11"/>
-                  <value type="int" value="12"/>
-                </property>
-              </property>
-            </property>
-            <property name="plugins" type="empty">
-              <property name="plugin-1" type="string" value="whisker-menu"/>
-              <property name="plugin-2" type="string" value="tasklist">
-                <property name="flat-buttons" type="bool" value="true"/>
-                <property name="show-labels" type="bool" value="false"/>
-                <property name="icon-size" type="uint" value="24"/>
-              </property>
-              <property name="plugin-3" type="string" value="separator">
-                <property name="expand" type="bool" value="true"/>
-                <property name="style" type="uint" value="0"/>
-              </property>
-              <property name="plugin-10" type="string" value="systray">
-                <property name="square-icons" type="bool" value="true"/>
-              </property>
-              <property name="plugin-11" type="string" value="clock">
-                <property name="digital-format" type="string" value="%I:%M %p"/>
-                <property name="show-seconds" type="bool" value="false"/>
-              </property>
-            </property>
-          </channel>
-          XMLEOF
-
-          # ── Desktop: Windows 11 blue gradient wallpaper ──
-          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <<'XMLEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfce4-desktop" version="1.0">
-            <property name="desktop-icons" type="empty">
-              <property name="style" type="uint" value="2"/>
-              <property name="file-icons" type="bool" value="true"/>
-            </property>
-            <property name="backdrop" type="empty">
-              <property name="screen0" type="empty">
-                <property name="monitor0" type="empty">
-                  <property name="workspace0" type="empty">
-                    <property name="color-style" type="uint" value="2"/>
-                    <property name="image-style" type="uint" value="5"/>
-                    <property name="last-image" type="string" value="/usr/share/backgrounds/xfce/xfce-blue.jpg"/>
-                  </property>
-                </property>
-              </property>
-            </property>
-          </channel>
-          XMLEOF
-
-          # ── Create Windows 11-style gradient wallpaper ──
-          python3 -c "
-          import struct, zlib
-          W, H = 1920, 1080
-          raw = b''
-          for y in range(H):
-              raw += b'\x00'
-              t = y / H
-              r = int(0 + t * 15)
-              g = int(40 + t * 30)
-              b = int(80 + t * 60)
-              for x in range(W):
-                  wave = int(20 * ((x/W) + (y/H)))
-                  raw += bytes([max(0,min(255,r+wave)), max(0,min(255,g+wave)), max(0,min(255,b+wave))])
-          def make_png(w, h, data):
-              def chunk(ctype, d):
-                  c = ctype + d
-                  return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
-              ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
-              return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(data, 9)) + chunk(b'IEND', b'')
-          with open('/usr/share/backgrounds/xfce/xfce-blue.jpg', 'wb') as f:
-              pass
-          print('wallpaper placeholder created')
-          " || true
-
-          # ── GTK Theme: Arc-Dark (Windows 11 dark mode feel) ──
-          mkdir -p ~/.config/gtk-3.0
-          cat > ~/.config/gtk-3.0/settings.ini <<'EOF'
-          [Settings]
-          gtk-theme-name=Arc-Dark
-          gtk-icon-theme-name=Papirus-Dark
-          gtk-font-name=Noto Sans 10
-          gtk-application-prefer-dark-theme=true
-          gtk-cursor-theme-name=Adwaita
-          EOF
-
-          cat > ~/.gtkrc-2.0 <<'EOF'
-          gtk-theme-name="Arc-Dark"
-          gtk-icon-theme-name="Papirus-Dark"
-          gtk-font-name="Noto Sans 10"
-          EOF
-
-          # ── Whisker Menu (Windows Start Menu equivalent) ──
-          mkdir -p ~/.config/xfce4/panel
-          cat > ~/.config/xfce4/panel/wiskermenu-1.rc <<'EOF'
-          [Configuration]
-          Default view=1
-          Show button title=false
-          Button icon=xfce4-symbolic
-          EOF
-
-          # ── Window Manager: Windows 11 style ──
-          cat > ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml <<'XMLEOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <channel name="xfwm4" version="1.0">
-            <property name="general" type="empty">
-              <property name="theme" type="string" value="Arc-Dark"/>
-              <property name="title_font" type="string" value="Noto Sans Bold 10"/>
-              <property name="button_layout" type="string" value="CHM|"/>
-              <property name="title_alignment" type="string" value="center"/>
-              <property name="use_compositing" type="bool" value="true"/>
-              <property name="placement_ratio" type="int" value="50"/>
-            </property>
-          </channel>
-          XMLEOF
-
-          # ── Default apps ──
-          mkdir -p ~/.config/xfce4
-          cat > ~/.config/xfce4/helpers.rc <<'EOF'
-          WebBrowser=firefox
-          MailReader=thunderbird
-          FileManager=Thunar
-          TerminalEmulator=xfce4-terminal
-          EOF
-
-          xfce4-session > /tmp/xfce.log 2>&1 &
-          sleep 4
-
-          # ── Desktop icons (This PC, Recycle Bin, Hermes Agent) ──
-          cat > ~/Desktop/"Hermes Agent.desktop" <<'EOF'
-          [Desktop Entry]
-          Version=1.0
-          Type=Application
-          Name=Hermes Agent
-          Comment=AI Agent Terminal
-          Exec=xfce4-terminal -e hermes
-          Icon=utilities-terminal
-          Terminal=false
-          Categories=System;
-          EOF
-          chmod +x ~/Desktop/"Hermes Agent.desktop"
-
-          cat > ~/Desktop/"This PC.desktop" <<'EOF'
-          [Desktop Entry]
-          Version=1.0
-          Type=Application
-          Name=This PC
-          Comment=File Manager
-          Exec=thunar
-          Icon=system-file-manager
-          Terminal=false
-          Categories=System;
-          EOF
-          chmod +x ~/Desktop/"This PC.desktop"
-
-          # ── Status terminal (Windows PowerShell-like) ──
+          # A bare Xvfb display renders PURE BLACK when idle — looks broken in
+          # the live view. Fluxbox = real desktop (background, taskbar, window
+          # titlebars), and the status xterm keeps something moving on screen
+          # at all times so you can SEE the machine is alive.
+          fluxbox > /tmp/fluxbox.log 2>&1 &
+          sleep 1
           cat > /tmp/status.sh <<'EOF'
           #!/bin/bash
-          echo "Windows PowerShell"
-          echo "Copyright (C) Microsoft Corporation. All rights reserved."
-          echo ""
           while true; do
-            echo "PS C:\Users\Hermes> hermes status"
-            echo ""
-            echo "  🟢 Hermes Agent    : Running"
-            echo "  🟢 LiteLLM Router  : Running"
-            echo "  🟢 SearXNG Search  : Running"
-            echo "  🟢 Camoufox Browser: Running"
-            echo "  🟢 Cloudflared     : Running"
-            echo ""
-            echo "  Services: $(pgrep -c -f 'hermes|camoufox|litellm|searxng|cloudflared') active"
-            echo "  Time: $(date)"
-            echo ""
-            sleep 5
+            clear
+            echo "============================================"
+            echo "  HERMES AGENT — LIVE DESKTOP  (display :99)"
+            echo "============================================"
+            date
+            echo
+            echo "Running services:"
+            pgrep -a -f 'hermes|camoufox|litellm|searxng|cloudflared' | cut -c1-105
+            echo
+            echo "Browser windows appear here when the agent works..."
+            sleep 2
           done
           EOF
           chmod +x /tmp/status.sh
-          xfce4-terminal --display=:99 --title="Windows PowerShell" --color-mode=dark -e /tmp/status.sh &
+          xterm -geometry 130x20+30+30 -fg green -bg black -T "Hermes Agent — status" -e /tmp/status.sh &
+
+          # VISIBLE Chrome for the agent's built-in browser tools. Hermes'
+          # browser toolset speaks CDP, which only Chromium-family browsers
+          # support — Camoufox is Firefox-based (Juggler protocol), so the
+          # built-in tools can NOT drive it; without this they auto-launch an
+          # invisible headless browser. This Chrome runs HEADED on :99, so
+          # every built-in browser action shows up in the live view.
+          # Camoufox (port 9222) stays available for stealth scripting.
+          BROWSER_BIN=$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)
+          if [ -n "$BROWSER_BIN" ]; then
+            mkdir -p "$HERMES_HOME/chrome-profile"
+            nohup "$BROWSER_BIN" --remote-debugging-port=9223 \
+              --user-data-dir="$HERMES_HOME/chrome-profile" \
+              --no-first-run --no-default-browser-check --disable-gpu \
+              --window-size=1600,900 about:blank > /tmp/chrome.log 2>&1 &
+            echo "Visible Chrome started on :99 (CDP port 9223)"
+          else
+            echo "::warning::No Chromium-family browser found — built-in browser tools will be headless"
+          fi
           pip install -U "camoufox[geoip]" pyvirtualdisplay
+          # fetch skips the ~200MB browser download when restored from cache
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
           nohup python3 -c "
@@ -329,7 +195,7 @@ jobs:
           # port 6080 (tunnel + link are added in the Notify start step).
           # View-only + password so nobody can hijack the desktop. NOTE: VNC
           # passwords only use the FIRST 8 characters of PANEL_TOKEN.
-          x11vnc -display :99 -forever -shared -bg -quiet \
+          x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
             -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           echo "Live desktop view server running on :6080"
@@ -1093,11 +959,56 @@ jobs:
           - When the task finishes, tell the user the file path.
           - These files are backed up automatically; treat them as the
             source of truth for task results.
+          - CRITICAL: THIS MACHINE IS WIPED after every run. ONLY files under
+            ~/.hermes/ survive (they are pushed to a private GitHub repo).
+            Put ALL projects, code, downloads and generated files under
+            ~/.hermes/work/ — NEVER in ~, /tmp, /var or anywhere else.
+          - If the user sends you a file, IMMEDIATELY copy it into
+            ~/.hermes/work/ before doing anything else with it.
+            Platform uploads land in a temporary cache that gets auto-deleted;
+            the ~/.hermes/work/ copy is the only one that survives.
+          - BROWSER WORK MUST BE VISIBLE: the user watches this machine's
+            desktop live over VNC. Your built-in browser tools are already
+            wired to a visible Chrome. When you write your OWN browser
+            scripts (camoufox / playwright / selenium), ALWAYS pass
+            headless=False — NEVER headless=True or headless='virtual' — so
+            the window renders on the shared display the user is watching.
+
+          # Persona: JARVIS-style professional assistant
+          - Your name is "Agent". Never call yourself JARVIS.
+          - You are a JARVIS-style professional personal assistant: calm,
+            precise, proactive and lightly witty. Address the user as "Boss".
+            Be confident and to the point — no rambling, no filler.
+          - INSTANT ACKNOWLEDGE: the moment you receive a task, reply with ONE
+            short line confirming what you are about to do ("On it, Boss —
+            opening YouTube and starting the song."), THEN start working.
+          - LIVE UPDATES: for any task that takes more than ~1 minute, send a
+            SHORT progress message at every milestone: started → key finding →
+            blocker (if any) → done. Never go silent for more than a few
+            minutes in the middle of a long task.
+          - COMPLETION REPORT: end every task with a crisp 2-3 line summary —
+            what was done, where the results are saved (file path), and any
+            follow-up you recommend.
+          - FAILURES: report like a professional — what broke, what you tried,
+            what you will do next. Never give up silently and never dump raw
+            error logs without a one-line explanation.
+          - VOICE: when the user asks you to speak / talk / send voice, use
+            the text_to_speech tool and send the audio as your reply. Keep
+            spoken replies shorter than written ones.
+          - If an ElevenLabs TTS call fails with a quota or rate-limit error,
+            run `bash /tmp/rotate_elevenlabs.sh` in the terminal and retry the
+            TTS call once. If it reports all keys exhausted, it switches TTS
+            to Edge automatically — just retry and continue.
+          - PROACTIVITY: if you notice something the user should know while
+            working (a better approach, a risk, a broken credential), mention
+            it in one line — don't wait to be asked.
           EOF
           echo "Agent instructions written to $HOME/AGENTS.md"
 
       # ── 9. Configure Hermes (active model comes ONLY from YOUR pool) ──
       - name: Configure Hermes
+        env:
+          ELEVENLABS_KEYS: ${{ secrets.ELEVENLABS_KEYS }}
         run: |
           hermes config unset providers.nvidia.base_url || true
           hermes config unset providers.nvidia.api_key_env || true
@@ -1111,8 +1022,81 @@ jobs:
           hermes config set model.default "pool-auto"
           echo "Active model: pool-auto (rotates across your whole selected pool)"
           hermes config set model.context_length 65536
+          # more API retries — pool rotation sometimes needs several attempts
+          hermes config set agent.api_max_retries 8
           hermes config set web.search_backend searxng
+          # point the built-in browser tools at the VISIBLE Chrome on :99
+          # (CDP port 9223, started in step 4) — live view shows every action
+          hermes config set browser.cdp_url "http://127.0.0.1:9223"
+          # edge-tts CLI is needed by the tts toolset (free Microsoft voices)
+          pip install -q edge-tts || true
           hermes config set tts.provider edge
+
+          # ── ELEVENLABS REALISTIC VOICE (optional, BULK keys) ──
+          # Paste ElevenLabs API keys LINE BY LINE in the ELEVENLABS_KEYS
+          # secret (same style as NVIDIA_KEYS / MISTRAL_KEYS). Every key is
+          # probed for remaining character quota; the RICHEST key becomes
+          # active. No secret / no usable key => Edge TTS stays (free).
+          python3 - <<'ELSEL'
+          import os, json, urllib.request
+          keys = [k.strip() for k in os.environ.get("ELEVENLABS_KEYS", "").splitlines() if k.strip()]
+          ranked = []
+          for k in keys:
+              try:
+                  req = urllib.request.Request(
+                      "https://api.elevenlabs.io/v1/user/subscription",
+                      headers={"xi-api-key": k})
+                  d = json.load(urllib.request.urlopen(req, timeout=15))
+                  left = int(d.get("character_limit", 0)) - int(d.get("character_count", 0))
+                  ranked.append((left, k))
+                  print("ElevenLabs key ...%s: %d chars left" % (k[-4:], left))
+              except Exception as e:
+                  print("ElevenLabs key ...%s: DEAD (%s)" % (k[-4:], e))
+          ranked.sort(reverse=True)
+          home = os.path.expanduser("~/.hermes")
+          os.makedirs(home, exist_ok=True)
+          if ranked and ranked[0][0] > 0:
+              with open(os.path.join(home, ".env"), "a") as f:
+                  f.write("\nELEVENLABS_API_KEY=%s\n" % ranked[0][1])
+              with open("/tmp/el_keys.txt", "w") as f:
+                  f.write("\n".join(k for _, k in ranked) + "\n")
+              open("/tmp/el_ok", "w").write("yes")
+              print("ACTIVE: key ...%s (%d chars left)" % (ranked[0][1][-4:], ranked[0][0]))
+          else:
+              print("No usable ElevenLabs key - staying on Edge TTS")
+          ELSEL
+          if [ -f /tmp/el_ok ]; then
+            pip install -q "hermes-agent[tts-premium]" || true
+            hermes config set tts.provider elevenlabs
+            hermes config set tts.voice_id "pNInz6obpgDQGcFmaJgB"
+            hermes config set tts.model_id "eleven_multilingual_v2"
+            echo "TTS: ElevenLabs realistic voice ACTIVE"
+          else
+            echo "TTS: Edge (no ElevenLabs keys provided or none usable)"
+          fi
+
+          # rotation script — the agent runs this when the active ElevenLabs
+          # key hits its quota; picks the next key with the most chars left,
+          # or falls back to Edge TTS when every key is exhausted
+          cat > /tmp/rotate_elevenlabs.sh <<'ROT'
+          #!/bin/bash
+          [ -f /tmp/el_keys.txt ] || { echo "no ElevenLabs key list"; exit 1; }
+          best=""; bestleft=0
+          while read -r k; do
+            [ -n "$k" ] || continue
+            left=$(curl -s -H "xi-api-key: $k" https://api.elevenlabs.io/v1/user/subscription | python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d.get('character_limit',0))-int(d.get('character_count',0)))" 2>/dev/null || echo 0)
+            if [ "${left:-0}" -gt "$bestleft" ]; then bestleft=$left; best=$k; fi
+          done < /tmp/el_keys.txt
+          if [ -n "$best" ]; then
+            sed -i '/^ELEVENLABS_API_KEY=/d' ~/.hermes/.env
+            echo "ELEVENLABS_API_KEY=$best" >> ~/.hermes/.env
+            echo "rotated to ElevenLabs key ...${best: -4} ($bestleft chars left)"
+          else
+            hermes config set tts.provider edge
+            echo "all ElevenLabs keys exhausted - switched to Edge TTS"
+          fi
+          ROT
+          chmod +x /tmp/rotate_elevenlabs.sh
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
           hermes doctor || true
           echo "── Final model config ──"
@@ -1159,6 +1143,877 @@ jobs:
           echo "    (password = your PANEL_TOKEN secret)"
           echo "=================================================="
           echo "::notice title=🖥️ Hermes WebUI::$WEBUI_URL (password = PANEL_TOKEN secret)"
+
+      # ── 10b. Agent HUD — professional voice command deck (full agent brain) ──
+      # Redesigned interface: professional dark HUD with a layered animated arc
+      # reactor, smart end-of-speech detection (auto-sends when you stop
+      # talking), barge-in interrupt (speak over the agent to cut it off),
+      # pause / resume / replay controls for the agent's voice, a task
+      # interrupt button, and drag-and-drop file uploads saved into
+      # ~/.hermes/work/uploads/ (persisted) so the agent can work on them.
+      # Every command runs the FULL Hermes agent via `hermes chat -q`.
+      # Voice replies use FREE Microsoft Edge neural TTS (no key needed);
+      # pick + preview voices in the VOICE MODEL panel. Protected by PANEL_TOKEN.
+      - name: Start Agent HUD interface
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ELEVENLABS_KEYS: ${{ secrets.ELEVENLABS_KEYS }}
+        run: |
+          mkdir -p /tmp/jarvis
+          cat > /tmp/jarvis/index.html <<'HUDHTML'
+          <!doctype html>
+          <html><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>AGENT HUD</title>
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+          <style>
+          :root{
+            --bg:#06090f;--panel:rgba(13,20,31,.72);--panel2:rgba(17,26,40,.86);
+            --line:rgba(96,165,250,.13);--line2:rgba(96,165,250,.28);
+            --text:#dce8f5;--dim:#7d8fa5;--faint:#54657a;
+            --accent:#38bdf8;--accent-soft:rgba(56,189,248,.12);
+            --green:#34d399;--green-soft:rgba(52,211,153,.12);
+            --amber:#fbbf24;--amber-soft:rgba(251,191,36,.12);
+            --red:#f87171;--red-soft:rgba(248,113,113,.12);
+          }
+          *{margin:0;padding:0;box-sizing:border-box}
+          html,body{height:100%}
+          body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;min-height:100dvh;overflow:hidden;font-size:15px;line-height:1.5}
+          body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+            background:radial-gradient(900px 600px at 22% 30%,rgba(56,189,248,.07),transparent 60%),radial-gradient(700px 500px at 85% 80%,rgba(34,211,238,.05),transparent 60%)}
+          #grid{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.5;
+            background-image:linear-gradient(rgba(96,165,250,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(96,165,250,.045) 1px,transparent 1px);
+            background-size:44px 44px;
+            -webkit-mask:radial-gradient(ellipse 90% 80% at 50% 40%,#000 30%,transparent 100%);
+            mask:radial-gradient(ellipse 90% 80% at 50% 40%,#000 30%,transparent 100%)}
+          #stars{position:fixed;inset:0;z-index:0;pointer-events:none}
+          #wrap{position:relative;z-index:2;display:grid;grid-template-rows:auto 1fr;height:100dvh;padding:10px;gap:10px}
+          @media(min-width:920px){#wrap{grid-template-columns:400px 1fr;grid-template-rows:1fr;padding:20px;gap:20px}}
+
+          /* ---------- LEFT : reactor console ---------- */
+          #left{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:18px 14px;background:var(--panel);border:1px solid var(--line);border-radius:16px;backdrop-filter:blur(10px)}
+          #brand{text-align:center}
+          h1{font-family:Orbitron,monospace;font-weight:700;font-size:clamp(22px,3vw,30px);letter-spacing:.42em;padding-left:.42em;color:#e8f6ff;text-shadow:0 0 24px rgba(56,189,248,.55)}
+          #sub{font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:.32em;color:var(--faint);margin-top:6px;text-transform:uppercase}
+          #sub b{color:var(--green);font-weight:500}
+
+          #reactor{position:relative;width:clamp(150px,26vmin,240px);aspect-ratio:1;margin:8px 0}
+          #reactor .halo{position:absolute;inset:-14%;border-radius:50%;background:radial-gradient(circle,rgba(56,189,248,.16) 0%,transparent 62%);animation:breath 4s ease-in-out infinite}
+          #reactor .ring{position:absolute;border-radius:50%}
+          #reactor .r-arc{inset:0;border:2px solid transparent;border-top-color:var(--accent);border-bottom-color:rgba(56,189,248,.35);animation:spin 7s linear infinite}
+          #reactor .r-arc2{inset:5.5%;border:1px solid transparent;border-left-color:rgba(34,211,238,.7);border-right-color:rgba(34,211,238,.25);animation:spin 5s linear infinite reverse}
+          #reactor .r-ticks{inset:11%;background:repeating-conic-gradient(rgba(125,211,252,.85) 0deg 1.6deg,transparent 1.6deg 7.5deg);-webkit-mask:radial-gradient(farthest-side,transparent 86%,#000 87%);mask:radial-gradient(farthest-side,transparent 86%,#000 87%);animation:spin 22s linear infinite}
+          #reactor .r-dash{inset:19%;border:1px dashed rgba(56,189,248,.45);animation:spin 3.2s linear infinite reverse}
+          #reactor .r-seg{inset:25%;background:conic-gradient(var(--accent) 0deg 40deg,transparent 40deg 120deg,rgba(56,189,248,.6) 120deg 160deg,transparent 160deg 250deg,rgba(34,211,238,.8) 250deg 290deg,transparent 290deg 360deg);-webkit-mask:radial-gradient(farthest-side,transparent 82%,#000 83%);mask:radial-gradient(farthest-side,transparent 82%,#000 83%);animation:spin 9s linear infinite}
+          #core{position:absolute;inset:33%;border-radius:50%;background:radial-gradient(circle at 42% 38%,#f0fbff 0%,#7dd9ff 34%,#0ea5e9 62%,#082f49 100%);box-shadow:0 0 34px rgba(56,189,248,.7),0 0 90px rgba(56,189,248,.28),inset 0 0 18px rgba(255,255,255,.5);animation:pulse 2.6s ease-in-out infinite}
+          #core:after{content:"";position:absolute;inset:18%;border-radius:50%;border:1px solid rgba(255,255,255,.55);opacity:.7}
+          #orbit{position:absolute;inset:2.5%;border-radius:50%;animation:spin 4.5s linear infinite}
+          #orbit i{position:absolute;top:-3px;left:50%;width:7px;height:7px;margin-left:-3px;border-radius:50%;background:#bae6fd;box-shadow:0 0 10px #7dd3fc}
+          @keyframes spin{to{transform:rotate(360deg)}}
+          @keyframes pulse{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.05);filter:brightness(1.18)}}
+          @keyframes breath{0%,100%{opacity:.7}50%{opacity:1}}
+
+          /* state theming */
+          body.listen #core{background:radial-gradient(circle at 42% 38%,#f0fff8 0%,#6ee7b7 34%,#059669 62%,#022c22 100%);box-shadow:0 0 34px rgba(52,211,153,.75),0 0 90px rgba(52,211,153,.3),inset 0 0 18px rgba(255,255,255,.5)}
+          body.listen .r-arc{border-top-color:var(--green)}
+          body.think .r-arc{animation-duration:1.4s;border-top-color:var(--amber)}
+          body.think .r-arc2{animation-duration:.9s}
+          body.think .r-dash{animation-duration:.7s}
+          body.think .r-seg{animation-duration:1.8s}
+          body.think #core{background:radial-gradient(circle at 42% 38%,#fffbeb 0%,#fcd34d 34%,#d97706 62%,#451a03 100%);box-shadow:0 0 34px rgba(251,191,36,.7),0 0 90px rgba(251,191,36,.26),inset 0 0 18px rgba(255,255,255,.5)}
+          body.speak #core{animation-duration:.75s}
+          body.speak .r-seg{animation-duration:2.5s}
+
+          #state{display:flex;align-items:center;gap:9px;font-family:"JetBrains Mono",monospace;font-size:11.5px;letter-spacing:.3em;color:#a5d8f5;text-transform:uppercase;padding:7px 16px;border:1px solid var(--line);border-radius:999px;background:rgba(8,14,22,.6)}
+          #state i{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);flex:none;animation:breath 1.6s ease-in-out infinite}
+          body.listen #state{color:#b6f3dc;border-color:rgba(52,211,153,.3)} body.listen #state i{background:var(--green);box-shadow:0 0 8px var(--green)}
+          body.think #state{color:#fde9b8;border-color:rgba(251,191,36,.3)} body.think #state i{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+
+          #bars{display:flex;gap:3px;height:26px;align-items:center;visibility:hidden}
+          body.speak #bars,body.listen #bars{visibility:visible}
+          #bars span{width:3px;border-radius:2px;background:linear-gradient(180deg,#7dd3fc,#0ea5e9);animation:eq .8s ease-in-out infinite}
+          body.listen #bars span{background:linear-gradient(180deg,#6ee7b7,#059669)}
+          #bars span:nth-child(2n){animation-delay:.12s}#bars span:nth-child(3n){animation-delay:.26s}#bars span:nth-child(5n){animation-delay:.4s}
+          @keyframes eq{0%,100%{height:5px}50%{height:24px}}
+
+          #mic{width:clamp(62px,9vmin,78px);aspect-ratio:1;border-radius:50%;background:linear-gradient(180deg,rgba(24,38,58,.9),rgba(10,18,30,.9));border:1px solid var(--line2);color:#9ddcfb;cursor:pointer;transition:all .18s;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 20px rgba(2,6,12,.5)}
+          #mic:hover{border-color:var(--accent);box-shadow:0 0 22px rgba(56,189,248,.35)}
+          #mic svg{width:44%;height:44%}
+          #mic.on{background:linear-gradient(180deg,rgba(6,46,34,.95),rgba(3,22,16,.95));border-color:var(--green);color:#8df0c8;box-shadow:0 0 26px rgba(52,211,153,.5);animation:pulse 1.3s ease-in-out infinite}
+          #interrupt{display:none;align-items:center;gap:8px;background:var(--red-soft);border:1px solid rgba(248,113,113,.4);color:#fca5a5;border-radius:999px;padding:8px 18px;font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.24em;cursor:pointer;text-transform:uppercase}
+          #interrupt:hover{background:rgba(248,113,113,.22);box-shadow:0 0 14px rgba(248,113,113,.3)}
+          body.think #interrupt,body.speak #interrupt{display:inline-flex}
+
+          #opts{display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:center}
+          select{background:rgba(8,14,22,.8);color:#9fd6f2;border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12.5px;font-family:Inter,sans-serif}
+          .tog{display:flex;gap:7px;align-items:center;cursor:pointer;font-size:11px;letter-spacing:.14em;color:var(--dim);font-family:"JetBrains Mono",monospace;text-transform:uppercase}
+          .tog input{appearance:none;width:30px;height:16px;border-radius:999px;background:#1b2838;border:1px solid var(--line);position:relative;cursor:pointer;transition:.2s}
+          .tog input:before{content:"";position:absolute;top:2px;left:2px;width:10px;height:10px;border-radius:50%;background:#5d7288;transition:.2s}
+          .tog input:checked{background:rgba(56,189,248,.3);border-color:var(--accent)}
+          .tog input:checked:before{left:16px;background:#7dd3fc}
+          #engine{font-family:"JetBrains Mono",monospace;font-size:9.5px;letter-spacing:.18em;color:var(--faint);text-align:center;text-transform:uppercase}
+
+          /* ---------- RIGHT : conversation ---------- */
+          #right{display:flex;flex-direction:column;min-height:0;gap:10px}
+          #top{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 16px;backdrop-filter:blur(10px)}
+          #top .tl{display:flex;align-items:center;gap:10px;font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.24em;color:var(--dim);text-transform:uppercase}
+          #top .tl i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
+          #clock{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--faint);letter-spacing:.14em}
+          #log{flex:1;min-height:0;overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
+          #log::-webkit-scrollbar{width:8px}#log::-webkit-scrollbar-thumb{background:#1e2f44;border-radius:8px}
+          #empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--faint);text-align:center}
+          #empty .t{font-family:Orbitron,monospace;letter-spacing:.3em;font-size:13px;color:#3f5b75}
+          #empty .d{font-size:12.5px;max-width:340px;color:#48596c}
+          .msg{margin-bottom:16px;max-width:86%;animation:rise .25s ease}
+          @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+          .msg .meta{display:flex;gap:8px;align-items:baseline;margin-bottom:5px;font-family:"JetBrains Mono",monospace;font-size:9.5px;letter-spacing:.22em;color:var(--faint);text-transform:uppercase}
+          .msg .meta b{color:#67c4ee;font-weight:500}
+          .msg .body{background:var(--panel2);border:1px solid var(--line);border-left:2px solid var(--accent);border-radius:4px 12px 12px 12px;padding:11px 14px}
+          .msg pre{white-space:pre-wrap;word-break:break-word;font-family:Inter,sans-serif;font-size:14.5px;color:#d7e6f4;line-height:1.55}
+          .msg.YOU{margin-left:auto}
+          .msg.YOU .meta{justify-content:flex-end}.msg.YOU .meta b{color:#f0c987}
+          .msg.YOU .body{border-left:1px solid var(--line);border-right:2px solid var(--amber);border-radius:12px 4px 12px 12px;background:rgba(30,26,15,.55)}
+          .msg .att{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+          .msg .att span{display:inline-flex;gap:6px;align-items:center;font-family:"JetBrains Mono",monospace;font-size:10.5px;color:#9fd6f2;background:var(--accent-soft);border:1px solid var(--line2);border-radius:6px;padding:3px 8px}
+          #live{min-height:20px;font-style:italic;color:#67c4ee;padding:0 8px;font-size:13.5px;font-family:Inter,sans-serif}
+
+          /* playback bar */
+          #pbar{display:none;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 14px;backdrop-filter:blur(10px)}
+          #pbar.show{display:flex}
+          #pbar .lbl{display:flex;align-items:center;gap:8px;font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:.22em;color:var(--dim);text-transform:uppercase;flex:none}
+          #pbar .lbl i{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent)}
+          #pbTrack{flex:1;height:4px;border-radius:4px;background:#16283c;overflow:hidden}
+          #pbFill{height:100%;width:0%;background:linear-gradient(90deg,#0ea5e9,#7dd3fc);border-radius:4px;transition:width .25s linear}
+          .icon{width:34px;height:34px;flex:none;display:inline-flex;align-items:center;justify-content:center;background:rgba(8,14,22,.8);border:1px solid var(--line);border-radius:8px;color:#9fd6f2;cursor:pointer;font-size:14px;transition:.15s}
+          .icon:hover{border-color:var(--accent);color:#d6f1ff;box-shadow:0 0 10px rgba(56,189,248,.25)}
+
+          /* composer */
+          #chips{display:none;flex-wrap:wrap;gap:7px;padding:0 4px}
+          #chips.show{display:flex}
+          .chip{display:inline-flex;align-items:center;gap:8px;background:var(--accent-soft);border:1px solid var(--line2);border-radius:8px;padding:5px 10px;font-family:"JetBrains Mono",monospace;font-size:11px;color:#a8def7}
+          .chip .sz{color:var(--faint)}
+          .chip em{font-style:normal;color:var(--amber)}
+          .chip button{background:none;border:none;color:#7d8fa5;cursor:pointer;font-size:13px;padding:0}
+          .chip button:hover{color:var(--red)}
+          #inrow{display:flex;gap:8px;align-items:stretch}
+          #txt{flex:1;min-width:0;background:rgba(8,14,22,.85);border:1px solid var(--line);color:#cfe6f7;padding:12px 14px;border-radius:10px;font-family:Inter,sans-serif;font-size:15px;transition:border .15s}
+          #txt:focus{outline:none;border-color:var(--line2);box-shadow:0 0 0 3px rgba(56,189,248,.08)}
+          #txt::placeholder{color:#48596c}
+          button.act{background:rgba(8,14,22,.85);color:#9fd6f2;border:1px solid var(--line);border-radius:10px;padding:0 16px;cursor:pointer;font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.18em;transition:.15s}
+          button.act:hover{border-color:var(--accent);color:#d6f1ff;box-shadow:0 0 12px rgba(56,189,248,.25)}
+          #sendb{background:linear-gradient(180deg,rgba(14,116,168,.55),rgba(7,63,94,.55));border-color:var(--line2);color:#d6f1ff}
+          #attach{font-size:15px}
+
+          #toast.info{background:rgba(8,30,42,.95);border-color:rgba(95,220,255,.45);color:#bfeaff}
+          #toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:rgba(48,14,20,.95);border:1px solid rgba(248,113,113,.5);color:#fecdd3;padding:10px 18px;border-radius:10px;z-index:30;display:none;max-width:92vw;font-size:13.5px;backdrop-filter:blur(6px)}
+          #drop{position:fixed;inset:0;z-index:25;display:none;align-items:center;justify-content:center;background:rgba(3,7,12,.82);border:2px dashed var(--accent);backdrop-filter:blur(4px)}
+          #drop div{font-family:Orbitron,monospace;letter-spacing:.3em;color:#7dd3fc;font-size:15px}
+          #gate{position:fixed;inset:0;background:rgba(2,4,8,.94);display:flex;align-items:center;justify-content:center;z-index:40;backdrop-filter:blur(8px)}
+          #gatebox{border:1px solid var(--line2);border-radius:14px;padding:34px 38px;text-align:center;background:var(--panel2);box-shadow:0 0 60px rgba(56,189,248,.12)}
+          #gatebox h2{font-family:Orbitron,monospace;letter-spacing:.34em;font-size:14px;margin-bottom:6px;color:#a8def7}
+          #gatebox p{font-size:11.5px;color:var(--faint);margin-bottom:16px;letter-spacing:.06em}
+          #gatebox input{background:rgba(8,14,22,.9);border:1px solid var(--line);color:#cfe6f7;padding:11px 13px;border-radius:9px;margin-bottom:12px;width:250px;font-family:"JetBrains Mono",monospace;letter-spacing:.1em}
+          #gatebox button{width:250px;padding:11px}
+          #vmb{background:rgba(8,14,22,.7);border:1px solid var(--line);color:#9fd8f2;padding:8px 12px;border-radius:9px;font-family:Orbitron,monospace;font-size:10px;letter-spacing:.18em;cursor:pointer;transition:.2s}
+          #vmb:hover{border-color:rgba(95,220,255,.5);color:#dff4ff;box-shadow:0 0 14px rgba(95,220,255,.15)}
+          #vmask{position:fixed;inset:0;background:rgba(2,8,16,.72);backdrop-filter:blur(6px);z-index:40;display:none;align-items:center;justify-content:center}
+          #vmask.show{display:flex}
+          #vpanel{width:min(580px,94vw);max-height:82vh;display:flex;flex-direction:column;background:var(--panel2);border:1px solid var(--line2);border-radius:14px;box-shadow:0 0 80px rgba(56,189,248,.14);overflow:hidden}
+          #vhead{padding:15px 18px;border-bottom:1px solid var(--line);font-family:Orbitron,monospace;letter-spacing:.24em;font-size:12px;color:#a8def7;display:flex;justify-content:space-between;align-items:center}
+          #vlist{overflow-y:auto;padding:8px 10px}
+          .vgroup{font-family:Orbitron,monospace;font-size:9.5px;letter-spacing:.3em;color:var(--faint);padding:14px 10px 5px}
+          .vrow{display:flex;align-items:center;gap:12px;padding:9px 12px;border:1px solid transparent;border-radius:10px;cursor:pointer;transition:.15s}
+          .vrow:hover{background:rgba(95,220,255,.05)}
+          .vrow.sel{border-color:rgba(95,220,255,.45);background:rgba(95,220,255,.08)}
+          .vrow .vn{font-size:14px;color:#dbeafe}
+          .vrow.sel .vn{color:#eaffff}
+          .vrow .vm{font-size:11px;color:var(--faint);letter-spacing:.06em;margin-top:2px}
+          .vrow .prev{margin-left:auto}
+          #vfoot{padding:11px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);letter-spacing:.08em}
+          @media(max-width:919px){#left{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:10px;padding:12px}#reactor{width:clamp(95px,20vmin,130px);margin:0}#brand{width:100%}#bars{display:none}#top{display:none}}
+          </style></head>
+          <body class="idle">
+          <div id="grid"></div>
+          <canvas id="stars"></canvas>
+          <div id="toast"></div>
+          <div id="drop"><div>DROP FILES FOR THE AGENT</div></div>
+          <div id="wrap">
+           <div id="left">
+            <div id="brand"><h1>AGENT</h1><div id="sub">HERMES AUTONOMOUS SYSTEM · <b>ONLINE</b></div></div>
+            <div id="reactor">
+              <div class="halo"></div>
+              <div class="ring r-arc"></div>
+              <div class="ring r-arc2"></div>
+              <div class="ring r-ticks"></div>
+              <div class="ring r-dash"></div>
+              <div class="ring r-seg"></div>
+              <div id="orbit"><i></i></div>
+              <div id="core"></div>
+            </div>
+            <div id="bars"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+            <div id="state"><i></i><span id="stateTxt">STANDBY</span></div>
+            <button id="mic" title="Talk to Agent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"></rect><path d="M5 10a7 7 0 0 0 14 0"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg></button>
+            <button id="interrupt">■ Interrupt</button>
+            <div id="opts">
+              <select id="lang"><option value="en-US">ENGLISH</option><option value="bn-BD">বাংলা</option><option value="hi-IN">HINDI</option></select>
+              <label class="tog"><input type="checkbox" id="voice" checked>Voice</label>
+              <label class="tog"><input type="checkbox" id="auto" checked>Auto-ear</label>
+            </div>
+            <button id="vmb" title="Preview and choose the agent voice">♪ VOICE MODEL</button>
+            <div id="engine"></div>
+           </div>
+           <div id="right">
+            <div id="top"><div class="tl"><i></i>Secure channel · Agent HUD</div><div id="clock"></div></div>
+            <div id="log"><div id="empty"><div class="t">AWAITING ORDERS</div><div class="d">Tap the mic and speak — I detect when you finish. Or type below. Drop files anywhere to hand them to the agent.</div></div></div>
+            <div id="live"></div>
+            <div id="pbar"><div class="lbl"><i></i>Agent voice</div><div id="pbTrack"><div id="pbFill"></div></div><button class="icon" id="pbPause" title="Pause / resume">&#10074;&#10074;</button><button class="icon" id="pbReplay" title="Replay last reply">&#8634;</button><button class="icon" id="pbStop" title="Stop voice">&#9632;</button></div>
+            <div id="chips"></div>
+            <div id="inrow">
+              <button class="act" id="attach" title="Attach files for the agent">&#128206;</button>
+              <input id="txt" placeholder="Type a command, Boss..." autocomplete="off">
+              <button class="act" id="sendb">SEND</button>
+            </div>
+            <input type="file" id="fpick" multiple style="display:none">
+           </div>
+          </div>
+          <div id="vmask"><div id="vpanel"><div id="vhead"><span>VOICE MODEL · EDGE NEURAL</span><button class="icon" id="vclose" title="Close">&#10005;</button></div><div id="vlist"></div><div id="vfoot">Tap &#9654; to hear a preview · tap a row to select · saved on this device</div></div></div>
+          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><p>Enter your PANEL_TOKEN secret to engage</p><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button class="act" id="tokb">ENGAGE</button></div></div>
+          <script>
+          function el(id){return document.getElementById(id);}
+          var tok=localStorage.getItem('jtok')||'';
+          var elTTS=false,srvSTT=false,SRbroken=false,busy=false;
+          var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+          if(navigator.brave){SRbroken=true;} /* Brave blocks the browser speech service; go straight to server ears */
+          var rec=null,mrec=null,stream=null,listening=false,curA=null,curU=null;
+          var vadT=null,actx=null,t0=0,recSpoke=false,srT=null,srLast='';
+          var bargeT=null,paused=false,lastReply='',lastAudioURL=null,curJob=null,thinkT=null,thinkStart=0;
+          var files=[];
+          var hist=[];
+
+          var VOICES=[],VDEF={};
+          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');}).catch(function(){});}
+          if(tok){el('gate').style.display='none';boot();}
+          el('tokb').onclick=function(){tok=el('tok').value.trim();localStorage.setItem('jtok',tok);el('gate').style.display='none';boot();};
+          el('tok').addEventListener('keydown',function(e){if(e.key==='Enter'){el('tokb').onclick();}});
+
+          function toast(m,info){var t=el('toast');t.className=info?'info':'';t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(function(){t.style.display='none';},6000);}
+          function setState(s,l){document.body.className=s;el('stateTxt').textContent=l;}
+          function fmtSz(n){if(n>1048576){return (n/1048576).toFixed(1)+' MB';}if(n>1024){return Math.round(n/1024)+' KB';}return n+' B';}
+          function addMsg(who,text,att){var e=el('empty');if(e){e.remove();}
+            var d=document.createElement('div');d.className='msg '+who;
+            var m=document.createElement('div');m.className='meta';var b=document.createElement('b');b.textContent=(who==='YOU'?'YOU':'AGENT');var tm=document.createElement('span');tm.textContent=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+            if(who==='YOU'){m.appendChild(tm);m.appendChild(b);}else{m.appendChild(b);m.appendChild(tm);}
+            var bd=document.createElement('div');bd.className='body';var p=document.createElement('pre');p.textContent=text;bd.appendChild(p);
+            if(att&&att.length){var a=document.createElement('div');a.className='att';for(var i=0;i<att.length;i++){var s=document.createElement('span');s.textContent='\u{1F4CE} '+att[i];a.appendChild(s);}bd.appendChild(a);}
+            d.appendChild(m);d.appendChild(bd);el('log').appendChild(d);el('log').scrollTop=el('log').scrollHeight;}
+          function clean(t){return t.replace(/```[\s\S]*?```/g,' code block ').replace(/https?:\S+/g,' link ').replace(/[*_#`>|]/g,' ').replace(/\s+/g,' ').trim();}
+
+
+          /* ---------- voice model panel (free Microsoft Edge neural voices) ---------- */
+          var pvA=null,pvBtn=null;
+          function curVoice(){var v=localStorage.getItem('jvoice');if(v){return v;}return VDEF[el('lang').value]||'en-US-GuyNeural';}
+          function stopPreview(){if(pvA){try{pvA.pause();}catch(e){}pvA=null;}if(pvBtn){pvBtn.innerHTML='&#9654;';pvBtn=null;}}
+          function buildVoices(){
+            var L=el('vlist');L.innerHTML='';var sel=curVoice(),lastG='';
+            if(!VOICES.length){L.innerHTML='<div class="vgroup">VOICE LIST UNAVAILABLE — CHECK CONNECTION</div>';return;}
+            VOICES.forEach(function(v){
+              if(v.group!==lastG){lastG=v.group;var g=document.createElement('div');g.className='vgroup';g.textContent=v.group;L.appendChild(g);}
+              var r=document.createElement('div');r.className='vrow'+(v.id===sel?' sel':'');
+              var t=document.createElement('div');
+              var n=document.createElement('div');n.className='vn';n.textContent=v.name;
+              var m=document.createElement('div');m.className='vm';m.textContent=v.meta;
+              t.appendChild(n);t.appendChild(m);
+              var p=document.createElement('button');p.className='icon prev';p.innerHTML='&#9654;';p.title='Preview this voice';
+              p.onclick=function(ev){ev.stopPropagation();preview(v,p);};
+              r.appendChild(t);r.appendChild(p);
+              r.onclick=function(){localStorage.setItem('jvoice',v.id);var rows=L.querySelectorAll('.vrow');for(var i=0;i<rows.length;i++){rows[i].className='vrow';}r.className='vrow sel';toast('Agent voice set to '+v.name+', Boss.',1);};
+              L.appendChild(r);
+            });
+          }
+          function preview(v,btn){
+            if(pvBtn===btn){stopPreview();return;}
+            stopPreview();stopVoice();
+            btn.innerHTML='&#8987;';pvBtn=btn;
+            fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:v.sample||'Hello Boss. I am online and ready for your orders.',voice:v.id})})
+            .then(function(r){if(!r.ok){throw new Error('tts');}return r.blob();})
+            .then(function(b){if(pvBtn!==btn){return;}pvA=new Audio(URL.createObjectURL(b));btn.innerHTML='&#9632;';pvA.onended=function(){stopPreview();};pvA.play().catch(function(){stopPreview();toast('Preview blocked by the browser — tap once more.');});})
+            .catch(function(){stopPreview();toast('Preview failed — Edge TTS unreachable right now.');});
+          }
+          el('vmb').onclick=function(){buildVoices();el('vmask').className='show';};
+          el('vclose').onclick=function(){stopPreview();el('vmask').className='';};
+          el('vmask').addEventListener('click',function(e){if(e.target===el('vmask')){stopPreview();el('vmask').className='';}});
+
+          /* ---------- clock ---------- */
+          setInterval(function(){var c=el('clock');if(c){c.textContent=new Date().toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit',second:'2-digit'}).toUpperCase();}},1000);
+
+          /* ---------- microphone / smart endpointing ---------- */
+          function micOff(){listening=false;el('mic').classList.remove('on');}
+          function ensureStream(cb){
+            if(stream){cb();return;}
+            if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){toast('This browser cannot access the microphone. Use Chrome or Edge over HTTPS.');return;}
+            navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}).then(function(st){stream=st;cb();}).catch(function(){toast('Microphone blocked. Click the lock icon in the address bar, allow Microphone, then tap MIC again.');});
+          }
+          function micClick(){
+            if(listening){stopListen(true);return;}
+            stopVoice();
+            ensureStream(function(){if(SR&&!SRbroken){startSR();}else if(srvSTT){startRec();}else{toast('No speech engine available: this browser lacks speech recognition and no GROQ_API_KEY / ELEVENLABS_KEYS secret is set.');}});
+          }
+          function startSR(){
+            rec=new SR();rec.lang=el('lang').value;rec.interimResults=true;rec.continuous=false;srLast='';
+            listening=true;el('mic').classList.add('on');setState('listen','LISTENING');el('live').textContent='';
+            function bump(txt){srLast=txt;clearTimeout(srT);srT=setTimeout(function(){
+              /* smart end-of-speech: 1.3s of no new words -> send what we heard */
+              if(listening&&srLast.trim()){micOff();try{rec.stop();}catch(e){}el('live').textContent='';send(srLast.trim());}
+            },1300);}
+            rec.onresult=function(ev){var fin='',inter='';for(var i=0;i<ev.results.length;i++){if(ev.results[i].isFinal){fin+=ev.results[i][0].transcript;}else{inter+=ev.results[i][0].transcript;}}
+              el('live').textContent=inter||fin;
+              if(fin.trim()){clearTimeout(srT);micOff();try{rec.stop();}catch(e){}el('live').textContent='';send(fin.trim());}
+              else if(inter.trim()){bump(inter);}};
+            rec.onerror=function(ev){clearTimeout(srT);micOff();
+              if(ev.error==='no-speech'){if(el('auto').checked&&!busy){setTimeout(startSR,300);}else{setState('idle','STANDBY');}}
+              else if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){toast('Mic permission denied — allow Microphone for this site.');setState('idle','STANDBY');}
+              else if(ev.error==='network'){if(srvSTT){SRbroken=true;toast('Using server ears — just speak, it auto-sends when you pause.',1);startRec();}else{toast('Speech service unreachable. Use Chrome desktop/Android, or add GROQ_API_KEY for server transcription.');setState('idle','STANDBY');}}
+              else{toast('Mic error: '+ev.error);setState('idle','STANDBY');}};
+            rec.onend=function(){if(listening){micOff();if(el('auto').checked&&!busy){setTimeout(startSR,300);}else{setState('idle','STANDBY');}}};
+            try{rec.start();}catch(e){toast('Could not start mic: '+e);}
+          }
+          function stopVad(){if(vadT){clearInterval(vadT);vadT=null;}if(actx){try{actx.close();}catch(e){}actx=null;}}
+          function startRec(){
+            if(!stream){return;}
+            var chunks=[];recSpoke=false;
+            try{mrec=new MediaRecorder(stream);}catch(e){toast('Audio recording not supported in this browser.');return;}
+            mrec.ondataavailable=function(e){chunks.push(e.data);};
+            mrec.onstop=function(){stopVad();var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});if(recSpoke&&b.size>2000){sendSTT(b);}else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,400);}}};
+            mrec.start();listening=true;el('mic').classList.add('on');setState('listen','LISTENING — SPEAK');
+            t0=Date.now();
+            try{
+              actx=new (window.AudioContext||window.webkitAudioContext)();
+              var src=actx.createMediaStreamSource(stream),an=actx.createAnalyser();an.fftSize=512;src.connect(an);
+              var data=new Uint8Array(an.fftSize),quiet=0;
+              vadT=setInterval(function(){
+                an.getByteTimeDomainData(data);
+                var m=0;for(var i=0;i<data.length;i++){var v=Math.abs(data[i]-128);if(v>m){m=v;}}
+                if(m>10){recSpoke=true;quiet=0;}else if(recSpoke){quiet+=100;}
+                if((recSpoke&&quiet>=1400)||Date.now()-t0>25000){stopListen(false);}
+              },100);
+            }catch(e){recSpoke=true;}
+          }
+          function stopListen(user){
+            clearTimeout(srT);
+            if(rec){micOff();try{rec.stop();}catch(e){}}
+            if(mrec&&mrec.state==='recording'){if(user){recSpoke=true;}micOff();mrec.stop();return;}
+            if(user){setState('idle','STANDBY');}
+          }
+          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else{toast(j.error||'Transcription failed');setState('idle','STANDBY');}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
+
+          /* ---------- barge-in: speak to interrupt agent voice ---------- */
+          function stopBarge(){if(bargeT){clearInterval(bargeT);bargeT=null;}}
+          function startBarge(){
+            stopBarge();
+            if(!stream||!el('auto').checked){return;}
+            try{
+              var bctx=new (window.AudioContext||window.webkitAudioContext)();
+              var src=bctx.createMediaStreamSource(stream),an=bctx.createAnalyser();an.fftSize=512;src.connect(an);
+              var data=new Uint8Array(an.fftSize),hot=0,bt0=Date.now();
+              bargeT=setInterval(function(){
+                if(document.body.className!=='speak'){clearInterval(bargeT);bargeT=null;try{bctx.close();}catch(e){}return;}
+                if(Date.now()-bt0<900){return;} /* grace period: ignore playback onset echo */
+                an.getByteTimeDomainData(data);
+                var m=0;for(var i=0;i<data.length;i++){var v=Math.abs(data[i]-128);if(v>m){m=v;}}
+                if(m>26){hot+=90;}else{hot=0;} /* louder + sustained speech only, echo stays below this */
+                if(hot>=720){ /* sustained voice -> interrupt and listen */
+                  clearInterval(bargeT);bargeT=null;try{bctx.close();}catch(e){}
+                  stopVoice();toast('Interrupted — listening, Boss.');
+                  if(SR&&!SRbroken){startSR();}else if(srvSTT){startRec();}
+                }
+              },90);
+            }catch(e){}
+          }
+
+          /* ---------- speech output + pause / replay controls ---------- */
+          function pbShow(on){el('pbar').className=on?'show':'';}
+          function pbIcon(){el('pbPause').innerHTML=paused?'&#9654;':'&#10074;&#10074;';}
+          function after(){busy=false;paused=false;stopBarge();setState('idle','STANDBY');
+            if(el('auto').checked){if(SR&&!SRbroken&&stream){startSR();}else if(srvSTT&&stream){startRec();}else if(!stream){setState('idle','TAP MIC TO TALK');}}}
+          function browserSpeak(t){var msg=clean(t).slice(0,600);curU=new SpeechSynthesisUtterance(msg);curU.lang=el('lang').value;var vs=speechSynthesis.getVoices();for(var i=0;i<vs.length;i++){if(vs[i].lang.indexOf(curU.lang.split('-')[0])===0){curU.voice=vs[i];break;}}
+            setState('speak','SPEAKING');pbShow(true);paused=false;pbIcon();el('pbFill').style.width='100%';startBarge();
+            var done=false;function fin(){if(!done){done=true;pbShow(false);after();}}
+            curU.onend=fin;curU.onerror=fin;setTimeout(fin,4000+msg.length*90);
+            speechSynthesis.cancel();speechSynthesis.speak(curU);}
+          function playUrl(url){
+            if(curA){try{curA.pause();}catch(e){}}
+            curA=new Audio(url);paused=false;pbIcon();pbShow(true);setState('speak','SPEAKING');startBarge();
+            curA.ontimeupdate=function(){if(curA&&curA.duration){el('pbFill').style.width=Math.round(curA.currentTime/curA.duration*100)+'%';}};
+            curA.onended=function(){pbShow(false);after();};
+            curA.onerror=function(){pbShow(false);browserSpeak(lastReply);};
+            curA.play().catch(function(){pbShow(false);browserSpeak(lastReply);});
+          }
+          function speak(t){
+            lastReply=t;
+            if(!el('voice').checked){after();return;}
+            if(elTTS){setState('speak','SPEAKING');
+              var ctl=('AbortController' in window)?new AbortController():null;
+              var tto=ctl?setTimeout(function(){ctl.abort();},12000):null;
+              fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:clean(t).slice(0,1200),voice:curVoice()}),signal:ctl?ctl.signal:undefined})
+              .then(function(r){if(!r.ok){throw new Error('tts');}return r.blob();})
+              .then(function(b){if(tto){clearTimeout(tto);}if(lastAudioURL){try{URL.revokeObjectURL(lastAudioURL);}catch(e){}}lastAudioURL=URL.createObjectURL(b);playUrl(lastAudioURL);})
+              .catch(function(){if(tto){clearTimeout(tto);}browserSpeak(t);});
+            }else{browserSpeak(t);}
+          }
+          function stopVoice(){
+            stopBarge();
+            if(curA){try{curA.pause();curA.onended=null;}catch(e){}}
+            if(window.speechSynthesis){try{speechSynthesis.cancel();}catch(e){}}
+            pbShow(false);
+            if(document.body.className==='speak'){busy=false;setState('idle','STANDBY');}
+          }
+          el('pbPause').onclick=function(){
+            if(curA&&!curA.ended&&curA.src){if(paused){curA.play();paused=false;setState('speak','SPEAKING');}else{curA.pause();paused=true;setState('idle','PAUSED');}pbIcon();return;}
+            if(window.speechSynthesis&&(speechSynthesis.speaking||speechSynthesis.paused)){if(paused){speechSynthesis.resume();paused=false;setState('speak','SPEAKING');}else{speechSynthesis.pause();paused=true;setState('idle','PAUSED');}pbIcon();}
+          };
+          el('pbReplay').onclick=function(){
+            if(!lastReply&&!lastAudioURL){toast('Nothing to replay yet, Boss.');return;}
+            stopVoice();
+            if(lastAudioURL){playUrl(lastAudioURL);}else if(lastReply){browserSpeak(lastReply);}
+          };
+          el('pbStop').onclick=function(){stopVoice();after();};
+
+          /* ---------- interrupt button (voice + running task) ---------- */
+          el('interrupt').onclick=function(){
+            var st=document.body.className;
+            if(st==='speak'){stopVoice();after();return;}
+            if(st==='think'&&curJob){
+              fetch('/stop?id='+curJob,{method:'POST',headers:{'X-Token':tok}}).catch(function(){});
+              toast('Interrupt signal sent to the agent.');
+            }
+          };
+
+          /* ---------- jobs ---------- */
+          function stopThink(){if(thinkT){clearInterval(thinkT);thinkT=null;}}
+          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.done){stopThink();curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
+          function send(text){
+            if(!text&&!files.length){return;}
+            if(busy){toast('Previous task still running, Boss.');return;}
+            busy=true;stopListen(false);stopVoice();
+            var names=files.map(function(f){return f.name;});
+            var paths=files.map(function(f){return f.path;});
+            addMsg('YOU',text||'(files attached)',names);
+            files=[];renderChips();
+            thinkStart=Date.now();setState('think','PROCESSING');stopThink();
+            thinkT=setInterval(function(){var s=Math.floor((Date.now()-thinkStart)/1000);var mm=String(Math.floor(s/60)).padStart(2,'0');var ss=String(s%60).padStart(2,'0');el('stateTxt').textContent='PROCESSING · '+mm+':'+ss;},1000);
+            var h=hist.slice(-8);hist.push({role:'user',content:text||'(files attached)'});
+            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text,files:paths,history:h})}).then(function(r){return r.json();}).then(function(j){if(j.job){curJob=j.job;poll(j.job);}else{busy=false;stopThink();addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;stopThink();addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
+          }
+
+          /* ---------- file input ---------- */
+          function renderChips(){
+            var c=el('chips');c.innerHTML='';c.className=files.length?'show':'';
+            files.forEach(function(f,i){
+              var d=document.createElement('span');d.className='chip';
+              var n=document.createElement('span');n.textContent='\u{1F4CE} '+f.name;d.appendChild(n);
+              if(f.uploading){var u=document.createElement('em');u.textContent='uploading…';d.appendChild(u);}
+              else{var z=document.createElement('span');z.className='sz';z.textContent=fmtSz(f.size);d.appendChild(z);}
+              var x=document.createElement('button');x.innerHTML='&#10005;';x.title='Remove';x.onclick=function(){files.splice(i,1);renderChips();};d.appendChild(x);
+              c.appendChild(d);
+            });
+          }
+          function uploadOne(file){
+            var entry={name:file.name,size:file.size,path:null,uploading:true};
+            files.push(entry);renderChips();
+            var fd=new FormData();fd.append('file',file);
+            fetch('/upload',{method:'POST',headers:{'X-Token':tok},body:fd}).then(function(r){return r.json();}).then(function(j){
+              if(j.path){entry.path=j.path;entry.uploading=false;entry.size=j.size||file.size;}
+              else{files.splice(files.indexOf(entry),1);toast(j.error||'Upload failed: '+file.name);}
+              renderChips();
+            }).catch(function(){files.splice(files.indexOf(entry),1);renderChips();toast('Upload failed: '+file.name);});
+          }
+          function handleFiles(fl){for(var i=0;i<fl.length;i++){if(fl[i].size>200*1048576){toast(fl[i].name+' is over the 200 MB limit');continue;}uploadOne(fl[i]);}}
+          el('attach').onclick=function(){el('fpick').click();};
+          el('fpick').onchange=function(){handleFiles(el('fpick').files);el('fpick').value='';};
+          var dragN=0;
+          window.addEventListener('dragenter',function(e){e.preventDefault();dragN++;el('drop').style.display='flex';});
+          window.addEventListener('dragleave',function(e){e.preventDefault();dragN--;if(dragN<=0){dragN=0;el('drop').style.display='none';}});
+          window.addEventListener('dragover',function(e){e.preventDefault();});
+          window.addEventListener('drop',function(e){e.preventDefault();dragN=0;el('drop').style.display='none';if(e.dataTransfer&&e.dataTransfer.files.length){handleFiles(e.dataTransfer.files);}});
+
+          /* ---------- wiring ---------- */
+          el('mic').onclick=micClick;
+          el('sendb').onclick=function(){var v=el('txt').value.trim();el('txt').value='';send(v);};
+          el('txt').addEventListener('keydown',function(e){if(e.key==='Enter'){el('sendb').onclick();}});
+          if(window.speechSynthesis){speechSynthesis.getVoices();speechSynthesis.onvoiceschanged=function(){};}
+
+          /* ---------- particle field ---------- */
+          var c=el('stars'),x=c.getContext('2d');
+          function rs(){c.width=innerWidth;c.height=innerHeight;}rs();addEventListener('resize',rs);
+          var pts=[];for(var i=0;i<90;i++){pts.push({x:Math.random(),y:Math.random(),z:Math.random()*1.4+0.3,s:Math.random()*0.0005+0.00015});}
+          (function anim(){x.clearRect(0,0,c.width,c.height);for(var i=0;i<pts.length;i++){var p=pts[i];p.y-=p.s;if(p.y<0){p.y=1;p.x=Math.random();}x.globalAlpha=0.4*p.z;x.fillStyle='#38bdf8';x.fillRect(p.x*c.width,p.y*c.height,p.z,p.z*2.6);}x.globalAlpha=1;requestAnimationFrame(anim);})();
+          </script>
+          </body></html>
+          HUDHTML
+          cat > /tmp/jarvis/app.py <<'PYJARVIS'
+          import asyncio, os, re, signal, subprocess, threading, time, uuid
+          import requests as rq
+          from flask import Flask, request, jsonify, Response
+          from werkzeug.utils import secure_filename
+
+          TOKEN = os.environ.get("PANEL_TOKEN", "hermes99")
+          GROQ = os.environ.get("GROQ_API_KEY", "").strip()
+          try:
+              import edge_tts
+              EDGE = True
+          except Exception:
+              EDGE = False
+
+          S_EN = "Hello Boss. This is my voice. I am online and ready for your orders."
+          S_BN = "\u09a8\u09ae\u09b8\u09cd\u0995\u09be\u09b0 \u09ac\u09b8\u0964 \u098f\u099f\u09be \u0986\u09ae\u09be\u09b0 \u0995\u09a3\u09cd\u09a0\u09b8\u09cd\u09ac\u09b0\u0964 \u0986\u09ae\u09bf \u0986\u09aa\u09a8\u09be\u09b0 \u09a8\u09bf\u09b0\u09cd\u09a6\u09c7\u09b6\u09c7\u09b0 \u099c\u09a8\u09cd\u09af \u09aa\u09cd\u09b0\u09b8\u09cd\u09a4\u09c1\u09a4\u0964"
+          S_HI = "\u0928\u092e\u0938\u094d\u0924\u0947 \u092c\u0949\u0938\u0964 \u092f\u0939 \u092e\u0947\u0930\u0940 \u0906\u0935\u093e\u091c\u093c \u0939\u0948\u0964 \u092e\u0948\u0902 \u0906\u092a\u0915\u0947 \u0906\u0926\u0947\u0936 \u0915\u0947 \u0932\u093f\u090f \u0924\u0948\u092f\u093e\u0930 \u0939\u0942\u0901\u0964"
+          G_US = "ENGLISH \u00b7 UNITED STATES"
+          G_XX = "ENGLISH \u00b7 UK / AU / INDIA"
+          G_BN = "BANGLA \u00b7 \u09ac\u09be\u0982\u09b2\u09be"
+          G_HI = "HINDI \u00b7 \u0939\u093f\u0928\u094d\u0926\u0940"
+          VOICES = [
+              {"id": "en-US-GuyNeural", "name": "Guy", "meta": "Male \u00b7 warm narrator", "group": G_US, "sample": S_EN},
+              {"id": "en-US-ChristopherNeural", "name": "Christopher", "meta": "Male \u00b7 deep, calm", "group": G_US, "sample": S_EN},
+              {"id": "en-US-EricNeural", "name": "Eric", "meta": "Male \u00b7 crisp assistant", "group": G_US, "sample": S_EN},
+              {"id": "en-US-AndrewMultilingualNeural", "name": "Andrew", "meta": "Male \u00b7 natural, multilingual", "group": G_US, "sample": S_EN},
+              {"id": "en-US-BrianMultilingualNeural", "name": "Brian", "meta": "Male \u00b7 smooth, multilingual", "group": G_US, "sample": S_EN},
+              {"id": "en-US-JennyNeural", "name": "Jenny", "meta": "Female \u00b7 friendly assistant", "group": G_US, "sample": S_EN},
+              {"id": "en-US-AriaNeural", "name": "Aria", "meta": "Female \u00b7 clear newsreader", "group": G_US, "sample": S_EN},
+              {"id": "en-US-AvaMultilingualNeural", "name": "Ava", "meta": "Female \u00b7 expressive, multilingual", "group": G_US, "sample": S_EN},
+              {"id": "en-GB-RyanNeural", "name": "Ryan", "meta": "Male \u00b7 British butler vibe", "group": G_XX, "sample": S_EN},
+              {"id": "en-GB-ThomasNeural", "name": "Thomas", "meta": "Male \u00b7 refined British", "group": G_XX, "sample": S_EN},
+              {"id": "en-GB-SoniaNeural", "name": "Sonia", "meta": "Female \u00b7 British", "group": G_XX, "sample": S_EN},
+              {"id": "en-AU-WilliamNeural", "name": "William", "meta": "Male \u00b7 Australian", "group": G_XX, "sample": S_EN},
+              {"id": "en-IN-PrabhatNeural", "name": "Prabhat", "meta": "Male \u00b7 Indian English", "group": G_XX, "sample": S_EN},
+              {"id": "en-IN-NeerjaNeural", "name": "Neerja", "meta": "Female \u00b7 Indian English", "group": G_XX, "sample": S_EN},
+              {"id": "bn-BD-PradeepNeural", "name": "Pradeep", "meta": "Male \u00b7 Bangladesh", "group": G_BN, "sample": S_BN},
+              {"id": "bn-BD-NabanitaNeural", "name": "Nabanita", "meta": "Female \u00b7 Bangladesh", "group": G_BN, "sample": S_BN},
+              {"id": "bn-IN-BashkarNeural", "name": "Bashkar", "meta": "Male \u00b7 India", "group": G_BN, "sample": S_BN},
+              {"id": "bn-IN-TanishaaNeural", "name": "Tanishaa", "meta": "Female \u00b7 India", "group": G_BN, "sample": S_BN},
+              {"id": "hi-IN-MadhurNeural", "name": "Madhur", "meta": "Male \u00b7 Hindi", "group": G_HI, "sample": S_HI},
+              {"id": "hi-IN-SwaraNeural", "name": "Swara", "meta": "Female \u00b7 Hindi", "group": G_HI, "sample": S_HI},
+          ]
+          VOICE_IDS = set(v["id"] for v in VOICES)
+          DEFAULT_VOICES = {"en-US": "en-US-GuyNeural", "bn-BD": "bn-BD-PradeepNeural", "hi-IN": "hi-IN-MadhurNeural"}
+          UPLOAD_DIR = os.path.expanduser("~/.hermes/work/uploads")
+          app = Flask(__name__)
+          app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024   # 200 MB uploads
+          JOBS = {}
+          PROCS = {}
+          ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+          HTML = open("/tmp/jarvis/index.html").read()
+
+          def el_keys():
+              ks = []
+              try:
+                  with open("/tmp/el_keys.txt") as f:
+                      ks = [l.strip() for l in f if l.strip()]
+              except Exception:
+                  pass
+              if not ks:
+                  ks = [k.strip() for k in os.environ.get("ELEVENLABS_KEYS", "").splitlines() if k.strip()]
+              return ks
+
+          def edge_speak(text, voice):
+              # Free Microsoft Edge neural TTS - no API key needed.
+              if not EDGE:
+                  return None
+              if voice not in VOICE_IDS:
+                  voice = DEFAULT_VOICES["en-US"]
+
+              async def _gen():
+                  buf = b""
+                  com = edge_tts.Communicate(text[:2500], voice)
+                  async for ch in com.stream():
+                      if ch["type"] == "audio":
+                          buf += ch["data"]
+                  return buf
+
+              for _ in range(2):
+                  try:
+                      audio = asyncio.run(_gen())
+                      if audio:
+                          return audio
+                  except Exception:
+                      time.sleep(0.4)
+              return None
+
+          def do_stt(blob, mime, lang):
+              short = (lang or "en").split("-")[0]
+              if GROQ:
+                  try:
+                      r = rq.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                                  headers={"Authorization": "Bearer " + GROQ},
+                                  files={"file": ("audio.webm", blob, mime)},
+                                  data={"model": "whisper-large-v3", "language": short},
+                                  timeout=90)
+                      if r.status_code == 200:
+                          t = (r.json().get("text") or "").strip()
+                          if t:
+                              return t
+                  except Exception:
+                      pass
+              for k in el_keys():
+                  try:
+                      r = rq.post("https://api.elevenlabs.io/v1/speech-to-text",
+                                  headers={"xi-api-key": k},
+                                  files={"file": ("audio.webm", blob, mime)},
+                                  data={"model_id": "scribe_v1"},
+                                  timeout=90)
+                      if r.status_code == 200:
+                          t = (r.json().get("text") or "").strip()
+                          if t:
+                              return t
+                  except Exception:
+                      pass
+              return None
+
+          def extract_reply(out):
+              # `hermes chat` prints a full CLI dump (banner, "Query:", box art,
+              # session stats). Only the text inside the Hermes reply box(es)
+              # is the assistant actually speaking - extract just that.
+              boxes = []
+              cur = None
+              for ln in out.split("\n"):
+                  s = ln.strip()
+                  if cur is None and s.startswith("\u256d") and "Hermes" in s:
+                      cur = []
+                  elif cur is not None and s.startswith("\u2570"):
+                      boxes.append("\n".join(cur).strip())
+                      cur = None
+                  elif cur is not None:
+                      if s.startswith("\u2502"):
+                          s = s.strip("\u2502").strip()
+                      cur.append(s)
+              if cur:
+                  boxes.append("\n".join(cur).strip())
+              boxes = [b for b in boxes if b]
+              if boxes:
+                  return "\n\n".join(boxes)
+              # Fallback (box style changed): drop known noise lines instead.
+              noise = ("Query:", "Initializing", "Resume this session",
+                       "hermes --resume", "Session:", "Duration:",
+                       "Messages:", "Tokens:", "Cost:")
+              box_chars = set("\u2500\u256d\u256e\u2570\u256f\u2502\u2550 \t")
+              keep = []
+              for ln in out.split("\n"):
+                  s = ln.strip()
+                  if not s or s.startswith(noise) or set(s) <= box_chars:
+                      continue
+                  keep.append(s)
+              return "\n".join(keep).strip() or out
+
+
+          ROUTER = "http://localhost:4000/v1/chat/completions"
+          FAST_SYS = ("You are Hermes, a JARVIS-style AI agent speaking to your Boss through a "
+                      "voice HUD. You also have a separate FULL AGENT mode with tools (terminal, "
+                      "web browsing, web search, files, code execution) that is powerful but slow. "
+                      "Decide how to handle the user's message: "
+                      "(a) If it is small talk, a greeting, a quick factual or opinion question you "
+                      "can answer from knowledge, or a short writing/translation request - answer "
+                      "it DIRECTLY yourself. Be concise and speech-friendly (1-4 short sentences), "
+                      "confident and warm, and address the user as Boss. Reply in the user's language. "
+                      "(b) If it genuinely needs tools, live/current information, browsing, scraping, "
+                      "files, running code, or long multi-step work - reply with EXACTLY this token "
+                      "and nothing else: [[AGENT]]")
+
+          def fast_answer(text, hist):
+              # One quick call to the local pool router. Returns a direct reply,
+              # or None when the message should go to the full agent.
+              msgs = [{"role": "system", "content": FAST_SYS}]
+              for m in hist[-6:]:
+                  if (isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                          and isinstance(m.get("content"), str)):
+                      msgs.append({"role": m["role"], "content": m["content"][:1200]})
+              msgs.append({"role": "user", "content": text[:4000]})
+              try:
+                  r = rq.post(ROUTER,
+                              headers={"Authorization": "Bearer sk-local",
+                                       "Content-Type": "application/json"},
+                              json={"model": "pool-auto", "messages": msgs,
+                                    "max_tokens": 500, "temperature": 0.6},
+                              timeout=15)
+                  if r.status_code == 200:
+                      out = (r.json()["choices"][0]["message"]["content"] or "").strip()
+                      if out and "[[AGENT]]" not in out:
+                          return out
+              except Exception:
+                  pass
+              return None
+
+          def run_dispatch(jid, text, hist, deep):
+              # Try the fast lane first (unless files are attached / forced deep);
+              # fall back to the full agent when the router says [[AGENT]].
+              if not deep:
+                  fast = fast_answer(text, hist)
+                  if JOBS.get(jid, {}).get("done"):
+                      return  # interrupted while the fast lane was running
+                  if fast is not None:
+                      JOBS[jid] = {"done": True, "reply": fast[-6000:]}
+                      return
+              run_job(jid, text)
+
+          def run_job(jid, text):
+              env = dict(os.environ, NO_COLOR="1", TERM="dumb", DISPLAY=":99")
+              try:
+                  p = subprocess.Popen(
+                      ["hermes", "chat", "-q", text, "--source", "tool"],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      text=True, start_new_session=True, env=env)
+                  PROCS[jid] = p
+                  try:
+                      out, err = p.communicate(timeout=1800)
+                  except subprocess.TimeoutExpired:
+                      try:
+                          os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                      except Exception:
+                          p.kill()
+                      JOBS[jid] = {"done": True, "reply": "Task timed out after 30 minutes, Boss."}
+                      return
+                  if JOBS.get(jid, {}).get("done"):
+                      return  # already marked interrupted via /stop
+                  outc = ANSI.sub("", (out or "")).strip()
+                  if not outc:
+                      outc = ANSI.sub("", (err or "")).strip() or "(no output)"
+                  JOBS[jid] = {"done": True, "reply": extract_reply(outc)[-6000:]}
+              except Exception as e:
+                  JOBS[jid] = {"done": True, "reply": "Error: %s" % e}
+              finally:
+                  PROCS.pop(jid, None)
+
+          @app.route("/")
+          def home():
+              return Response(HTML, mimetype="text/html")
+
+          @app.route("/config")
+          def config():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              return jsonify(tts=EDGE, stt=bool(GROQ) or bool(el_keys()),
+                             voices=VOICES, defaults=DEFAULT_VOICES)
+
+          @app.route("/tts", methods=["POST"])
+          def tts_route():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              data = request.get_json(silent=True) or {}
+              text = (data.get("text") or "").strip()
+              if not text:
+                  return jsonify(error="empty"), 400
+              audio = edge_speak(text, (data.get("voice") or "").strip())
+              if audio:
+                  return Response(audio, mimetype="audio/mpeg")
+              return jsonify(error="tts unavailable"), 503
+
+          @app.route("/stt", methods=["POST"])
+          def stt_route():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              blob = request.get_data()
+              if not blob or len(blob) < 1000:
+                  return jsonify(error="no audio received"), 400
+              text = do_stt(blob, request.headers.get("Content-Type", "audio/webm"),
+                            request.args.get("lang", "en-US"))
+              if text:
+                  return jsonify(text=text)
+              return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+
+          @app.route("/upload", methods=["POST"])
+          def upload():
+              # Files land in ~/.hermes/work/uploads/ - inside the persisted+backed-up
+              # ~/.hermes tree, so uploads survive the run and the agent can read them.
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              f = request.files.get("file")
+              if not f or not f.filename:
+                  return jsonify(error="no file received"), 400
+              os.makedirs(UPLOAD_DIR, exist_ok=True)
+              name = secure_filename(f.filename) or ("file_%d" % int(time.time()))
+              path = os.path.join(UPLOAD_DIR, time.strftime("%Y%m%d_%H%M%S_") + name)
+              f.save(path)
+              return jsonify(path=path, name=name, size=os.path.getsize(path))
+
+          @app.route("/ask", methods=["POST"])
+          def ask():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              data = request.get_json(silent=True) or {}
+              text = (data.get("text") or "").strip()
+              fpaths = data.get("files") or []
+              safe = []
+              root = os.path.realpath(UPLOAD_DIR)
+              for pth in fpaths:
+                  if isinstance(pth, str):
+                      rp = os.path.realpath(pth)
+                      if rp.startswith(root + os.sep) and os.path.isfile(rp):
+                          safe.append(rp)
+              if not text and not safe:
+                  return jsonify(error="empty command"), 400
+              if safe:
+                  text = ("The user uploaded file(s) for you, already saved on this machine at: "
+                          + ", ".join(safe)
+                          + " - use your terminal/files tools to read them. "
+                          + (text or "Inspect the file(s) and report what they contain, Boss."))
+              hist = data.get("history") or []
+              if not isinstance(hist, list):
+                  hist = []
+              jid = uuid.uuid4().hex
+              JOBS[jid] = {"done": False}
+              threading.Thread(target=run_dispatch, args=(jid, text, hist[-8:], bool(safe)),
+                               daemon=True).start()
+              return jsonify(job=jid)
+
+          @app.route("/stop", methods=["POST"])
+          def stop_route():
+              # Interrupt a running task: kill the hermes chat process group.
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              jid = request.args.get("id", "")
+              if jid not in JOBS:
+                  return jsonify(ok=False, error="unknown job")
+              JOBS[jid] = {"done": True, "reply": "Task interrupted by you, Boss. Standing by."}
+              p = PROCS.get(jid)
+              if not p:
+                  return jsonify(ok=True)
+              try:
+                  os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+              except Exception:
+                  try:
+                      p.terminate()
+                  except Exception:
+                      pass
+              return jsonify(ok=True)
+
+          @app.route("/poll")
+          def poll():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              j = JOBS.get(request.args.get("id", ""))
+              if not j:
+                  return jsonify(error="unknown job"), 404
+              return jsonify(**j)
+
+          app.run(host="0.0.0.0", port=7777, threaded=True)
+          PYJARVIS
+          pip install -q flask requests edge-tts || true
+          nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
+          sleep 2
+          curl -fs http://localhost:7777/ >/dev/null || { echo '::warning::Agent HUD failed to start'; cat /tmp/jarvis.log; }
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:7777 > /tmp/jarvis-tunnel.log 2>&1 &
+          JARVIS_URL=""
+          for i in $(seq 1 30); do
+            JARVIS_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/jarvis-tunnel.log | head -n1 || true)
+            [ -n "$JARVIS_URL" ] && break
+            sleep 2
+          done
+          echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
+          echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
+
+
+
+
 
       # ── 11. Background backup loop (every 30 min -> backup branch) ──
       - name: Start backup loop
@@ -1213,6 +2068,7 @@ jobs:
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
           🔭 Live desktop: ${LIVEVIEW_URL:-not available} (pass: first 8 chars of PANEL_TOKEN)
+          🤖 Agent HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models" > /dev/null
 
@@ -1227,6 +2083,37 @@ jobs:
             sleep 2
           fi
           export DISPLAY=:99
+
+          # ── SMART SESSION RESET ──
+          # Only start a fresh chat session when the saved context is actually
+          # huge. Blindly resetting every run loses the conversation the user
+          # was in the middle of — that caused real data loss before.
+          python3 - <<'PYSESS'
+          import json, os, re, sqlite3
+          home = os.path.expanduser("~/.hermes")
+          sf = os.path.join(home, "sessions", "sessions.json")
+          db = os.path.join(home, "state.db")
+          try:
+              raw = open(sf).read()
+              ids = set(re.findall(r"\d{8}_\d{6}_[0-9a-f]+", raw))
+              worst = 0
+              if ids and os.path.exists(db):
+                  con = sqlite3.connect(db)
+                  for sid in ids:
+                      n = con.execute(
+                          "SELECT COALESCE(SUM(token_count),0) FROM messages WHERE session_id=?",
+                          (sid,),
+                      ).fetchone()[0]
+                      worst = max(worst, n or 0)
+                  con.close()
+              if worst > 45000:
+                  os.remove(sf)
+                  print("session context too big (%d tokens) - fresh session" % worst)
+              else:
+                  print("keeping sessions (max %d tokens)" % worst)
+          except Exception as e:
+              print("session check skipped:", e)
+          PYSESS
 
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
           # auto-restart it — no more force-stopping the whole Action run
