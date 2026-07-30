@@ -34,22 +34,6 @@ jobs:
           git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
           if [ -d /tmp/data ]; then
             rm -f /tmp/data/.env
-            # RESTORE FROM BACKUP BRANCH TOO: the 30-min backup loop pushes to
-            # the 'backup' branch, while the final push (end of run) goes to
-            # 'main'. If the previous run crashed / was cancelled / hit the
-            # timeout, the final push never ran — the freshest memory + work
-            # files exist ONLY on 'backup'. Compare timestamps and overlay
-            # whichever is newer, so the bot's brain survives dirty shutdowns.
-            main_ts=$(cd /tmp/data && git log -1 --format=%ct 2>/dev/null || echo 0)
-            git clone --depth 1 -b backup "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/databk 2>/dev/null || true
-            if [ -d /tmp/databk ]; then
-              bk_ts=$(cd /tmp/databk && git log -1 --format=%ct 2>/dev/null || echo 0)
-              if [ "$bk_ts" -gt "$main_ts" ]; then
-                echo "backup branch is newer than main — restoring latest data from backup"
-                rm -f /tmp/databk/.env
-                rsync -a --exclude='.git' /tmp/databk/ /tmp/data/
-              fi
-            fi
             rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
             find "$HERMES_HOME" -name "*.gh-chunk.000" | while read -r first; do
               base="${first%.gh-chunk.000}"
@@ -94,16 +78,22 @@ jobs:
 
       # ── 4. Start Camoufox (stealth browser, NON-headless via virtual display) ──
       - name: Start Camoufox
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
         run: |
-          # Xvfb = virtual display so the browser runs fully HEADED on the runner
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+          # Shared virtual display :99 — the browser AND all the agent's GUI
+          # work render here, so the LIVE VIEW (below) shows everything.
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify
+          Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
+          sleep 2
+          export DISPLAY=:99
           pip install -U "camoufox[geoip]" pyvirtualdisplay
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
           nohup python3 -c "
           from camoufox.server import launch_server
           launch_server(
-              headless='virtual',  # real headed browser inside a virtual display
+              headless=False,  # real headed browser on the shared :99 display
               port=9222, ws_path='hermes',
               persistent_context=True,
               user_data_dir='/home/runner/.hermes/browser-profile',
@@ -118,6 +108,16 @@ jobs:
             sleep 3
           done
           cat /tmp/camoufox.log || true
+
+          # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
+          # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
+          # port 6080 (tunnel + link are added in the Notify start step).
+          # View-only + password so nobody can hijack the desktop. NOTE: VNC
+          # passwords only use the FIRST 8 characters of PANEL_TOKEN.
+          x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
+            -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
+          nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
+          echo "Live desktop view server running on :6080"
 
       # ── 5. Write model pool control panel ──
       - name: Write control panel
@@ -869,17 +869,6 @@ jobs:
           mkdir -p "$HERMES_HOME/work"
           cat > "$HOME/AGENTS.md" <<'EOF'
           # Standing instructions
-          - CRITICAL: THIS MACHINE IS WIPED after every run (fresh VM each
-            time). ONLY files under ~/.hermes/ survive via automatic backup.
-            Create ALL projects, scripts, credential/account files, downloads,
-            and outputs under ~/.hermes/work/ — NEVER in ~, /tmp, or any other
-            path. If you just created files elsewhere, move them into
-            ~/.hermes/work/ immediately. Anything outside ~/.hermes/ WILL BE
-            LOST when the run ends.
-          - When the user sends/uploads a file in chat, IMMEDIATELY copy it
-            into ~/.hermes/work/ and do all reading/editing on THAT copy.
-            Platform uploads land in a temporary cache that gets auto-deleted;
-            the ~/.hermes/work/ copy is the only one that survives.
           - For any long or multi-step task (scraping, research, data
             collection, comparisons), IMMEDIATELY append each intermediate
             result to a file under ~/.hermes/work/ as you go. Never keep
@@ -907,17 +896,7 @@ jobs:
           hermes config set model.default "pool-auto"
           echo "Active model: pool-auto (rotates across your whole selected pool)"
           hermes config set model.context_length 65536
-          # Survive router restarts: the LiteLLM counter-leak forces a fast
-          # container restart (~10-20s blip). Default api_max_retries=3 gives
-          # the gateway only ~7s of retry budget, so turns were DYING inside
-          # the blip. 8 retries with exponential backoff spans well past any
-          # restart window — the turn just waits and continues.
-          hermes config set agent.api_max_retries 8
           hermes config set web.search_backend searxng
-          # Edge TTS needs the edge-tts package on the machine — an earlier
-          # run failed with "edge-tts: command not found". Free Microsoft
-          # voices (400+ incl. Bangla bn-BD), no API key needed.
-          pip install -q edge-tts || true
           hermes config set tts.provider edge
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
           hermes doctor || true
@@ -996,88 +975,43 @@ jobs:
           HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" \
             nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
 
-      # ── 11.5. Start Live Screen (noVNC) ──
-      - name: Start Live Screen
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox
-          if ! pgrep -f "Xvfb :99" >/dev/null; then
-            Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
-            sleep 2
-          fi
-          DISPLAY=:99 fluxbox > /tmp/fluxbox.log 2>&1 &
-          x11vnc -display :99 -nopw -forever -shared -bg -rfbport 5900
-          websockify --web /usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
-          nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > /tmp/novnc-tunnel.log 2>&1 &
-          NOVNC_URL=""
-          for i in $(seq 1 30); do
-            NOVNC_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/novnc-tunnel.log | head -n1 || true)
-            [ -n "$NOVNC_URL" ] && break
-            sleep 2
-          done
-          echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
-          echo "Live Screen URL: $NOVNC_URL"
-
       # ── 12. Notify start on Telegram (includes panel links) ──
       - name: Notify start
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
+          # third quick tunnel: LIVE DESKTOP VIEW (noVNC on :6080, see step 4)
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > /tmp/liveview-tunnel.log 2>&1 &
+          LIVEVIEW_URL=""
+          for i in $(seq 1 30); do
+            LIVEVIEW_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/liveview-tunnel.log | head -n1 || true)
+            [ -n "$LIVEVIEW_URL" ] && break
+            sleep 2
+          done
+          [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html"
+          echo "::notice title=🔭 Live desktop view::${LIVEVIEW_URL:-tunnel failed}"
           TG_API="https://api.telegram.org"
           curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
             -d text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
-          📺 Live Screen: ${NOVNC_URL:-failed to start}
+          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (pass: first 8 chars of PANEL_TOKEN)
           🔑 Password: your PANEL_TOKEN secret
           Use /model in Telegram or !model in Slack to switch models" > /dev/null
 
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
         run: |
-          # Shared virtual display :99 for the AGENT's GUI work (screenshots,
-          # Qt apps, image tools). The browser's own virtual display is private
-          # to it — without this, scrot/GUI apps fail with "Can't open X
-          # display". Every terminal the agent opens inherits DISPLAY=:99.
+          # Shared virtual display :99 (browser + agent GUI + live view all
+          # render here; normally started in step 4 — this is just a safety
+          # net). Every terminal the agent opens inherits DISPLAY=:99.
           if ! pgrep -f "Xvfb :99" >/dev/null; then
             Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
             sleep 2
           fi
           export DISPLAY=:99
-
-          # SMART SESSION RESET: keep the conversation ALIVE across runs.
-          # sessions.json is the gateway routing index (chat -> active session
-          # id). We check each active session's real context size in state.db
-          # and detach ONLY if it is genuinely bloated (>45k tokens). Otherwise
-          # the bot continues the SAME conversation after a re-run — no
-          # amnesia, no manual /new. If anything fails, we keep continuity.
-          python3 - <<'PYSESS'
-          import os, re, sqlite3
-          home = os.environ.get("HERMES_HOME", "/home/runner/.hermes")
-          idx = os.path.join(home, "sessions", "sessions.json")
-          db = os.path.join(home, "state.db")
-          try:
-              if os.path.exists(idx) and os.path.exists(db):
-                  raw = open(idx, encoding="utf-8").read()
-                  ids = set(re.findall(r"\d{8}_\d{6}_[0-9a-f]+", raw))
-                  worst = 0
-                  if ids:
-                      conn = sqlite3.connect(db)
-                      for sid in ids:
-                          row = conn.execute(
-                              "SELECT COALESCE(SUM(token_count),0) FROM messages WHERE session_id=?",
-                              (sid,)).fetchone()
-                          worst = max(worst, row[0] or 0)
-                      conn.close()
-                  if worst > 45000:
-                      os.remove(idx)
-                      print("session context ~%d tokens -> bloated, starting fresh this run" % worst)
-                  else:
-                      print("session context ~%d tokens -> continuing previous conversation" % worst)
-          except Exception as e:
-              print("session check skipped (keeping continuity):", e)
-          PYSESS
 
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
           # auto-restart it — no more force-stopping the whole Action run
