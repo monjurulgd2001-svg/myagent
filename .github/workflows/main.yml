@@ -1,4 +1,4 @@
-name: Hermes Agent — Telegram + Slack + NVIDIA/Mistral Pool
+name: Hermes Agent - Telegram + Slack + NVIDIA/Mistral Pool
 
 on:
   workflow_dispatch:
@@ -83,7 +83,7 @@ jobs:
         run: |
           # Shared virtual display :99 — the browser AND all the agent's GUI
           # work render here, so the LIVE VIEW (below) shows everything.
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xdotool tint2 feh pcmanfm xterm nitrogen imagemagick
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xdotool tint2 feh pcmanfm xterm
           Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
           sleep 2
           export DISPLAY=:99
@@ -100,7 +100,7 @@ session.screen0.toolbar.borderColor: #2d2d2d
 session.screen0.toolbar.borderWidth: 0
 session.screen0.slitlist.file: ~/.fluxbox/slitlist
 session.screen0.tabs.usePixmap: false
-session.screen0.rootCommand: nitrogen --restore &
+session.screen0.rootCommand: feh --bg-color "#001a33" &
 session.screen0.windowPlacement: UnderMouse
 session.screen0.focusNewWindows: true
 session.screen0.focusLastWindow: true
@@ -153,17 +153,34 @@ THEMET
           fluxbox > /tmp/fluxbox.log 2>&1 &
           sleep 3
           export DISPLAY=:99
-          xterm -geometry 120x35 -bg "#0c0c0c" -fg "#cccccc" -fa "Consolas:size=11" -title "Command Prompt" -e bash -c "echo 'Microsoft Windows [Version 10.0.19045]'; echo '(c) Microsoft Corporation. All rights reserved.'; echo ''; cd ~; while true; do printf 'C:\\\\Users\\\\Admin> '; read cmd; [ -n \"\$cmd\" ] && \$cmd 2>&1 || true; done" > /tmp/xterm.log 2>&1 &
+          cat > /tmp/cmd.sh <<'CMDEOF'
+#!/bin/bash
+echo "Microsoft Windows [Version 10.0.19045]"
+echo "(c) Microsoft Corporation. All rights reserved."
+echo ""
+cd ~
+while true; do
+  echo -n 'C:\Users\Admin> '
+  read cmd
+  [ -n "$cmd" ] && $cmd 2>&1 || true
+done
+CMDEOF
+          chmod +x /tmp/cmd.sh
+          xterm -geometry 120x35 -bg "#0c0c0c" -fg "#cccccc" -fa "Consolas:size=11" -title "Command Prompt" -e /tmp/cmd.sh > /tmp/xterm.log 2>&1 &
 
           # Windows 10 dark wallpaper
           mkdir -p ~/Pictures
-          convert -size 1920x1080 xc:"#001a33" \
-            -fill "#003366" -draw "rectangle 0,800 1920,1080" \
-            -fill "#004080" -draw "rectangle 0,900 1920,1080" \
-            -fill "#0066cc" -draw "polygon 960,200 1200,800 720,800" \
-            -fill "#0055aa" -draw "polygon 960,300 1100,750 820,750" \
-            ~/Pictures/wallpaper.png 2>/dev/null || true
-          nitrogen --set-zoom-fill ~/Pictures/wallpaper.png 2>/dev/null || feh --bg-color "#001a33" 2>/dev/null || true
+          python3 -c "
+from PIL import Image, ImageDraw
+img = Image.new('RGB', (1920, 1080), '#001a33')
+d = ImageDraw.Draw(img)
+d.rectangle([0, 800, 1920, 1080], fill='#003366')
+d.rectangle([0, 900, 1920, 1080], fill='#004080')
+d.polygon([(960, 200), (1200, 800), (720, 800)], fill='#0066cc')
+d.polygon([(960, 300), (1100, 750), (820, 750)], fill='#0055aa')
+img.save('/root/Pictures/wallpaper.png')
+" 2>/dev/null || true
+          feh --bg-color "#001a33" 2>/dev/null || true
 
           # Windows-style taskbar via tint2
           cat > /tmp/tint2rc <<'TINT2'
@@ -203,13 +220,13 @@ panel_window_name = taskbar
 panel_background_id = 1
 # Clock (right side)
 time1_format = %H:%M
-time1_font = Segoe UI:size=11
-time2_format = %d/%m/%Y
-time2_font = Segoe UI:size=9
+          time1_font = DejaVu Sans:size=11
+          time2_format = %d/%m/%Y
+          time2_font = DejaVu Sans:size=9
 clock_font_color = #ffffff 100
 clock_padding = 12 4
 clock_background_id = 3
-clock_lclick_command = gsimplecal
+          clock_lclick_command =
 # Taskbar
 taskbar_mode = single_desktop
 taskbar_padding = 4 4 4
@@ -219,7 +236,7 @@ task_icon = 1
 task_text = 1
 task_centered = 1
 task_maximum_size = 220 36
-task_font = Segoe UI:size=10
+          task_font = DejaVu Sans:size=10
 task_font_color = #cccccc 100
 task_active_font_color = #ffffff 100
 task_iconified_font_color = #888888 100
