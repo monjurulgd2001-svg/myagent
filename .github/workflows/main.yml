@@ -55,15 +55,15 @@ jobs:
         run: |
           mkdir -p /tmp/searxng
           cat > /tmp/searxng/settings.yml <<'EOF'
-          use_default_settings: true
-          server:
-            secret_key: "hermes-searxng-secret"
-            limiter: false
-          search:
-            formats:
-              - html
-              - json
-          EOF
+use_default_settings: true
+server:
+  secret_key: "hermes-searxng-secret"
+  limiter: false
+search:
+  formats:
+    - html
+    - json
+EOF
           docker run -d --name searxng -p 8080:8080 \
             -v /tmp/searxng:/etc/searxng \
             searxng/searxng:latest
@@ -220,13 +220,13 @@ panel_window_name = taskbar
 panel_background_id = 1
 # Clock (right side)
 time1_format = %H:%M
-          time1_font = DejaVu Sans:size=11
-          time2_format = %d/%m/%Y
-          time2_font = DejaVu Sans:size=9
+time1_font = DejaVu Sans:size=11
+time2_format = %d/%m/%Y
+time2_font = DejaVu Sans:size=9
 clock_font_color = #ffffff 100
 clock_padding = 12 4
 clock_background_id = 3
-          clock_lclick_command =
+clock_lclick_command =
 # Taskbar
 taskbar_mode = single_desktop
 taskbar_padding = 4 4 4
@@ -236,7 +236,7 @@ task_icon = 1
 task_text = 1
 task_centered = 1
 task_maximum_size = 220 36
-          task_font = DejaVu Sans:size=10
+task_font = DejaVu Sans:size=10
 task_font_color = #cccccc 100
 task_active_font_color = #ffffff 100
 task_iconified_font_color = #888888 100
