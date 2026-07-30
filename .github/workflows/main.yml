@@ -83,35 +83,155 @@ jobs:
         run: |
           # Shared virtual display :99 — the browser AND all the agent's GUI
           # work render here, so the LIVE VIEW (below) shows everything.
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xdotool tint2 feh pcmanfm xterm nitrogen imagemagick
           Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
           sleep 2
           export DISPLAY=:99
 
-          # A bare Xvfb display renders PURE BLACK when idle — looks broken in
-          # the live view. Fluxbox = real desktop (background, taskbar, window
-          # titlebars), and the status xterm keeps something moving on screen
-          # at all times so you can SEE the machine is alive.
+          # fluxbox config: Windows-style
+          mkdir -p ~/.fluxbox
+          cat > ~/.fluxbox/init <<'FLUX'
+session.screen0.toolbar.visible: true
+session.screen0.toolbar.tools: systemtray, iconbar, clock
+session.screen0.toolbar.position: bottom
+session.screen0.toolbar.height: 40
+session.screen0.toolbar.alpha: 245
+session.screen0.toolbar.borderColor: #2d2d2d
+session.screen0.toolbar.borderWidth: 0
+session.screen0.slitlist.file: ~/.fluxbox/slitlist
+session.screen0.tabs.usePixmap: false
+session.screen0.rootCommand: nitrogen --restore &
+session.screen0.windowPlacement: UnderMouse
+session.screen0.focusNewWindows: true
+session.screen0.focusLastWindow: true
+session.screen0.tabFocusModel: Sloppy
+session.screen0.maxDisableMove: false
+session.screen0.maxDisableResize: false
+session.screen0.fullMaxReplaceVert: true
+session.screen0.fullMaxReplaceHoriz: true
+session.screen0.maxGrabThreshold: 1
+session.screen0.maxIgnoreIncrement: true
+session.screen0.snapThreshold: 5
+session.screen0.edgeSnapThreshold: 10
+session.screen0.focusDelay: 200
+session.screen0.raiseOnFocus: true
+FLUX
+
+          # fluxbox theme: Windows 10 dark style
+          cat > ~/.fluxbox/theme <<'THEMET'
+! Windows 10 Dark Theme
+toolbar*: font: DejaVu Sans:size=10
+toolbar*: color: #ffffff
+toolbar*: backgroundColor: #1f1f1f
+toolbar*: borderColor: #2d2d2d
+toolbar*.button: color: #ffffff
+toolbar*.button: backgroundColor: #1f1f1f
+toolbar*.button:hover: backgroundColor: #333333
+toolbar*.button.pressed: backgroundColor: #0078d4
+toolbar*.clock: color: #ffffff
+toolbar*.clock: backgroundColor: #1f1f1f
+toolbar*.iconbar: color: #ffffff
+toolbar*.iconbar: backgroundColor: #1f1f1f
+toolbar*.iconbar.unfocused: color: #888888
+toolbar*.iconbar.focused: color: #ffffff
+toolbar*.iconbar.focused: backgroundColor: #0078d4
+window.border.width: 1
+window.border.color: #3d3d3d
+window.handle.width: 0
+window.borderWidth: 1
+window.borderColor: #3d3d3d
+window.focused.borderColor: #0078d4
+menu*.font: DejaVu Sans:size=10
+menu*.color: #e0e0e0
+menu*.backgroundColor: #2d2d2d
+menu*.borderColor: #404040
+menu*.borderWidth: 1
+menu.separator.color: #404040
+menu.separator.width: 1
+THEMET
+
           fluxbox > /tmp/fluxbox.log 2>&1 &
-          sleep 1
-          cat > /tmp/status.sh <<'EOF'
-          #!/bin/bash
-          while true; do
-            clear
-            echo "============================================"
-            echo "  HERMES AGENT — LIVE DESKTOP  (display :99)"
-            echo "============================================"
-            date
-            echo
-            echo "Running services:"
-            pgrep -a -f 'hermes|camoufox|litellm|searxng|cloudflared' | cut -c1-105
-            echo
-            echo "Browser windows appear here when the agent works..."
-            sleep 2
-          done
-          EOF
-          chmod +x /tmp/status.sh
-          xterm -geometry 130x20+30+30 -fg green -bg black -T "Hermes Agent — status" -e /tmp/status.sh &
+          sleep 3
+          export DISPLAY=:99
+          xterm -geometry 120x35 -bg "#0c0c0c" -fg "#cccccc" -fa "Consolas:size=11" -title "Command Prompt" -e bash -c "echo 'Microsoft Windows [Version 10.0.19045]'; echo '(c) Microsoft Corporation. All rights reserved.'; echo ''; cd ~; while true; do printf 'C:\\\\Users\\\\Admin> '; read cmd; [ -n \"\$cmd\" ] && \$cmd 2>&1 || true; done" > /tmp/xterm.log 2>&1 &
+
+          # Windows 10 dark wallpaper
+          mkdir -p ~/Pictures
+          convert -size 1920x1080 xc:"#001a33" \
+            -fill "#003366" -draw "rectangle 0,800 1920,1080" \
+            -fill "#004080" -draw "rectangle 0,900 1920,1080" \
+            -fill "#0066cc" -draw "polygon 960,200 1200,800 720,800" \
+            -fill "#0055aa" -draw "polygon 960,300 1100,750 820,750" \
+            ~/Pictures/wallpaper.png 2>/dev/null || true
+          nitrogen --set-zoom-fill ~/Pictures/wallpaper.png 2>/dev/null || feh --bg-color "#001a33" 2>/dev/null || true
+
+          # Windows-style taskbar via tint2
+          cat > /tmp/tint2rc <<'TINT2'
+# Backgrounds
+rounded = 0
+border_width = 0
+border_sides = TRLB
+# Background 1 - panel
+background_color = #1f1f1f 100
+border_color = #2d2d2d 100
+# Background 2 - active task
+rounded = 2
+border_width = 0
+border_sides = TRLB
+background_color = #0078d4 100
+border_color = #0078d4 100
+# Background 3 - clock
+rounded = 0
+border_width = 0
+border_sides = TRLB
+background_color = #2d2d2d 100
+border_color = #2d2d2d 100
+# Background 4 - button hover
+rounded = 0
+border_width = 0
+border_sides = TRLB
+background_color = #333333 100
+border_color = #333333 100
+# Panel
+panel_size = 100% 40
+panel_margin = 0 0
+panel_padding = 0 0 0
+panel_position = bottom center horizontal
+panel_dock = 1
+panel_layer = top
+panel_window_name = taskbar
+panel_background_id = 1
+# Clock (right side)
+time1_format = %H:%M
+time1_font = Segoe UI:size=11
+time2_format = %d/%m/%Y
+time2_font = Segoe UI:size=9
+clock_font_color = #ffffff 100
+clock_padding = 12 4
+clock_background_id = 3
+clock_lclick_command = gsimplecal
+# Taskbar
+taskbar_mode = single_desktop
+taskbar_padding = 4 4 4
+taskbar_background_id = 1
+taskbar_active_background_id = 1
+task_icon = 1
+task_text = 1
+task_centered = 1
+task_maximum_size = 220 36
+task_font = Segoe UI:size=10
+task_font_color = #cccccc 100
+task_active_font_color = #ffffff 100
+task_iconified_font_color = #888888 100
+# Systray (left side)
+systray_padding = 8 4 4
+systray_background_id = 1
+systray_sort = ascending
+systray_sort_order = left-to-right
+TINT2
+
+          tint2 -c /tmp/tint2rc > /tmp/tint2.log 2>&1 &
+          sleep 2
           pip install -U "camoufox[geoip]" pyvirtualdisplay
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
@@ -133,6 +253,77 @@ jobs:
             sleep 3
           done
           cat /tmp/camoufox.log || true
+          export DISPLAY=:99
+          sleep 2
+          xdotool search --name "" windowactivate --sync 2>/dev/null || true
+          xdotool key --clearmodifiers F11 2>/dev/null || true
+          sleep 1
+
+          # desktop icons via pcmanfm
+          export DISPLAY=:99
+          mkdir -p ~/.config/pcmanfm/default
+          cat > ~/.config/pcmanfm/default/desktop-items-0.conf <<'PCM'
+[*]
+desktop-manager=pcmanfm
+show-wm-menu=0
+sort=mtime;ascending;
+show-hidden=0
+snap-to-grid=0
+desktop-origin=margin
+desktop-margin-left=0
+desktop-margin-right=0
+desktop-margin-top=0
+desktop-margin-bottom=0
+desktop-font=Sans 12
+name-show=1
+size=48
+PCM
+          pcmanfm --desktop 2>/dev/null &
+          sleep 3
+
+          # desktop shortcuts - Windows style
+          mkdir -p ~/Desktop
+          cat > ~/Desktop/terminal.desktop <<'EOF'
+[Desktop Entry]
+Name=Command Prompt
+Comment=Open Terminal
+Exec=xterm -bg "#0c0c0c" -fg "#cccccc" -fa "Consolas:size=11" -title "Command Prompt"
+Icon=utilities-terminal
+Type=Application
+Categories=System;
+EOF
+          cat > ~/Desktop/browser.desktop <<'EOF'
+[Desktop Entry]
+Name=Web Browser
+Comment=Open Camoufox Browser
+Exec=xdg-open http://localhost:9222
+Icon=firefox
+Type=Application
+Categories=Network;
+EOF
+          cat > ~/Desktop/files.desktop <<'EOF'
+[Desktop Entry]
+Name=File Explorer
+Comment=Open Files
+Exec=pcmanfm
+Icon=system-file-manager
+Type=Application
+Categories=System;
+EOF
+          cat > ~/Desktop/panel.desktop <<'EOF'
+[Desktop Entry]
+Name=Model Panel
+Comment=Open Hermes Control Panel
+Exec=xdg-open http://localhost:7000
+Icon=preferences-system
+Type=Application
+Categories=Settings;
+EOF
+          chmod +x ~/Desktop/*.desktop
+          # tell pcmanfm to show desktop icons
+          export DISPLAY=:99
+          pcmanfm --desktop 2>/dev/null &
+          sleep 2
 
           # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
           # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
