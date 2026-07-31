@@ -171,6 +171,297 @@ jobs:
           # fetch skips the ~200MB browser download when restored from cache
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
+
+          # ── Install Stable Audio extension into Camoufox profile ──
+          # The extension is a Firefox-compatible WebExtension that automates
+          # Stable Audio account registration and token extraction.
+          # It is installed permanently into the browser profile so it
+          # persists across restarts.
+          mkdir -p /tmp/stableaudioextension
+          cat > /tmp/stableaudioextension/manifest.json <<'EXTMANIFEST'
+          {
+            "manifest_version": 2,
+            "name": "Stable Audio Token Automator",
+            "version": "2.0",
+            "description": "Automated account registration and authentication token extraction for Stable Audio.",
+            "browser_action": {
+              "default_icon": {
+                "16": "icon16.png",
+                "32": "icon32.png",
+                "48": "icon48.png",
+                "128": "icon128.png"
+              }
+            },
+            "permissions": [
+              "activeTab",
+              "scripting",
+              "storage",
+              "tabs",
+              "cookies",
+              "browsingData",
+              "alarms",
+              "<all_urls>"
+            ],
+            "background": {
+              "scripts": ["browser-polyfill.js", "background.js"],
+              "persistent": true
+            },
+            "content_scripts": [
+              {
+                "matches": ["<all_urls>"],
+                "js": ["browser-polyfill.js", "content.js"],
+                "css": ["content.css"],
+                "run_at": "document_idle"
+              }
+            ],
+            "web_accessible_resources": [
+              "icon16.png",
+              "icon32.png",
+              "icon48.png",
+              "icon128.png"
+            ]
+          }
+          EXTMANIFEST
+
+          cat > /tmp/stableaudioextension/browser-polyfill.js <<'POLYFILL'
+          /* browser-polyfill.js — Maps chrome.* APIs to browser.* (Firefox) APIs */
+          (function() {
+            'use strict';
+            if (typeof browser !== 'undefined' && typeof chrome === 'undefined') {
+              window.chrome = window.browser;
+            } else if (typeof chrome !== 'undefined' && typeof browser === 'undefined') {
+              window.browser = window.chrome;
+            }
+            const namespaces = ['tabs', 'scripting', 'storage', 'cookies', 'browsingData', 'alarms', 'runtime', 'action'];
+            for (const ns of namespaces) {
+              if (!chrome[ns]) chrome[ns] = {};
+              if (!browser[ns]) browser[ns] = {};
+            }
+            if (!chrome.scripting || !chrome.scripting.executeScript) {
+              chrome.scripting = chrome.scripting || {};
+              chrome.scripting.executeScript = async function(options, funcOrDetails) {
+                const target = options.target || options;
+                const tabId = target.tabId;
+                if (typeof funcOrDetails === 'function' || (options.func && typeof options.func === 'function')) {
+                  const func = options.func || funcOrDetails;
+                  const args = options.args || [];
+                  try {
+                    const results = await browser.tabs.executeScript(tabId, { func: func, args: args });
+                    return results.map(r => ({ result: r }));
+                  } catch(e) { return [{ result: null }]; }
+                }
+                return [{ result: null }];
+              };
+            }
+            if (!chrome.runtime) chrome.runtime = {};
+            Object.defineProperty(chrome.runtime, 'lastError', {
+              get: function() { return browser.runtime.lastError || null; },
+              configurable: true
+            });
+            if (!chrome.runtime.onMessage) chrome.runtime.onMessage = browser.runtime.onMessage;
+            if (!chrome.runtime.onStartup) chrome.runtime.onStartup = browser.runtime.onStartup || { addListener: function() {} };
+            if (!chrome.runtime.sendMessage) chrome.runtime.sendMessage = browser.runtime.sendMessage;
+            console.log('[browser-polyfill] Chrome-Firefox API bridge initialized.');
+          })();
+          POLYFILL
+
+          cat > /tmp/stableaudioextension/background.js <<'BGBACKGROUND'
+          /* Stable Audio Background Script (Firefox MV2) */
+          let _isCreatingAccount = false;
+          function generateRandomEmail() {
+            const ts = Date.now();
+            const r = Math.random().toString(36).substring(2, 10);
+            const domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com'];
+            return `stableaudio_${r}_${ts}@${domains[Math.floor(Math.random() * domains.length)]}`;
+          }
+          function generateStrongPassword() {
+            const lc='abcdefghijklmnopqrstuvwxyz',uc='ABCDEFGHIJKLMNOPQRSTUVWXYZ',n='0123456789',s='!@#$%^&*';
+            let p=''; for(let i=0;i<8;i++) p+=[lc,uc,n,s][i%4][Math.floor(Math.random()*[lc,uc,n,s][i%4].length)];
+            const all=lc+uc+n+s; for(let i=0;i<4;i++) p+=all[Math.floor(Math.random()*all.length)];
+            return p.split('').sort(()=>Math.random()-0.5).join('');
+          }
+          async function execTab(tabId, func, args=[]) {
+            try {
+              if (typeof browser !== 'undefined' && browser.tabs && browser.tabs.executeScript) {
+                return await browser.tabs.executeScript(tabId, { func, args });
+              }
+            } catch(e) {}
+            try {
+              if (chrome.scripting && chrome.scripting.executeScript) {
+                return await chrome.scripting.executeScript({ target: { tabId }, func, args });
+              }
+            } catch(e) {}
+            return [null];
+          }
+          async function waitForTabLoad(tabId, timeout=30000) {
+            const s=Date.now(); while(Date.now()-s<timeout) {
+              try { const t=await chrome.tabs.get(tabId); if(t&&t.status==='complete') return; } catch(e){throw new Error('Tab closed');}
+              await new Promise(r=>setTimeout(r,300));
+            } throw new Error('Tab load timeout');
+          }
+          async function waitForElement(tabId, sel, timeout=30000) {
+            const s=Date.now(); while(Date.now()-s<timeout) {
+              try { const r=await execTab(tabId,(s)=>document.querySelector(s)!==null,[sel]); if(r&&r[0]&&r[0].result) return true; } catch(e){}
+              await new Promise(r=>setTimeout(r,200));
+            } throw new Error('Element not found: '+sel);
+          }
+          async function waitForToken(tabId, timeout=40000) {
+            const s=Date.now(); while(Date.now()-s<timeout) {
+              try {
+                const r=await execTab(tabId,()=>{
+                  for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&(k.includes('auth0')||k.includes('@@auth0spajs@@'))){try{const d=JSON.parse(localStorage.getItem(k));if(d.body?.access_token||d.access_token||d.idToken) return true;}catch(e){}}}
+                  return false;
+                });
+                if(r&&r[0]&&r[0].result) return true;
+              } catch(e){}
+              await new Promise(r=>setTimeout(r,200));
+            } throw new Error('Token not found');
+          }
+          async function performLogout(tabId, cb) {
+            if(cb) cb('Killing Auth0 SSO session...');
+            await chrome.tabs.update(tabId,{url:'https://login.stableaudio.com/v2/logout'});
+            await new Promise(r=>setTimeout(r,3000));
+            try{await waitForTabLoad(tabId,15000);}catch(e){}
+            await new Promise(r=>setTimeout(r,1500));
+            const domains=['stableaudio.com','.stableaudio.com','login.stableaudio.com','auth0.com','.auth0.com','us.auth0.com','.us.auth0.com'];
+            for(const d of domains){try{const c=await chrome.cookies.getAll({domain:d});for(const ck of c){chrome.cookies.remove({url:`https://${ck.domain.startsWith('.')?ck.domain.slice(1):ck.domain}${ck.path}`,name:ck.name}).catch(()=>{});}}catch(e){}}
+            try{await chrome.browsingData.remove({origins:['https://stableaudio.com','https://www.stableaudio.com']},{localStorage:true,indexedDB:true,cookies:true,cacheStorage:true});}catch(e){}
+            await chrome.tabs.update(tabId,{url:'https://stableaudio.com'});
+            await waitForTabLoad(tabId,20000);
+            await new Promise(r=>setTimeout(r,2000));
+            try{await execTab(tabId,()=>{localStorage.clear();sessionStorage.clear();});}catch(e){}
+            if(cb) cb('Session wiped. Ready for fresh account...');
+          }
+          async function createAccount(cb) {
+            if(_isCreatingAccount) return{success:false,error:'Already in progress'};
+            _isCreatingAccount=true;
+            let tabId=null;
+            try {
+              const email=generateRandomEmail(), password=generateStrongPassword();
+              if(cb) cb('Opening Stable Audio...');
+              const tab=await chrome.tabs.create({url:'https://stableaudio.com',active:true});
+              tabId=tab.id; await waitForTabLoad(tabId); await new Promise(r=>setTimeout(r,1000));
+              let isExisting=false, signupFound=false;
+              const dw=Date.now();
+              while(Date.now()-dw<20000) {
+                try {
+                  const r=await execTab(tabId,()=>{
+                    for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&(k.includes('auth0')||k.includes('@@auth0spajs@@'))){try{const d=JSON.parse(localStorage.getItem(k));if(d.body?.access_token||d.access_token||d.idToken) return{state:'TOKEN_FOUND'};}catch(e){}}}
+                    const bs=Array.from(document.querySelectorAll('button'));const sb=bs.find(b=>{const t=b.textContent.trim().toLowerCase();return t==='sign up'||t==='sign-up';});if(sb){sb.click();return{state:'SIGNUP_CLICKED'};}
+                    return{state:'NOTHING'};
+                  });
+                  if(r&&r[0]){const s=r[0].result.state;if(s==='TOKEN_FOUND'){isExisting=true;break;}if(s==='SIGNUP_CLICKED'){signupFound=true;break;}}
+                }catch(e){}
+                await new Promise(r=>setTimeout(r,200));
+              }
+              if(!isExisting&&!signupFound) throw new Error('Sign up button not found');
+              if(isExisting) {
+                await performLogout(tabId,cb);
+                const sr=Date.now(); let so=false;
+                while(Date.now()-sr<15000){try{const r=await execTab(tabId,()=>{const bs=Array.from(document.querySelectorAll('button'));const sb=bs.find(b=>{const t=b.textContent.trim().toLowerCase();return t==='sign up'||t==='sign-up';});if(sb){sb.click();return true;}return false;});if(r?.[0]?.result){so=true;break;}}catch(e){}await new Promise(r=>setTimeout(r,300));}
+                if(!so) throw new Error('Sign up not found after logout');
+              }
+              if(cb) cb('Filling registration form...');
+              await waitForElement(tabId,'input[name="email"]',15000);
+              const fr=await execTab(tabId,(e,p)=>{const ei=document.querySelector('input[name="email"]');const pi=document.querySelector('input[name="password"]');if(ei&&pi){const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(ei,e);ei.dispatchEvent(new Event('input',{bubbles:true}));s.call(pi,p);pi.dispatchEvent(new Event('input',{bubbles:true}));return{success:true};}return{success:false};},[email,password]);
+              if(!fr?.[0]?.result.success) throw new Error('Form fill failed');
+              await waitForElement(tabId,'button[type="submit"]',10000);
+              if(cb) cb('Submitting registration...');
+              await execTab(tabId,()=>{document.querySelector('button[type="submit"]').click();});
+              await waitForToken(tabId,45000);
+              if(cb) cb('Extracting token...');
+              const tr=await execTab(tabId,()=>{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&(k.includes('auth0')||k.includes('@@auth0spajs@@'))){try{const d=JSON.parse(localStorage.getItem(k));if(d.body?.access_token) return{found:true,token:d.body.access_token};if(d.access_token) return{found:true,token:d.access_token};}catch(e){}}}return{found:false};});
+              const td=tr?.[0]?.result;
+              if(td&&td.found&&td.token){await chrome.storage.local.set({stableAudioToken:td.token,stableAudioEmail:email,stableAudioPassword:password});setTimeout(()=>chrome.tabs.remove(tabId).catch(()=>{}),1000);return{success:true,email,password,token:td.token};}
+              else{setTimeout(()=>chrome.tabs.remove(tabId).catch(()=>{}),2000);return{success:false,error:'Token extraction failed',email,password};}
+            } catch(err) { if(tabId) setTimeout(()=>chrome.tabs.remove(tabId).catch(()=>{}),2000); return{success:false,error:err.message}; }
+            finally { _isCreatingAccount=false; }
+          }
+          chrome.runtime.onMessage.addListener((req,sender,sendResp)=>{
+            if(req.action==='createStableAudioAccount'){const cb=(m)=>{if(sender?.tab?.id) chrome.tabs.sendMessage(sender.tab.id,{action:'updateAutomationStatus',message:m}).catch(()=>{});};createAccount(cb).then(r=>sendResp(r)).catch(e=>sendResp({success:false,error:e.message}));return true;}
+            if(req.action==='apiLimitReached'){const cb=(m)=>{chrome.tabs.query({},(tabs)=>{tabs.forEach(t=>{chrome.tabs.sendMessage(t.id,{action:'updateAutomationStatus',message:m}).catch(()=>{});});});};createAccount(cb).then(r=>{if(r.success){chrome.tabs.query({},(tabs)=>{tabs.forEach(t=>{chrome.tabs.sendMessage(t.id,{action:'apiLimitRecovered',token:r.token,email:r.email,password:r.password}).catch(()=>{});});});}sendResp(r);}).catch(e=>sendResp({success:false,error:e.message}));return true;}
+          });
+          console.log('[Stable Audio Automator] Background loaded.');
+          BGBACKGROUND
+
+          cat > /tmp/stableaudioextension/content.js <<'BGCONTENT'
+          (function(){console.log('Stable Audio Content Script: Loaded.');function inject(){const ti=document.getElementById('stableAudioToken');if(!ti)return;const tr=ti.closest('.token-row');if(!tr)return;if(document.getElementById('extAutoTokenContainer'))return;const c=document.createElement('div');c.id='extAutoTokenContainer';c.className='ext-container';c.innerHTML='<button id="extAutoTokenBtn" class="ext-auto-token-btn"><i class="fas fa-robot"></i> Auto-Create Account &amp; Sync Token</button><div id="extStatusBox" class="ext-status-box" style="display:none;"></div><div id="extSuccessCard" class="ext-success-card" style="display:none;"></div><div id="extErrorCard" class="ext-error-card" style="display:none;"></div>';tr.parentNode.insertBefore(c,tr.nextSibling);const btn=c.querySelector('#extAutoTokenBtn');const sb=c.querySelector('#extStatusBox');const sc=c.querySelector('#extSuccessCard');const ec=c.querySelector('#extErrorCard');btn.addEventListener('click',()=>{btn.disabled=true;btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Initializing...';sb.style.display='flex';sb.innerHTML='<i class="fas fa-sync fa-spin ext-status-icon-spinner"></i> Starting Account Creator...';sc.style.display='none';ec.style.display='none';chrome.runtime.sendMessage({action:'createStableAudioAccount'},(r)=>{btn.disabled=false;btn.innerHTML='<i class="fas fa-robot"></i> Auto-Create Account &amp; Sync Token';sb.style.display='none';if(chrome.runtime.lastError){ec.style.display='flex';ec.innerHTML='<i class="fas fa-exclamation-circle ext-error-icon"></i><div>Extension message failed.</div>';return;}if(r&&r.success){ti.value=r.token;ti.dispatchEvent(new Event('input',{bubbles:true}));sc.style.display='flex';sc.innerHTML='<div class="ext-success-header"><i class="fas fa-check-circle"></i> Token Synced!</div><div>Email: '+r.email+' | Password: '+r.password+'</div>';}else{ec.style.display='flex';ec.innerHTML='<i class="fas fa-exclamation-circle ext-error-icon"></i><div>'+(r?.error||'Failed')+'</div>';}});});}inject();setInterval(inject,1000);})();
+          BGCONTENT
+
+          cat > /tmp/stableaudioextension/content.css <<'BGCSS'
+          .ext-container{margin-top:10px;width:100%;display:flex;flex-direction:column;gap:10px;}
+          .ext-auto-token-btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:11px 18px;background:linear-gradient(135deg,#a855f7 0%,#7c3aed 100%);color:#fff!important;border:none;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 4px 15px rgba(124,58,237,.3);transition:all .3s;font-family:Arial,sans-serif;}
+          .ext-auto-token-btn:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 6px 20px rgba(124,58,237,.45);}
+          .ext-auto-token-btn:disabled{background:#cbd5e1!important;color:#94a3b8!important;cursor:not-allowed!important;}
+          .ext-status-box{display:flex;align-items:flex-start;gap:10px;background:#f8fafc;border:1.5px dashed #cbd5e1;border-radius:12px;padding:12px 14px;font-size:12px;color:#475569;animation:extFadeIn .3s ease-out;}
+          .ext-status-icon-spinner{font-size:14px;color:#7c3aed;margin-top:2px;}
+          .ext-success-card{display:flex;flex-direction:column;gap:10px;background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:12px;padding:14px;font-size:12px;color:#166534;animation:extFadeIn .4s cubic-bezier(.16,1,.3,1);}
+          .ext-success-header{display:flex;align-items:center;gap:8px;font-weight:700;font-size:13px;color:#15803d;}
+          .ext-error-card{display:flex;align-items:flex-start;gap:10px;background:#fef2f2;border:1.5px solid #fecaca;border-radius:12px;padding:12px 14px;font-size:12px;color:#991b1b;animation:extFadeIn .3s ease-out;}
+          .ext-error-icon{font-size:14px;color:#dc2626;margin-top:1px;}
+          @keyframes extFadeIn{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
+          BGCSS
+
+          # Copy icon files (placeholder — real icons will be in the repo)
+          for size in 16 32 48 128; do
+            convert -size ${size}x${size} xc:"#7c3aed" -fill white -gravity center \
+              -pointsize $((size/3)) -annotate 0 "SA" \
+              /tmp/stableaudioextension/icon${size}.png 2>/dev/null || \
+            python3 -c "
+          from PIL import Image, ImageDraw, ImageFont
+          img = Image.new('RGB', (${size}, ${size}), '#7c3aed')
+          d = ImageDraw.Draw(img)
+          try:
+              f = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', ${size}//3)
+          except:
+              f = ImageFont.load_default()
+          d.text((${size}//4, ${size}//4), 'SA', fill='white', font=f)
+          img.save('/tmp/stableaudioextension/icon${size}.png')
+          " 2>/dev/null || \
+            python3 -c "
+          import struct, zlib
+          def create_png(w,h,r,g,b):
+              def chunk(ctype,data):
+                  c=ctype+data;return struct.pack('>I',len(data))+c+struct.pack('>I',zlib.crc32(c)&0xffffffff)
+              ihdr=chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))
+              raw=b''
+              for y in range(h):raw+=b'\x00'+bytes([r,g,b])*w
+              idat=chunk(b'IDAT',zlib.compress(raw))
+              iend=chunk(b'IEND',b'')
+              return b'\x89PNG\r\n\x1a\n'+ihdr+idat+iend
+          open('/tmp/stableaudioextension/icon${size}.png','wb').write(create_png(${size},${size},0x7c,0x3aed,0xed))
+          "
+          done
+
+          # Install extension into Camoufox profile
+          cat > /tmp/install_extension.py <<'INSTPY'
+          import os, sys, json, shutil
+          ext_dir = sys.argv[1]
+          profile_dir = sys.argv[2]
+          ext_id = "stable-audio-automator@extension"
+          exts_dir = os.path.join(profile_dir, "extensions")
+          os.makedirs(exts_dir, exist_ok=True)
+          dest = os.path.join(exts_dir, ext_id)
+          if os.path.exists(dest): shutil.rmtree(dest)
+          shutil.copytree(ext_dir, dest)
+          print(f"Extension installed: {ext_id}")
+          prefs = os.path.join(profile_dir, "prefs.js")
+          with open(prefs, 'w') as f:
+              f.write('user_pref("xpinstall.signatures.required", false);\n')
+              f.write('user_pref("extensions.autoDisableScopes", 0);\n')
+              f.write('user_pref("extensions.enabledScopes", 15);\n')
+              f.write('user_pref("extensions.experiments.enabled", true);\n')
+              f.write('user_pref("app.update.auto", false);\n')
+              f.write('user_pref("app.update.enabled", false);\n')
+              f.write('user_pref("browser.startup.homepage_override.mstone", "ignore");\n')
+              f.write('user_pref("extensions.update.enabled", false);\n')
+              f.write('user_pref("toolkit.telemetry.enabled", false);\n')
+              f.write('user_pref("datareporting.healthreport.uploadEnabled", false);\n')
+              f.write('user_pref("datareporting.policy.dataSubmissionEnabled", false);\n')
+          print(f"Preferences written: {prefs}")
+          INSTPY
+          python3 /tmp/install_extension.py /tmp/stableaudioextension "$HERMES_HOME/browser-profile"
+
           nohup python3 -c "
           from camoufox.server import launch_server
           launch_server(
@@ -199,6 +490,37 @@ jobs:
             -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           echo "Live desktop view server running on :6080"
+
+          # ── VNC WATCHDOG: auto-restart x11vnc + websockify if crashed ──
+          # Prevents the dreaded "Failed to connect to server" on noVNC.
+          # Checks every 30s; restarts any dead process immediately.
+          cat > /tmp/vnc-watchdog.sh <<'VNCWATCH'
+          #!/bin/bash
+          export DISPLAY=:99
+          export PANEL_TOKEN="${PANEL_TOKEN:-hermes99}"
+          while true; do
+            sleep 30
+            # Restart x11vnc if dead
+            if ! pgrep -f "x11vnc.*:99" > /dev/null 2>&1; then
+              echo "$(date) x11vnc crashed — restarting" >> /tmp/vnc-watchdog.log
+              x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
+                -passwd "$PANEL_TOKEN" -o /tmp/x11vnc.log
+            fi
+            # Restart websockify if dead
+            if ! pgrep -f "websockify.*6080" > /dev/null 2>&1; then
+              echo "$(date) websockify crashed — restarting" >> /tmp/vnc-watchdog.log
+              nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
+            fi
+            # Restart cloudflared liveview tunnel if dead
+            if ! pgrep -f "cloudflared.*6080" > /dev/null 2>&1; then
+              echo "$(date) liveview tunnel crashed — restarting" >> /tmp/vnc-watchdog.log
+              nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > /tmp/liveview-tunnel.log 2>&1 &
+            fi
+          done
+          VNCWATCH
+          chmod +x /tmp/vnc-watchdog.sh
+          nohup /tmp/vnc-watchdog.sh > /tmp/vnc-watchdog.log 2>&1 &
+          echo "VNC watchdog started (checks every 30s)"
 
       # ── 5. Write model pool control panel ──
       - name: Write control panel
@@ -2052,6 +2374,8 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
           # third quick tunnel: LIVE DESKTOP VIEW (noVNC on :6080, see step 4)
+          # Note: if the tunnel dies, the VNC watchdog (step 4) auto-restarts it.
+          # The URL will change on restart — check /tmp/liveview-tunnel.log for the new one.
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > /tmp/liveview-tunnel.log 2>&1 &
           LIVEVIEW_URL=""
           for i in $(seq 1 30); do
@@ -2074,6 +2398,8 @@ jobs:
 
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
         run: |
           # Shared virtual display :99 (browser + agent GUI + live view all
           # render here; normally started in step 4 — this is just a safety
@@ -2116,10 +2442,13 @@ jobs:
           PYSESS
 
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
-          # auto-restart it — no more force-stopping the whole Action run
+          # auto-restart it — no more force-stopping the whole Action run.
+          # Also monitors VNC services (x11vnc, websockify) for crashes.
           cat > /tmp/watchdog.sh <<'EOF'
           #!/bin/bash
           fails=0
+          export DISPLAY=:99
+          export PANEL_TOKEN="${PANEL_TOKEN:-hermes99}"
           while true; do
             sleep 60
             # ZOMBIE detection: LiteLLM's per-worker request counter can LEAK
@@ -2129,8 +2458,6 @@ jobs:
             # Restart immediately when that error shows up in recent logs.
             if docker logs litellm --since 90s 2>&1 | grep -q "Worker local total request limit reached"; then
               echo "$(date) Router counter leak detected — restarting litellm container"
-              # -t 2: kill fast. Default docker restart waits 10s for graceful
-              # stop; that downtime is what burns the gateway's quick retries.
               docker restart -t 2 litellm >/dev/null 2>&1 || true
               fails=0
               continue
@@ -2145,6 +2472,16 @@ jobs:
                 docker restart -t 2 litellm >/dev/null 2>&1 || true
                 fails=0
               fi
+            fi
+            # ── VNC health check: restart dead x11vnc / websockify ──
+            if ! pgrep -f "x11vnc.*:99" > /dev/null 2>&1; then
+              echo "$(date) watchdog: x11vnc dead — restarting"
+              x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
+                -passwd "$PANEL_TOKEN" -o /tmp/x11vnc.log
+            fi
+            if ! pgrep -f "websockify.*6080" > /dev/null 2>&1; then
+              echo "$(date) watchdog: websockify dead — restarting"
+              nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
             fi
           done
           EOF
