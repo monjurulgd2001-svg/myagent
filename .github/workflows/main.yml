@@ -46,6 +46,23 @@ jobs:
               rsync -a --exclude='.git' /tmp/databk/ /tmp/data/ || true
             fi
           fi
+          # ── `hot` branch: 5-min critical saves + cancel-time emergency save.
+          # Almost always the freshest copy of skills / brain / tasks, so it is
+          # overlaid last when it is newer than what we already restored.
+          git clone --depth 1 -b hot "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/datahot 2>/dev/null || true
+          if [ -d /tmp/datahot/.git ] && [ -d /tmp/data/.git ]; then
+            CUR_TS=$(git -C /tmp/data log -1 --format=%ct 2>/dev/null || echo 0)
+            [ -d /tmp/databk/.git ] && BK2=$(git -C /tmp/databk log -1 --format=%ct 2>/dev/null || echo 0) || BK2=0
+            [ "$BK2" -gt "$CUR_TS" ] && CUR_TS=$BK2
+            HOT_TS=$(git -C /tmp/datahot log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$HOT_TS" -ge "$CUR_TS" ]; then
+              echo "hot branch is freshest — overlaying skills/brain/tasks"
+              rsync -a --exclude='.git' /tmp/datahot/ /tmp/data/ || true
+            fi
+          elif [ -d /tmp/datahot/.git ]; then
+            mkdir -p /tmp/data
+            rsync -a --exclude='.git' /tmp/datahot/ /tmp/data/ || true
+          fi
           if [ -d /tmp/data ]; then
             rm -f /tmp/data/.env
             rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
@@ -56,6 +73,20 @@ jobs:
               echo "Reassembled: $base"
             done
           fi
+
+          # ── Put restored OUTSIDE-tree Hermes state back in place ──
+          # The backup loop mirrors ~/.config/hermes*, ~/.local/share/hermes*
+          # and ~/.local/state/hermes* into ~/.hermes/xdg-mirror/. Restore them
+          # to their real homes so skills/brain/config are live again.
+          for pair in "config:.config" "share:.local/share" "state:.local/state"; do
+            srcd="$HERMES_HOME/xdg-mirror/${pair%%:*}"
+            dstd="$HOME/${pair##*:}"
+            if [ -d "$srcd" ] && [ -n "$(ls -A "$srcd" 2>/dev/null)" ]; then
+              mkdir -p "$dstd"
+              rsync -a "$srcd/" "$dstd/"
+              echo "Restored $dstd from backup"
+            fi
+          done
 
       # ── 1b. Preinstalled environment cache ──
       # The runner VM is WIPED after every run, so nothing can be truly
@@ -78,11 +109,31 @@ jobs:
       # ── 2. Install Hermes Agent (skipped when restored from cache) ──
       - name: Install Hermes Agent
         run: |
+          # Stash any user state sitting in the agent dir BEFORE wiping it
+          # (belt-and-braces: normally agent-state/ already holds a copy).
+          KEEP=/tmp/hermes-keep; rm -rf "$KEEP"; mkdir -p "$KEEP"
+          if [ -d "$HERMES_HOME/hermes-agent" ]; then
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+              [ -e "$HERMES_HOME/hermes-agent/$d" ] && cp -a "$HERMES_HOME/hermes-agent/$d" "$KEEP/" || true
+            done
+          fi
           rm -rf "$HERMES_HOME/hermes-agent"
           if [ -x "$HOME/.local/bin/hermes" ]; then
             echo "Hermes restored from cache — skipping download/install"
           else
             curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          fi
+          # ── MERGE BACKED-UP USER STATE into the fresh agent dir ──
+          # skills / brain / tasks / memory added in earlier sessions come back
+          # from ~/.hermes/agent-state (pulled from the privatestorage repo).
+          if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
+            mkdir -p "$HERMES_HOME/hermes-agent"
+            rsync -a "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            echo "Restored agent state: $(ls "$HERMES_HOME/agent-state" | tr '\n' ' ')"
+          fi
+          if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+            mkdir -p "$HERMES_HOME/hermes-agent"
+            rsync -a "$KEEP/" "$HERMES_HOME/hermes-agent/"
           fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -171,297 +222,6 @@ jobs:
           # fetch skips the ~200MB browser download when restored from cache
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
-
-          # ── Install Stable Audio extension into Camoufox profile ──
-          # The extension is a Firefox-compatible WebExtension that automates
-          # Stable Audio account registration and token extraction.
-          # It is installed permanently into the browser profile so it
-          # persists across restarts.
-          mkdir -p /tmp/stableaudioextension
-          cat > /tmp/stableaudioextension/manifest.json <<'EXTMANIFEST'
-          {
-            "manifest_version": 2,
-            "name": "Stable Audio Token Automator",
-            "version": "2.0",
-            "description": "Automated account registration and authentication token extraction for Stable Audio.",
-            "browser_action": {
-              "default_icon": {
-                "16": "icon16.png",
-                "32": "icon32.png",
-                "48": "icon48.png",
-                "128": "icon128.png"
-              }
-            },
-            "permissions": [
-              "activeTab",
-              "scripting",
-              "storage",
-              "tabs",
-              "cookies",
-              "browsingData",
-              "alarms",
-              "<all_urls>"
-            ],
-            "background": {
-              "scripts": ["browser-polyfill.js", "background.js"],
-              "persistent": true
-            },
-            "content_scripts": [
-              {
-                "matches": ["<all_urls>"],
-                "js": ["browser-polyfill.js", "content.js"],
-                "css": ["content.css"],
-                "run_at": "document_idle"
-              }
-            ],
-            "web_accessible_resources": [
-              "icon16.png",
-              "icon32.png",
-              "icon48.png",
-              "icon128.png"
-            ]
-          }
-          EXTMANIFEST
-
-          cat > /tmp/stableaudioextension/browser-polyfill.js <<'POLYFILL'
-          /* browser-polyfill.js — Maps chrome.* APIs to browser.* (Firefox) APIs */
-          (function() {
-            'use strict';
-            if (typeof browser !== 'undefined' && typeof chrome === 'undefined') {
-              window.chrome = window.browser;
-            } else if (typeof chrome !== 'undefined' && typeof browser === 'undefined') {
-              window.browser = window.chrome;
-            }
-            const namespaces = ['tabs', 'scripting', 'storage', 'cookies', 'browsingData', 'alarms', 'runtime', 'action'];
-            for (const ns of namespaces) {
-              if (!chrome[ns]) chrome[ns] = {};
-              if (!browser[ns]) browser[ns] = {};
-            }
-            if (!chrome.scripting || !chrome.scripting.executeScript) {
-              chrome.scripting = chrome.scripting || {};
-              chrome.scripting.executeScript = async function(options, funcOrDetails) {
-                const target = options.target || options;
-                const tabId = target.tabId;
-                if (typeof funcOrDetails === 'function' || (options.func && typeof options.func === 'function')) {
-                  const func = options.func || funcOrDetails;
-                  const args = options.args || [];
-                  try {
-                    const results = await browser.tabs.executeScript(tabId, { func: func, args: args });
-                    return results.map(r => ({ result: r }));
-                  } catch(e) { return [{ result: null }]; }
-                }
-                return [{ result: null }];
-              };
-            }
-            if (!chrome.runtime) chrome.runtime = {};
-            Object.defineProperty(chrome.runtime, 'lastError', {
-              get: function() { return browser.runtime.lastError || null; },
-              configurable: true
-            });
-            if (!chrome.runtime.onMessage) chrome.runtime.onMessage = browser.runtime.onMessage;
-            if (!chrome.runtime.onStartup) chrome.runtime.onStartup = browser.runtime.onStartup || { addListener: function() {} };
-            if (!chrome.runtime.sendMessage) chrome.runtime.sendMessage = browser.runtime.sendMessage;
-            console.log('[browser-polyfill] Chrome-Firefox API bridge initialized.');
-          })();
-          POLYFILL
-
-          cat > /tmp/stableaudioextension/background.js <<'BGBACKGROUND'
-          /* Stable Audio Background Script (Firefox MV2) */
-          let _isCreatingAccount = false;
-          function generateRandomEmail() {
-            const ts = Date.now();
-            const r = Math.random().toString(36).substring(2, 10);
-            const domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com'];
-            return `stableaudio_${r}_${ts}@${domains[Math.floor(Math.random() * domains.length)]}`;
-          }
-          function generateStrongPassword() {
-            const lc='abcdefghijklmnopqrstuvwxyz',uc='ABCDEFGHIJKLMNOPQRSTUVWXYZ',n='0123456789',s='!@#$%^&*';
-            let p=''; for(let i=0;i<8;i++) p+=[lc,uc,n,s][i%4][Math.floor(Math.random()*[lc,uc,n,s][i%4].length)];
-            const all=lc+uc+n+s; for(let i=0;i<4;i++) p+=all[Math.floor(Math.random()*all.length)];
-            return p.split('').sort(()=>Math.random()-0.5).join('');
-          }
-          async function execTab(tabId, func, args=[]) {
-            try {
-              if (typeof browser !== 'undefined' && browser.tabs && browser.tabs.executeScript) {
-                return await browser.tabs.executeScript(tabId, { func, args });
-              }
-            } catch(e) {}
-            try {
-              if (chrome.scripting && chrome.scripting.executeScript) {
-                return await chrome.scripting.executeScript({ target: { tabId }, func, args });
-              }
-            } catch(e) {}
-            return [null];
-          }
-          async function waitForTabLoad(tabId, timeout=30000) {
-            const s=Date.now(); while(Date.now()-s<timeout) {
-              try { const t=await chrome.tabs.get(tabId); if(t&&t.status==='complete') return; } catch(e){throw new Error('Tab closed');}
-              await new Promise(r=>setTimeout(r,300));
-            } throw new Error('Tab load timeout');
-          }
-          async function waitForElement(tabId, sel, timeout=30000) {
-            const s=Date.now(); while(Date.now()-s<timeout) {
-              try { const r=await execTab(tabId,(s)=>document.querySelector(s)!==null,[sel]); if(r&&r[0]&&r[0].result) return true; } catch(e){}
-              await new Promise(r=>setTimeout(r,200));
-            } throw new Error('Element not found: '+sel);
-          }
-          async function waitForToken(tabId, timeout=40000) {
-            const s=Date.now(); while(Date.now()-s<timeout) {
-              try {
-                const r=await execTab(tabId,()=>{
-                  for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&(k.includes('auth0')||k.includes('@@auth0spajs@@'))){try{const d=JSON.parse(localStorage.getItem(k));if(d.body?.access_token||d.access_token||d.idToken) return true;}catch(e){}}}
-                  return false;
-                });
-                if(r&&r[0]&&r[0].result) return true;
-              } catch(e){}
-              await new Promise(r=>setTimeout(r,200));
-            } throw new Error('Token not found');
-          }
-          async function performLogout(tabId, cb) {
-            if(cb) cb('Killing Auth0 SSO session...');
-            await chrome.tabs.update(tabId,{url:'https://login.stableaudio.com/v2/logout'});
-            await new Promise(r=>setTimeout(r,3000));
-            try{await waitForTabLoad(tabId,15000);}catch(e){}
-            await new Promise(r=>setTimeout(r,1500));
-            const domains=['stableaudio.com','.stableaudio.com','login.stableaudio.com','auth0.com','.auth0.com','us.auth0.com','.us.auth0.com'];
-            for(const d of domains){try{const c=await chrome.cookies.getAll({domain:d});for(const ck of c){chrome.cookies.remove({url:`https://${ck.domain.startsWith('.')?ck.domain.slice(1):ck.domain}${ck.path}`,name:ck.name}).catch(()=>{});}}catch(e){}}
-            try{await chrome.browsingData.remove({origins:['https://stableaudio.com','https://www.stableaudio.com']},{localStorage:true,indexedDB:true,cookies:true,cacheStorage:true});}catch(e){}
-            await chrome.tabs.update(tabId,{url:'https://stableaudio.com'});
-            await waitForTabLoad(tabId,20000);
-            await new Promise(r=>setTimeout(r,2000));
-            try{await execTab(tabId,()=>{localStorage.clear();sessionStorage.clear();});}catch(e){}
-            if(cb) cb('Session wiped. Ready for fresh account...');
-          }
-          async function createAccount(cb) {
-            if(_isCreatingAccount) return{success:false,error:'Already in progress'};
-            _isCreatingAccount=true;
-            let tabId=null;
-            try {
-              const email=generateRandomEmail(), password=generateStrongPassword();
-              if(cb) cb('Opening Stable Audio...');
-              const tab=await chrome.tabs.create({url:'https://stableaudio.com',active:true});
-              tabId=tab.id; await waitForTabLoad(tabId); await new Promise(r=>setTimeout(r,1000));
-              let isExisting=false, signupFound=false;
-              const dw=Date.now();
-              while(Date.now()-dw<20000) {
-                try {
-                  const r=await execTab(tabId,()=>{
-                    for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&(k.includes('auth0')||k.includes('@@auth0spajs@@'))){try{const d=JSON.parse(localStorage.getItem(k));if(d.body?.access_token||d.access_token||d.idToken) return{state:'TOKEN_FOUND'};}catch(e){}}}
-                    const bs=Array.from(document.querySelectorAll('button'));const sb=bs.find(b=>{const t=b.textContent.trim().toLowerCase();return t==='sign up'||t==='sign-up';});if(sb){sb.click();return{state:'SIGNUP_CLICKED'};}
-                    return{state:'NOTHING'};
-                  });
-                  if(r&&r[0]){const s=r[0].result.state;if(s==='TOKEN_FOUND'){isExisting=true;break;}if(s==='SIGNUP_CLICKED'){signupFound=true;break;}}
-                }catch(e){}
-                await new Promise(r=>setTimeout(r,200));
-              }
-              if(!isExisting&&!signupFound) throw new Error('Sign up button not found');
-              if(isExisting) {
-                await performLogout(tabId,cb);
-                const sr=Date.now(); let so=false;
-                while(Date.now()-sr<15000){try{const r=await execTab(tabId,()=>{const bs=Array.from(document.querySelectorAll('button'));const sb=bs.find(b=>{const t=b.textContent.trim().toLowerCase();return t==='sign up'||t==='sign-up';});if(sb){sb.click();return true;}return false;});if(r?.[0]?.result){so=true;break;}}catch(e){}await new Promise(r=>setTimeout(r,300));}
-                if(!so) throw new Error('Sign up not found after logout');
-              }
-              if(cb) cb('Filling registration form...');
-              await waitForElement(tabId,'input[name="email"]',15000);
-              const fr=await execTab(tabId,(e,p)=>{const ei=document.querySelector('input[name="email"]');const pi=document.querySelector('input[name="password"]');if(ei&&pi){const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(ei,e);ei.dispatchEvent(new Event('input',{bubbles:true}));s.call(pi,p);pi.dispatchEvent(new Event('input',{bubbles:true}));return{success:true};}return{success:false};},[email,password]);
-              if(!fr?.[0]?.result.success) throw new Error('Form fill failed');
-              await waitForElement(tabId,'button[type="submit"]',10000);
-              if(cb) cb('Submitting registration...');
-              await execTab(tabId,()=>{document.querySelector('button[type="submit"]').click();});
-              await waitForToken(tabId,45000);
-              if(cb) cb('Extracting token...');
-              const tr=await execTab(tabId,()=>{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&(k.includes('auth0')||k.includes('@@auth0spajs@@'))){try{const d=JSON.parse(localStorage.getItem(k));if(d.body?.access_token) return{found:true,token:d.body.access_token};if(d.access_token) return{found:true,token:d.access_token};}catch(e){}}}return{found:false};});
-              const td=tr?.[0]?.result;
-              if(td&&td.found&&td.token){await chrome.storage.local.set({stableAudioToken:td.token,stableAudioEmail:email,stableAudioPassword:password});setTimeout(()=>chrome.tabs.remove(tabId).catch(()=>{}),1000);return{success:true,email,password,token:td.token};}
-              else{setTimeout(()=>chrome.tabs.remove(tabId).catch(()=>{}),2000);return{success:false,error:'Token extraction failed',email,password};}
-            } catch(err) { if(tabId) setTimeout(()=>chrome.tabs.remove(tabId).catch(()=>{}),2000); return{success:false,error:err.message}; }
-            finally { _isCreatingAccount=false; }
-          }
-          chrome.runtime.onMessage.addListener((req,sender,sendResp)=>{
-            if(req.action==='createStableAudioAccount'){const cb=(m)=>{if(sender?.tab?.id) chrome.tabs.sendMessage(sender.tab.id,{action:'updateAutomationStatus',message:m}).catch(()=>{});};createAccount(cb).then(r=>sendResp(r)).catch(e=>sendResp({success:false,error:e.message}));return true;}
-            if(req.action==='apiLimitReached'){const cb=(m)=>{chrome.tabs.query({},(tabs)=>{tabs.forEach(t=>{chrome.tabs.sendMessage(t.id,{action:'updateAutomationStatus',message:m}).catch(()=>{});});});};createAccount(cb).then(r=>{if(r.success){chrome.tabs.query({},(tabs)=>{tabs.forEach(t=>{chrome.tabs.sendMessage(t.id,{action:'apiLimitRecovered',token:r.token,email:r.email,password:r.password}).catch(()=>{});});});}sendResp(r);}).catch(e=>sendResp({success:false,error:e.message}));return true;}
-          });
-          console.log('[Stable Audio Automator] Background loaded.');
-          BGBACKGROUND
-
-          cat > /tmp/stableaudioextension/content.js <<'BGCONTENT'
-          (function(){console.log('Stable Audio Content Script: Loaded.');function inject(){const ti=document.getElementById('stableAudioToken');if(!ti)return;const tr=ti.closest('.token-row');if(!tr)return;if(document.getElementById('extAutoTokenContainer'))return;const c=document.createElement('div');c.id='extAutoTokenContainer';c.className='ext-container';c.innerHTML='<button id="extAutoTokenBtn" class="ext-auto-token-btn"><i class="fas fa-robot"></i> Auto-Create Account &amp; Sync Token</button><div id="extStatusBox" class="ext-status-box" style="display:none;"></div><div id="extSuccessCard" class="ext-success-card" style="display:none;"></div><div id="extErrorCard" class="ext-error-card" style="display:none;"></div>';tr.parentNode.insertBefore(c,tr.nextSibling);const btn=c.querySelector('#extAutoTokenBtn');const sb=c.querySelector('#extStatusBox');const sc=c.querySelector('#extSuccessCard');const ec=c.querySelector('#extErrorCard');btn.addEventListener('click',()=>{btn.disabled=true;btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Initializing...';sb.style.display='flex';sb.innerHTML='<i class="fas fa-sync fa-spin ext-status-icon-spinner"></i> Starting Account Creator...';sc.style.display='none';ec.style.display='none';chrome.runtime.sendMessage({action:'createStableAudioAccount'},(r)=>{btn.disabled=false;btn.innerHTML='<i class="fas fa-robot"></i> Auto-Create Account &amp; Sync Token';sb.style.display='none';if(chrome.runtime.lastError){ec.style.display='flex';ec.innerHTML='<i class="fas fa-exclamation-circle ext-error-icon"></i><div>Extension message failed.</div>';return;}if(r&&r.success){ti.value=r.token;ti.dispatchEvent(new Event('input',{bubbles:true}));sc.style.display='flex';sc.innerHTML='<div class="ext-success-header"><i class="fas fa-check-circle"></i> Token Synced!</div><div>Email: '+r.email+' | Password: '+r.password+'</div>';}else{ec.style.display='flex';ec.innerHTML='<i class="fas fa-exclamation-circle ext-error-icon"></i><div>'+(r?.error||'Failed')+'</div>';}});});}inject();setInterval(inject,1000);})();
-          BGCONTENT
-
-          cat > /tmp/stableaudioextension/content.css <<'BGCSS'
-          .ext-container{margin-top:10px;width:100%;display:flex;flex-direction:column;gap:10px;}
-          .ext-auto-token-btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:11px 18px;background:linear-gradient(135deg,#a855f7 0%,#7c3aed 100%);color:#fff!important;border:none;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 4px 15px rgba(124,58,237,.3);transition:all .3s;font-family:Arial,sans-serif;}
-          .ext-auto-token-btn:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 6px 20px rgba(124,58,237,.45);}
-          .ext-auto-token-btn:disabled{background:#cbd5e1!important;color:#94a3b8!important;cursor:not-allowed!important;}
-          .ext-status-box{display:flex;align-items:flex-start;gap:10px;background:#f8fafc;border:1.5px dashed #cbd5e1;border-radius:12px;padding:12px 14px;font-size:12px;color:#475569;animation:extFadeIn .3s ease-out;}
-          .ext-status-icon-spinner{font-size:14px;color:#7c3aed;margin-top:2px;}
-          .ext-success-card{display:flex;flex-direction:column;gap:10px;background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:12px;padding:14px;font-size:12px;color:#166534;animation:extFadeIn .4s cubic-bezier(.16,1,.3,1);}
-          .ext-success-header{display:flex;align-items:center;gap:8px;font-weight:700;font-size:13px;color:#15803d;}
-          .ext-error-card{display:flex;align-items:flex-start;gap:10px;background:#fef2f2;border:1.5px solid #fecaca;border-radius:12px;padding:12px 14px;font-size:12px;color:#991b1b;animation:extFadeIn .3s ease-out;}
-          .ext-error-icon{font-size:14px;color:#dc2626;margin-top:1px;}
-          @keyframes extFadeIn{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
-          BGCSS
-
-          # Copy icon files (placeholder — real icons will be in the repo)
-          for size in 16 32 48 128; do
-            convert -size ${size}x${size} xc:"#7c3aed" -fill white -gravity center \
-              -pointsize $((size/3)) -annotate 0 "SA" \
-              /tmp/stableaudioextension/icon${size}.png 2>/dev/null || \
-            python3 -c "
-          from PIL import Image, ImageDraw, ImageFont
-          img = Image.new('RGB', (${size}, ${size}), '#7c3aed')
-          d = ImageDraw.Draw(img)
-          try:
-              f = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', ${size}//3)
-          except:
-              f = ImageFont.load_default()
-          d.text((${size}//4, ${size}//4), 'SA', fill='white', font=f)
-          img.save('/tmp/stableaudioextension/icon${size}.png')
-          " 2>/dev/null || \
-            python3 -c "
-          import struct, zlib
-          def create_png(w,h,r,g,b):
-              def chunk(ctype,data):
-                  c=ctype+data;return struct.pack('>I',len(data))+c+struct.pack('>I',zlib.crc32(c)&0xffffffff)
-              ihdr=chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))
-              raw=b''
-              for y in range(h):raw+=b'\x00'+bytes([r,g,b])*w
-              idat=chunk(b'IDAT',zlib.compress(raw))
-              iend=chunk(b'IEND',b'')
-              return b'\x89PNG\r\n\x1a\n'+ihdr+idat+iend
-          open('/tmp/stableaudioextension/icon${size}.png','wb').write(create_png(${size},${size},0x7c,0x3aed,0xed))
-          "
-          done
-
-          # Install extension into Camoufox profile
-          cat > /tmp/install_extension.py <<'INSTPY'
-          import os, sys, json, shutil
-          ext_dir = sys.argv[1]
-          profile_dir = sys.argv[2]
-          ext_id = "stable-audio-automator@extension"
-          exts_dir = os.path.join(profile_dir, "extensions")
-          os.makedirs(exts_dir, exist_ok=True)
-          dest = os.path.join(exts_dir, ext_id)
-          if os.path.exists(dest): shutil.rmtree(dest)
-          shutil.copytree(ext_dir, dest)
-          print(f"Extension installed: {ext_id}")
-          prefs = os.path.join(profile_dir, "prefs.js")
-          with open(prefs, 'w') as f:
-              f.write('user_pref("xpinstall.signatures.required", false);\n')
-              f.write('user_pref("extensions.autoDisableScopes", 0);\n')
-              f.write('user_pref("extensions.enabledScopes", 15);\n')
-              f.write('user_pref("extensions.experiments.enabled", true);\n')
-              f.write('user_pref("app.update.auto", false);\n')
-              f.write('user_pref("app.update.enabled", false);\n')
-              f.write('user_pref("browser.startup.homepage_override.mstone", "ignore");\n')
-              f.write('user_pref("extensions.update.enabled", false);\n')
-              f.write('user_pref("toolkit.telemetry.enabled", false);\n')
-              f.write('user_pref("datareporting.healthreport.uploadEnabled", false);\n')
-              f.write('user_pref("datareporting.policy.dataSubmissionEnabled", false);\n')
-          print(f"Preferences written: {prefs}")
-          INSTPY
-          python3 /tmp/install_extension.py /tmp/stableaudioextension "$HERMES_HOME/browser-profile"
-
           nohup python3 -c "
           from camoufox.server import launch_server
           launch_server(
@@ -490,37 +250,6 @@ jobs:
             -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           echo "Live desktop view server running on :6080"
-
-          # ── VNC WATCHDOG: auto-restart x11vnc + websockify if crashed ──
-          # Prevents the dreaded "Failed to connect to server" on noVNC.
-          # Checks every 30s; restarts any dead process immediately.
-          cat > /tmp/vnc-watchdog.sh <<'VNCWATCH'
-          #!/bin/bash
-          export DISPLAY=:99
-          export PANEL_TOKEN="${PANEL_TOKEN:-hermes99}"
-          while true; do
-            sleep 30
-            # Restart x11vnc if dead
-            if ! pgrep -f "x11vnc.*:99" > /dev/null 2>&1; then
-              echo "$(date) x11vnc crashed — restarting" >> /tmp/vnc-watchdog.log
-              x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
-                -passwd "$PANEL_TOKEN" -o /tmp/x11vnc.log
-            fi
-            # Restart websockify if dead
-            if ! pgrep -f "websockify.*6080" > /dev/null 2>&1; then
-              echo "$(date) websockify crashed — restarting" >> /tmp/vnc-watchdog.log
-              nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
-            fi
-            # Restart cloudflared liveview tunnel if dead
-            if ! pgrep -f "cloudflared.*6080" > /dev/null 2>&1; then
-              echo "$(date) liveview tunnel crashed — restarting" >> /tmp/vnc-watchdog.log
-              nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > /tmp/liveview-tunnel.log 2>&1 &
-            fi
-          done
-          VNCWATCH
-          chmod +x /tmp/vnc-watchdog.sh
-          nohup /tmp/vnc-watchdog.sh > /tmp/vnc-watchdog.log 2>&1 &
-          echo "VNC watchdog started (checks every 30s)"
 
       # ── 5. Write model pool control panel ──
       - name: Write control panel
@@ -1289,6 +1018,37 @@ jobs:
             ~/.hermes/work/ before doing anything else with it.
             Platform uploads land in a temporary cache that gets auto-deleted;
             the ~/.hermes/work/ copy is the only one that survives.
+          - VOICE IN, VOICE OUT: if the incoming Telegram or Slack message was
+            a VOICE / audio message, reply with VOICE too. Send your normal text
+            answer first, then speak it by running:
+              curl -s -X POST http://localhost:7777/voicereply \
+                -H "X-Token: $PANEL_TOKEN" -H 'Content-Type: application/json' \
+                -d '{"text":"<your reply text>","chat_id":"<telegram chat id>"}'
+            For Slack use "channel":"<channel id>" instead of chat_id. Omit
+            chat_id to use the default Telegram chat. Keep spoken replies short
+            (2-4 sentences) and skip code blocks and URLs. The endpoint speaks
+            with the Supertonic on-device model (Bangla automatically uses the
+            Edge Bangla voice).
+          - SENDING FILES TO THE BOSS (screenshots, video, any file): the
+            Jarvis HUD can now show files inline in the chat. Whenever the
+            user asks you for a screenshot, recording, report, export or ANY
+            file, you MUST save it into the outbox folder:
+              ~/.hermes/work/outputs/
+            Everything you write there during a task is delivered into the
+            chat automatically - images and video appear as inline previews
+            with a download button. Use clear filenames.
+            For a full-desktop screenshot use the visible display :99:
+              DISPLAY=:99 import -window root ~/.hermes/work/outputs/shot.png
+              (or: DISPLAY=:99 scrot ~/.hermes/work/outputs/shot.png)
+            To push a file into the chat immediately, without waiting for
+            your reply to finish, run:
+              curl -s -X POST http://localhost:7777/share \
+                -H "X-Token: $PANEL_TOKEN" -H 'Content-Type: application/json' \
+                -d '{"path":"/home/runner/.hermes/work/outputs/shot.png","text":"Screenshot, Boss."}'
+            Always MENTION the file path in your reply text too. Never tell
+            the user you cannot send files - save it to the outbox instead.
+            Files are served only from ~/.hermes/work, ~/Desktop, ~/Pictures,
+            ~/Videos, ~/Downloads and /tmp, so keep outputs in those places.
           - BROWSER WORK MUST BE VISIBLE: the user watches this machine's
             desktop live over VNC. Your built-in browser tools are already
             wired to a visible Chrome. When you write your OWN browser
@@ -1481,12 +1241,15 @@ jobs:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           ELEVENLABS_KEYS: ${{ secrets.ELEVENLABS_KEYS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         run: |
           mkdir -p /tmp/jarvis
           cat > /tmp/jarvis/index.html <<'HUDHTML'
           <!doctype html>
           <html><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
           <title>AGENT HUD</title>
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1500,7 +1263,8 @@ jobs:
             --amber:#fbbf24;--amber-soft:rgba(251,191,36,.12);
             --red:#f87171;--red-soft:rgba(248,113,113,.12);
           }
-          *{margin:0;padding:0;box-sizing:border-box}
+          *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+          button,select,input,.vrow{touch-action:manipulation}
           html,body{height:100%}
           body{background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;min-height:100dvh;overflow:hidden;font-size:15px;line-height:1.5}
           body:before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
@@ -1583,7 +1347,7 @@ jobs:
           #top .tl{display:flex;align-items:center;gap:10px;font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:.24em;color:var(--dim);text-transform:uppercase}
           #top .tl i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
           #clock{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--faint);letter-spacing:.14em}
-          #log{flex:1;min-height:0;overflow-y:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
+          #log{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;backdrop-filter:blur(10px);scroll-behavior:smooth}
           #log::-webkit-scrollbar{width:8px}#log::-webkit-scrollbar-thumb{background:#1e2f44;border-radius:8px}
           #empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--faint);text-align:center}
           #empty .t{font-family:Orbitron,monospace;letter-spacing:.3em;font-size:13px;color:#3f5b75}
@@ -1654,7 +1418,65 @@ jobs:
           .vrow .vm{font-size:11px;color:var(--faint);letter-spacing:.06em;margin-top:2px}
           .vrow .prev{margin-left:auto}
           #vfoot{padding:11px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);letter-spacing:.08em}
-          @media(max-width:919px){#left{flex-direction:row;flex-wrap:wrap;justify-content:center;gap:10px;padding:12px}#reactor{width:clamp(95px,20vmin,130px);margin:0}#brand{width:100%}#bars{display:none}#top{display:none}}
+          /* ---------- MOBILE ---------- */
+          @media(max-width:919px){
+            #wrap{padding:8px;gap:8px;padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right));padding-bottom:max(8px,env(safe-area-inset-bottom))}
+            /* compact console: brand strip, then reactor + state + mic in one row */
+            #left{flex-direction:row;flex-wrap:wrap;justify-content:center;align-items:center;gap:6px 14px;padding:10px 12px 12px}
+            #brand{width:100%}
+            h1{font-size:19px;letter-spacing:.34em;padding-left:.34em}
+            #sub{font-size:8.5px;letter-spacing:.26em;margin-top:3px}
+            #reactor{width:clamp(84px,24vw,110px);margin:0}
+            #state{font-size:9.5px;letter-spacing:.2em;padding:7px 13px}
+            #mic{width:58px}
+            #bars{display:none}#top{display:none}#engine{display:none}
+            #interrupt{padding:10px 16px;min-height:44px}
+            /* options: full-width row with comfortable touch sizes */
+            #opts{width:100%;gap:10px 14px}
+            select{padding:10px 12px;font-size:14px;min-height:42px}
+            .tog{font-size:10px;min-height:42px}
+            .tog input{width:36px;height:20px}
+            .tog input:before{width:14px;height:14px}
+            .tog input:checked:before{left:19px}
+            #vmb{padding:11px 14px;min-height:42px}
+            /* conversation: denser padding, wider bubbles, readable text */
+            #log{padding:12px;border-radius:12px}
+            .msg{max-width:94%;margin-bottom:13px}
+            .msg pre{font-size:14px}
+            #empty .d{max-width:260px}
+            #live{font-size:13px;min-height:18px}
+            /* composer: 16px input stops iOS zoom-on-focus; 46px touch targets */
+            #inrow{gap:7px}
+            #txt{font-size:16px;padding:12px 13px}
+            button.act{min-height:46px;padding:0 15px}
+            #attach{min-width:46px;font-size:17px}
+            .icon{width:44px;height:44px;font-size:15px}
+            .chip{padding:7px 11px;font-size:11.5px}
+            .chip button{font-size:16px;padding:2px 5px}
+            /* playback bar: drop the label, keep track + big controls */
+            #pbar{gap:8px;padding:8px 10px}
+            #pbar .lbl{display:none}
+            /* voice model panel becomes a bottom sheet */
+            #vmask{align-items:flex-end}
+            #vpanel{width:100%;max-width:none;max-height:80dvh;border-radius:18px 18px 0 0;border-bottom:none}
+            #vhead{padding:14px 16px}
+            .vrow{padding:12px;gap:10px}
+            .vrow .prev{width:44px;height:44px}
+            #vfoot{padding:11px 16px;padding-bottom:max(11px,env(safe-area-inset-bottom))}
+            /* token gate fits small screens */
+            #gatebox{margin:0 16px;padding:26px 22px;width:100%;max-width:360px}
+            #gatebox input,#gatebox button{width:100%}
+          }
+          .outs{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px}
+          .out{border:1px solid rgba(0,229,255,.28);border-radius:10px;overflow:hidden;background:rgba(0,20,30,.45);max-width:100%}
+          .out img,.out video{display:block;max-width:340px;max-height:260px;width:auto;cursor:zoom-in;background:#000}
+          .out audio{display:block;width:300px;max-width:100%;margin:8px}
+          .obar{display:flex;align-items:center;gap:8px;padding:7px 10px;font-size:11px;letter-spacing:.06em}
+          .onm{flex:1;color:#cfefff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px}
+          .osz{color:#5c8ea3}
+          .odl{color:#00e5ff;text-decoration:none;border:1px solid rgba(0,229,255,.45);border-radius:6px;padding:3px 8px;font-size:10px}
+          .odl:hover{background:rgba(0,229,255,.14)}
+          @media(max-width:680px){.out img,.out video{max-width:100%;max-height:200px}.outs{gap:8px}}
           </style></head>
           <body class="idle">
           <div id="grid"></div>
@@ -1701,7 +1523,7 @@ jobs:
            </div>
           </div>
           <div id="vmask"><div id="vpanel"><div id="vhead"><span>VOICE MODEL · EDGE NEURAL</span><button class="icon" id="vclose" title="Close">&#10005;</button></div><div id="vlist"></div><div id="vfoot">Tap &#9654; to hear a preview · tap a row to select · saved on this device</div></div></div>
-          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><p>Enter your PANEL_TOKEN secret to engage</p><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button class="act" id="tokb">ENGAGE</button></div></div>
+          <div id="gate"><div id="gatebox"><h2>ACCESS TOKEN</h2><p id="gatep">Enter your PANEL_TOKEN secret to engage</p><input id="tok" type="password" placeholder="PANEL_TOKEN"><br><button class="act" id="tokb">ENGAGE</button></div></div>
           <script>
           function el(id){return document.getElementById(id);}
           var tok=localStorage.getItem('jtok')||'';
@@ -1711,35 +1533,95 @@ jobs:
           var rec=null,mrec=null,stream=null,listening=false,curA=null,curU=null;
           var vadT=null,actx=null,t0=0,recSpoke=false,srT=null,srLast='';
           var bargeT=null,paused=false,lastReply='',lastAudioURL=null,curJob=null,thinkT=null,thinkStart=0;
+          var Q=[],QI=0,QURL=[],QSEQ=0,QDONE=false;
+          var pushSince=0;
           var files=[];
           var hist=[];
 
-          var VOICES=[],VDEF={};
-          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');}).catch(function(){});}
-          if(tok){el('gate').style.display='none';boot();}
-          el('tokb').onclick=function(){tok=el('tok').value.trim();localStorage.setItem('jtok',tok);el('gate').style.display='none';boot();};
+          var VOICES=[],VDEF={},lastNote='',stStatus='',stErr='',PREFS={};
+          function savePrefs(o){for(var k in o){PREFS[k]=o[k];}
+            fetch('/prefs',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify(o)}).catch(function(){});}
+          function applyConfig(j){elTTS=!!j.tts;srvSTT=!!j.stt;VOICES=j.voices||[];VDEF=j.defaults||{};stStatus=j.st||'';stErr=j.sterr||'';
+            PREFS=j.prefs||{};
+            if(PREFS.voice){localStorage.setItem('jvoice',PREFS.voice);}
+            if(PREFS.lang){el('lang').value=PREFS.lang;}
+            if(typeof PREFS.speak==='boolean'){el('voice').checked=PREFS.speak;}
+            if(typeof PREFS.autoEar==='boolean'){el('auto').checked=PREFS.autoEar;}el('engine').textContent='VOICE '+(elTTS?'EDGE NEURAL · FREE':'BROWSER')+' · EARS '+(srvSTT?'SERVER+BROWSER':'BROWSER');if(j.st==='loading'){stPoll(0);}}
+          function boot(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){lockOut();return null;}return r.json();}).then(function(j){if(j){applyConfig(j);}}).catch(function(){});}
+          function stPoll(n){if(n>20){return;}setTimeout(function(){fetch('/config',{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.voices&&j.voices.length>VOICES.length){VOICES=j.voices;toast('Supertonic on-device voices are ready — open the voice panel to try them.',1);}else if(j.st==='loading'){stPoll(n+1);}}).catch(function(){});},20000);}
+          function gateMsg(m,bad){var p=el('gatep');p.textContent=m;p.style.color=bad?'#fda4af':'';}
+          function lockOut(m){localStorage.removeItem('jtok');tok='';VOICES=[];el('gate').style.display='';el('tok').value='';gateMsg(m||'Token rejected \u2014 re-enter your PANEL_TOKEN secret',true);}
+          function tryToken(t,fromGate){
+            el('tokb').disabled=true;if(fromGate){gateMsg('Verifying\u2026');}
+            return fetch('/config',{headers:{'X-Token':t}}).then(function(r){
+              if(r.status===401){throw new Error('bad');}
+              return r.json();
+            }).then(function(j){
+              el('tokb').disabled=false;tok=t;localStorage.setItem('jtok',t);el('gate').style.display='none';applyConfig(j);
+            }).catch(function(e){
+              el('tokb').disabled=false;
+              if(e&&e.message==='bad'){lockOut('Wrong token \u2014 use the exact PANEL_TOKEN secret from your repo');}
+              else{gateMsg('Cannot reach the agent \u2014 is the run still alive? Retry.',true);el('gate').style.display='';}
+            });
+          }
+          if(tok){tryToken(tok,false);}
+          el('tokb').onclick=function(){var v=el('tok').value.trim();if(!v){gateMsg('Enter your PANEL_TOKEN secret',true);return;}tryToken(v,true);};
           el('tok').addEventListener('keydown',function(e){if(e.key==='Enter'){el('tokb').onclick();}});
 
           function toast(m,info){var t=el('toast');t.className=info?'info':'';t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(function(){t.style.display='none';},6000);}
           function setState(s,l){document.body.className=s;el('stateTxt').textContent=l;}
           function fmtSz(n){if(n>1048576){return (n/1048576).toFixed(1)+' MB';}if(n>1024){return Math.round(n/1024)+' KB';}return n+' B';}
-          function addMsg(who,text,att){var e=el('empty');if(e){e.remove();}
+          function addMsg(who,text,att,outs){var e=el('empty');if(e){e.remove();}
             var d=document.createElement('div');d.className='msg '+who;
             var m=document.createElement('div');m.className='meta';var b=document.createElement('b');b.textContent=(who==='YOU'?'YOU':'AGENT');var tm=document.createElement('span');tm.textContent=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
             if(who==='YOU'){m.appendChild(tm);m.appendChild(b);}else{m.appendChild(b);m.appendChild(tm);}
             var bd=document.createElement('div');bd.className='body';var p=document.createElement('pre');p.textContent=text;bd.appendChild(p);
             if(att&&att.length){var a=document.createElement('div');a.className='att';for(var i=0;i<att.length;i++){var s=document.createElement('span');s.textContent='\u{1F4CE} '+att[i];a.appendChild(s);}bd.appendChild(a);}
-            d.appendChild(m);d.appendChild(bd);el('log').appendChild(d);el('log').scrollTop=el('log').scrollHeight;}
-          function clean(t){return t.replace(/```[\s\S]*?```/g,' code block ').replace(/https?:\S+/g,' link ').replace(/[*_#`>|]/g,' ').replace(/\s+/g,' ').trim();}
+            if(outs&&outs.length){bd.appendChild(renderOuts(outs));}
+            d.appendChild(m);d.appendChild(bd);el('log').appendChild(d);el('log').scrollTop=el('log').scrollHeight;
+            return d;}
+          function drainPushed(j){
+            if(j&&j.now){pushSince=j.now;}
+            if(!j||!j.pushed||!j.pushed.length){return;}
+            j.pushed.forEach(function(x){
+              addMsg('AGENT',x.text||'Here you go, Boss.',null,x.files);
+            });
+          }
+          function fileURL(f,dl){return f.url+'&t='+encodeURIComponent(tok)+(dl?'&dl=1':'');}
+          function renderOuts(outs){
+            var w=document.createElement('div');w.className='outs';
+            outs.forEach(function(f){
+              var c=document.createElement('div');c.className='out '+f.kind;
+              if(f.kind==='image'){
+                var im=document.createElement('img');im.src=fileURL(f,0);im.alt=f.name;im.loading='lazy';
+                im.onclick=function(){window.open(fileURL(f,0),'_blank');};
+                im.onerror=function(){im.remove();};
+                c.appendChild(im);
+              }else if(f.kind==='video'){
+                var vd=document.createElement('video');vd.src=fileURL(f,0);vd.controls=true;vd.preload='metadata';vd.playsInline=true;c.appendChild(vd);
+              }else if(f.kind==='audio'){
+                var au=document.createElement('audio');au.src=fileURL(f,0);au.controls=true;au.preload='metadata';c.appendChild(au);
+              }
+              var bar=document.createElement('div');bar.className='obar';
+              var nm=document.createElement('span');nm.className='onm';nm.textContent=f.name;bar.appendChild(nm);
+              var sz=document.createElement('span');sz.className='osz';sz.textContent=fmtSz(f.size);bar.appendChild(sz);
+              var dl=document.createElement('a');dl.className='odl';dl.href=fileURL(f,1);dl.textContent='DOWNLOAD';
+              dl.setAttribute('download',f.name);bar.appendChild(dl);
+              c.appendChild(bar);w.appendChild(c);
+            });
+            return w;}
+          function clean(t){return t.replace(/```[\s\S]*?```/g,' code block ').replace(/(?:~|\.?\/)[^\s"'`)\]<>,;]+\.[A-Za-z0-9]{1,5}/g,' the file ').replace(/https?:\S+/g,' link ').replace(/[*_#`>|]/g,' ').replace(/\s+/g,' ').trim();}
 
 
           /* ---------- voice model panel (free Microsoft Edge neural voices) ---------- */
           var pvA=null,pvBtn=null;
-          function curVoice(){var v=localStorage.getItem('jvoice');if(v){return v;}return VDEF[el('lang').value]||'en-US-GuyNeural';}
+          function curVoice(){var v=localStorage.getItem('jvoice')||PREFS.voice;if(v){return v;}return VDEF[el('lang').value]||'en-US-GuyNeural';}
           function stopPreview(){if(pvA){try{pvA.pause();}catch(e){}pvA=null;}if(pvBtn){pvBtn.innerHTML='&#9654;';pvBtn=null;}}
           function buildVoices(){
             var L=el('vlist');L.innerHTML='';var sel=curVoice(),lastG='';
-            if(!VOICES.length){L.innerHTML='<div class="vgroup">VOICE LIST UNAVAILABLE — CHECK CONNECTION</div>';return;}
+            if(stStatus==='loading'){var s1=document.createElement('div');s1.className='vgroup';s1.textContent='SUPERTONIC 3 \u00b7 LOADING\u2026 VOICES APPEAR WHEN READY';L.appendChild(s1);}
+            else if(stStatus==='error'||stStatus==='missing'){var s2=document.createElement('div');s2.className='vgroup';s2.textContent='SUPERTONIC 3 UNAVAILABLE \u00b7 '+(stErr||'').toUpperCase().slice(0,60);L.appendChild(s2);}
+            if(!VOICES.length){L.innerHTML='<div class="vgroup">VOICE LIST UNAVAILABLE — RELOADING…</div>';boot();return;}
             VOICES.forEach(function(v){
               if(v.group!==lastG){lastG=v.group;var g=document.createElement('div');g.className='vgroup';g.textContent=v.group;L.appendChild(g);}
               var r=document.createElement('div');r.className='vrow'+(v.id===sel?' sel':'');
@@ -1750,7 +1632,7 @@ jobs:
               var p=document.createElement('button');p.className='icon prev';p.innerHTML='&#9654;';p.title='Preview this voice';
               p.onclick=function(ev){ev.stopPropagation();preview(v,p);};
               r.appendChild(t);r.appendChild(p);
-              r.onclick=function(){localStorage.setItem('jvoice',v.id);var rows=L.querySelectorAll('.vrow');for(var i=0;i<rows.length;i++){rows[i].className='vrow';}r.className='vrow sel';toast('Agent voice set to '+v.name+', Boss.',1);};
+              r.onclick=function(){localStorage.setItem('jvoice',v.id);savePrefs({voice:v.id});var rows=L.querySelectorAll('.vrow');for(var i=0;i<rows.length;i++){rows[i].className='vrow';}r.className='vrow sel';toast('Agent voice set to '+v.name+', Boss.',1);};
               L.appendChild(r);
             });
           }
@@ -1763,6 +1645,9 @@ jobs:
             .then(function(b){if(pvBtn!==btn){return;}pvA=new Audio(URL.createObjectURL(b));btn.innerHTML='&#9632;';pvA.onended=function(){stopPreview();};pvA.play().catch(function(){stopPreview();toast('Preview blocked by the browser — tap once more.');});})
             .catch(function(){stopPreview();toast('Preview failed — Edge TTS unreachable right now.');});
           }
+          el('lang').addEventListener('change',function(){savePrefs({lang:el('lang').value});});
+          el('voice').addEventListener('change',function(){savePrefs({speak:el('voice').checked});});
+          el('auto').addEventListener('change',function(){savePrefs({autoEar:el('auto').checked});});
           el('vmb').onclick=function(){buildVoices();el('vmask').className='show';};
           el('vclose').onclick=function(){stopPreview();el('vmask').className='';};
           el('vmask').addEventListener('click',function(e){if(e.target===el('vmask')){stopPreview();el('vmask').className='';}});
@@ -1807,20 +1692,35 @@ jobs:
             var chunks=[];recSpoke=false;
             try{mrec=new MediaRecorder(stream);}catch(e){toast('Audio recording not supported in this browser.');return;}
             mrec.ondataavailable=function(e){chunks.push(e.data);};
-            mrec.onstop=function(){stopVad();var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});if(recSpoke&&b.size>2000){sendSTT(b);}else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,400);}}};
+            mrec.onstop=function(){stopVad();el('live').textContent='';var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});
+              /* send when voice was detected OR the clip is big enough that the meter
+                 may simply have missed it — let Whisper decide, never discard words */
+              if((recSpoke&&b.size>2000)||b.size>12000){sendSTT(b);}
+              else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,150);}}};
             mrec.start();listening=true;el('mic').classList.add('on');setState('listen','LISTENING — SPEAK');
             t0=Date.now();
             try{
               actx=new (window.AudioContext||window.webkitAudioContext)();
+              if(actx.state==='suspended'){actx.resume();}
               var src=actx.createMediaStreamSource(stream),an=actx.createAnalyser();an.fftSize=512;src.connect(an);
-              var data=new Uint8Array(an.fftSize),quiet=0;
+              var data=new Uint8Array(an.fftSize),quiet=0,nf=0,ticks=0,flat=0;
               vadT=setInterval(function(){
                 an.getByteTimeDomainData(data);
                 var m=0;for(var i=0;i<data.length;i++){var v=Math.abs(data[i]-128);if(v>m){m=v;}}
-                if(m>10){recSpoke=true;quiet=0;}else if(recSpoke){quiet+=100;}
-                if((recSpoke&&quiet>=1400)||Date.now()-t0>25000){stopListen(false);}
+                ticks++;
+                if(ticks<=4){nf=Math.max(nf,m);return;} /* first 400ms: learn the room's noise floor */
+                if(m===0){flat+=100;}else{flat=0;}
+                if(flat>=2000){ /* analyser returns silence (privacy shields) -> timed mode */
+                  clearInterval(vadT);vadT=null;recSpoke=true;
+                  el('live').textContent='● voice meter blocked by browser shields — recording 15s then sending';
+                  setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},Math.max(300,15000-(Date.now()-t0)));
+                  return;}
+                var th=Math.max(6,Math.min(20,nf*1.8+3)); /* adaptive: just above the noise floor */
+                if(m>th){if(!recSpoke||quiet>=1200){el('live').textContent='● hearing you — pause when done and I will send';}recSpoke=true;quiet=0;}
+                else if(recSpoke){quiet+=100;if(quiet===1200){el('live').textContent='● finishing… keep talking to add more';}}
+                if((recSpoke&&quiet>=2200)||Date.now()-t0>60000){stopListen(false);}
               },100);
-            }catch(e){recSpoke=true;}
+            }catch(e){recSpoke=true;setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},15000);}
           }
           function stopListen(user){
             clearTimeout(srT);
@@ -1828,7 +1728,7 @@ jobs:
             if(mrec&&mrec.state==='recording'){if(user){recSpoke=true;}micOff();mrec.stop();return;}
             if(user){setState('idle','STANDBY');}
           }
-          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else{toast(j.error||'Transcription failed');setState('idle','STANDBY');}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
+          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else if(j.error){toast(j.error);setState('idle','STANDBY');}else{toast('I heard audio but no clear words — speak a little closer, Boss.',1);setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,500);}}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
 
           /* ---------- barge-in: speak to interrupt agent voice ---------- */
           function stopBarge(){if(bargeT){clearInterval(bargeT);bargeT=null;}}
@@ -1859,32 +1759,124 @@ jobs:
           function pbIcon(){el('pbPause').innerHTML=paused?'&#9654;':'&#10074;&#10074;';}
           function after(){busy=false;paused=false;stopBarge();setState('idle','STANDBY');
             if(el('auto').checked){if(SR&&!SRbroken&&stream){startSR();}else if(srvSTT&&stream){startRec();}else if(!stream){setState('idle','TAP MIC TO TALK');}}}
-          function browserSpeak(t){var msg=clean(t).slice(0,600);curU=new SpeechSynthesisUtterance(msg);curU.lang=el('lang').value;var vs=speechSynthesis.getVoices();for(var i=0;i<vs.length;i++){if(vs[i].lang.indexOf(curU.lang.split('-')[0])===0){curU.voice=vs[i];break;}}
+          function scriptLang(t){if(/[\u0980-\u09FF]/.test(t)){return 'bn';}if(/[\u0900-\u097F]/.test(t)){return 'hi';}return 'en';}
+          function voiceFor(t){var sl=scriptLang(t),v=curVoice();if(v.indexOf('st:')===0){if(sl!=='bn'){return v;}return VDEF['bn-BD']||'bn-BD-PradeepNeural';}if(v.indexOf(sl)===0){return v;}if(sl==='bn'){return VDEF['bn-BD']||'bn-BD-PradeepNeural';}if(sl==='hi'){return VDEF['hi-IN']||'hi-IN-MadhurNeural';}return v;}
+          function browserSpeak(t){var msg=clean(t).slice(0,600);curU=new SpeechSynthesisUtterance(msg);var sl=scriptLang(msg);curU.lang=sl==='bn'?'bn-BD':(sl==='hi'?'hi-IN':el('lang').value);var vs=speechSynthesis.getVoices();for(var i=0;i<vs.length;i++){if(vs[i].lang.indexOf(curU.lang.split('-')[0])===0){curU.voice=vs[i];break;}}
             setState('speak','SPEAKING');pbShow(true);paused=false;pbIcon();el('pbFill').style.width='100%';startBarge();
             var done=false;function fin(){if(!done){done=true;pbShow(false);after();}}
             curU.onend=fin;curU.onerror=fin;setTimeout(fin,4000+msg.length*90);
             speechSynthesis.cancel();speechSynthesis.speak(curU);}
-          function playUrl(url){
-            if(curA){try{curA.pause();}catch(e){}}
+          function playUrl(url,onDone){
+            if(curA){try{curA.pause();curA.onended=null;curA.onerror=null;}catch(e){}}
             curA=new Audio(url);paused=false;pbIcon();pbShow(true);setState('speak','SPEAKING');startBarge();
-            curA.ontimeupdate=function(){if(curA&&curA.duration){el('pbFill').style.width=Math.round(curA.currentTime/curA.duration*100)+'%';}};
-            curA.onended=function(){pbShow(false);after();};
-            curA.onerror=function(){pbShow(false);browserSpeak(lastReply);};
-            curA.play().catch(function(){pbShow(false);browserSpeak(lastReply);});
+            curA.ontimeupdate=function(){
+              if(!curA||!curA.duration){return;}
+              // progress spans the whole reply, not just the current chunk
+              var n=Q.length||1,frac=(QI+(curA.currentTime/curA.duration))/n;
+              el('pbFill').style.width=Math.round(Math.min(1,frac)*100)+'%';
+            };
+            curA.onended=function(){curA=null;if(onDone){onDone();}else{pbShow(false);after();}};
+            curA.onerror=function(){curA=null;if(onDone){onDone();}else{pbShow(false);browserSpeak(lastReply);}};
+            curA.play().catch(function(){curA=null;if(onDone){onDone();}else{pbShow(false);browserSpeak(lastReply);}});
+          }
+          function browserSpeakOne(t,onDone){
+            if(!window.speechSynthesis){if(onDone){onDone();}return;}
+            try{
+              var u=new SpeechSynthesisUtterance(t);
+              u.lang=scriptLang(t);u.rate=1.02;
+              u.onend=function(){if(onDone){onDone();}};
+              u.onerror=function(){if(onDone){onDone();}};
+              startBarge();speechSynthesis.speak(u);
+            }catch(e){if(onDone){onDone();}}
+          }
+          function sentSplit(t,marks){
+            var out=[],cur='';
+            for(var i=0;i<t.length;i++){
+              var c=t.charAt(i);cur+=c;
+              if(marks.indexOf(c)>-1&&(i+1>=t.length||t.charAt(i+1)===' ')){
+                var v=cur.replace(/^\s+|\s+$/g,'');if(v){out.push(v);}cur='';
+              }
+            }
+            var last=cur.replace(/^\s+|\s+$/g,'');if(last){out.push(last);}
+            return out.length?out:[t];
+          }
+          function chunkText(t){
+            // First chunk stays tiny so audio starts almost instantly; later chunks grow.
+            // no lookbehind: older iOS Safari throws on it and would kill all voice output
+            var flat=String(t).replace(/\s+/g,' ').trim();
+            var parts=sentSplit(flat,'.!?।…');
+            if(parts.length===1){parts=sentSplit(flat,',;:');}
+            var out=[],cur='',lim=110;
+            for(var i=0;i<parts.length;i++){
+              var p=parts[i];
+              if(p.length>320){ // hard-wrap very long sentences on word bounds
+                var w=p.split(' '),b='';
+                for(var j=0;j<w.length;j++){
+                  if((b+' '+w[j]).length>320){out.push(b);b=w[j];}else{b=b?b+' '+w[j]:w[j];}
+                }
+                if(b){parts[i]=b;p=b;}
+              }
+              if(!cur){cur=p;}else if((cur+' '+p).length<=lim){cur=cur+' '+p;}else{out.push(cur);cur=p;lim=320;}
+              if(out.length===0&&cur.length>=lim){out.push(cur);cur='';lim=320;}
+            }
+            if(cur){out.push(cur);}
+            return out.length?out:[String(t)];
+          }
+          function ttsChunk(txt,seq){
+            var ctl=('AbortController' in window)?new AbortController():null;
+            var tto=ctl?setTimeout(function(){ctl.abort();},20000):null;
+            return fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:txt.slice(0,1200),voice:voiceFor(txt)}),signal:ctl?ctl.signal:undefined})
+            .then(function(r){
+              if(tto){clearTimeout(tto);}
+              if(r.status===401){authFail();throw new Error('auth');}
+              if(!r.ok){throw new Error('tts');}
+              var note=r.headers.get('X-TTS-Note');
+              if(note&&note!==lastNote){lastNote=note;toast(note,1);}
+              return r.blob();
+            }).then(function(b){
+              if(seq!==QSEQ){return null;}
+              return URL.createObjectURL(b);
+            });
+          }
+          function prefetch(i,seq){
+            if(i>=Q.length||seq!==QSEQ){return;}
+            if(QURL[i]!==undefined){return;}
+            QURL[i]=null;
+            ttsChunk(Q[i],seq).then(function(u){
+              if(seq!==QSEQ){if(u){try{URL.revokeObjectURL(u);}catch(e){}}return;}
+              QURL[i]=u||false;
+              if(i===QI&&!curA){playChunk(i,seq);}
+            }).catch(function(){if(seq===QSEQ){QURL[i]=false;if(i===QI&&!curA){playChunk(i,seq);}}});
+          }
+          function playChunk(i,seq){
+            if(seq!==QSEQ){return;}
+            if(i>=Q.length){QDONE=true;pbShow(false);after();return;}
+            QI=i;
+            prefetch(i+1,seq); // synthesize the NEXT chunk while this one plays
+            var u=QURL[i];
+            if(u===undefined||u===null){setTimeout(function(){playChunk(i,seq);},120);return;}
+            if(u===false){ // this chunk failed - speak it with the browser voice, keep going
+              browserSpeakOne(Q[i],function(){playChunk(i+1,seq);});
+              return;
+            }
+            playUrl(u,function(){playChunk(i+1,seq);});
           }
           function speak(t){
             lastReply=t;
             if(!el('voice').checked){after();return;}
-            if(elTTS){setState('speak','SPEAKING');
-              var ctl=('AbortController' in window)?new AbortController():null;
-              var tto=ctl?setTimeout(function(){ctl.abort();},12000):null;
-              fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:clean(t).slice(0,1200),voice:curVoice()}),signal:ctl?ctl.signal:undefined})
-              .then(function(r){if(!r.ok){throw new Error('tts');}return r.blob();})
-              .then(function(b){if(tto){clearTimeout(tto);}if(lastAudioURL){try{URL.revokeObjectURL(lastAudioURL);}catch(e){}}lastAudioURL=URL.createObjectURL(b);playUrl(lastAudioURL);})
-              .catch(function(){if(tto){clearTimeout(tto);}browserSpeak(t);});
+            var txt=clean(t);
+            if(!txt){after();return;}
+            QSEQ++;var seq=QSEQ;
+            Q=chunkText(txt);QI=0;QURL=[];QDONE=false;
+            if(elTTS){
+              setState('speak','SPEAKING');
+              prefetch(0,seq);
+              prefetch(1,seq); // first two in parallel: audio starts as soon as chunk 1 lands
+              playChunk(0,seq);
             }else{browserSpeak(t);}
           }
           function stopVoice(){
+            QSEQ++;Q=[];QURL=[];QI=0;
             stopBarge();
             if(curA){try{curA.pause();curA.onended=null;}catch(e){}}
             if(window.speechSynthesis){try{speechSynthesis.cancel();}catch(e){}}
@@ -1898,7 +1890,7 @@ jobs:
           el('pbReplay').onclick=function(){
             if(!lastReply&&!lastAudioURL){toast('Nothing to replay yet, Boss.');return;}
             stopVoice();
-            if(lastAudioURL){playUrl(lastAudioURL);}else if(lastReply){browserSpeak(lastReply);}
+            if(lastReply){speak(lastReply);}else if(lastAudioURL){playUrl(lastAudioURL);}
           };
           el('pbStop').onclick=function(){stopVoice();after();};
 
@@ -1914,7 +1906,8 @@ jobs:
 
           /* ---------- jobs ---------- */
           function stopThink(){if(thinkT){clearInterval(thinkT);thinkT=null;}}
-          function poll(id){fetch('/poll?id='+id,{headers:{'X-Token':tok}}).then(function(r){return r.json();}).then(function(j){if(j.done){stopThink();curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply);speak(j.reply);}else{setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
+          function poll(id){fetch('/poll?id='+id+'&since='+encodeURIComponent(pushSince),{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){authFail();return null;}return r.json();}).then(function(j){if(!j){return;}drainPushed(j);if(j.done){stopThink();curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply,null,j.files);if(j.files&&j.files.length){toast(j.files.length+' file'+(j.files.length>1?'s':'')+' delivered, Boss.',1);}speak(j.reply);}else{setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
+          function authFail(){busy=false;stopThink();setState('idle','STANDBY');lockOut('Session token no longer valid \u2014 enter your PANEL_TOKEN secret again');}
           function send(text){
             if(!text&&!files.length){return;}
             if(busy){toast('Previous task still running, Boss.');return;}
@@ -1926,7 +1919,7 @@ jobs:
             thinkStart=Date.now();setState('think','PROCESSING');stopThink();
             thinkT=setInterval(function(){var s=Math.floor((Date.now()-thinkStart)/1000);var mm=String(Math.floor(s/60)).padStart(2,'0');var ss=String(s%60).padStart(2,'0');el('stateTxt').textContent='PROCESSING · '+mm+':'+ss;},1000);
             var h=hist.slice(-8);hist.push({role:'user',content:text||'(files attached)'});
-            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text,files:paths,history:h})}).then(function(r){return r.json();}).then(function(j){if(j.job){curJob=j.job;poll(j.job);}else{busy=false;stopThink();addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;stopThink();addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
+            fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text,files:paths,history:h})}).then(function(r){if(r.status===401){authFail();return null;}return r.json();}).then(function(j){if(!j){return;}if(j.job){curJob=j.job;poll(j.job);}else{busy=false;stopThink();addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;stopThink();addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
           }
 
           /* ---------- file input ---------- */
@@ -1977,7 +1970,7 @@ jobs:
           cat > /tmp/jarvis/app.py <<'PYJARVIS'
           import asyncio, os, re, signal, subprocess, threading, time, uuid
           import requests as rq
-          from flask import Flask, request, jsonify, Response
+          from flask import Flask, request, jsonify, Response, send_file
           from werkzeug.utils import secure_filename
 
           TOKEN = os.environ.get("PANEL_TOKEN", "hermes99")
@@ -2019,10 +2012,274 @@ jobs:
           ]
           VOICE_IDS = set(v["id"] for v in VOICES)
           DEFAULT_VOICES = {"en-US": "en-US-GuyNeural", "bn-BD": "bn-BD-PradeepNeural", "hi-IN": "hi-IN-MadhurNeural"}
+
+          # ---- Supertonic 3: free on-device neural TTS (ONNX, CPU). No API, no limits.
+          # Loads in the background; until ready, /tts transparently uses Edge instead.
+          SUPER = {"ready": False, "tts": None, "styles": {}, "voices": [], "status": "off", "err": ""}
+          ST_LOCK = threading.Lock()
+
+          def _slog(m):
+              try:
+                  with open("/tmp/supertonic.log", "a") as f:
+                      f.write("%s %s\n" % (time.strftime("%H:%M:%S"), m))
+              except Exception:
+                  pass
+
+          def _super_init():
+              # Tolerant loader: the SDK surface can differ between versions, so every
+              # step tries several shapes and logs what happened to /tmp/supertonic.log.
+              try:
+                  from supertonic import TTS as _ST
+              except Exception as e:
+                  SUPER["status"] = "missing"
+                  SUPER["err"] = "supertonic package not installed (%s)" % e
+                  _slog("import failed: %s" % e)
+                  return
+              SUPER["status"] = "loading"
+              for attempt in range(3):
+                  t = None
+                  for kw in ({"auto_download": True}, {}):
+                      try:
+                          t = _ST(**kw)
+                          _slog("constructed with %s" % (kw or "no args"))
+                          break
+                      except Exception as e:
+                          _slog("ctor %s failed: %s" % (kw, e))
+                  if t is None:
+                      time.sleep(10)
+                      continue
+                  names = []
+                  for attr in ("list_voice_styles", "list_voices", "voice_names", "voices", "styles"):
+                      try:
+                          v = getattr(t, attr)
+                          names = [str(x) for x in (v() if callable(v) else v)]
+                          if names:
+                              _slog("voices via %s: %s" % (attr, names[:12]))
+                              break
+                      except Exception:
+                          pass
+                  if not names:
+                      names = ["M1", "M2", "M3", "M4", "F1", "F2", "F3", "F4"]
+                      _slog("falling back to preset names")
+                  got = {}
+                  for n in names[:12]:
+                      for call in (lambda n=n: t.get_voice_style(voice_name=n),
+                                   lambda n=n: t.get_voice_style(n)):
+                          try:
+                              got["st:" + n] = call()
+                              break
+                          except Exception as e:
+                              last = e
+                  if not got:
+                      _slog("no voice styles loaded; retrying")
+                      time.sleep(10)
+                      continue
+                  # prove synthesis actually works before advertising the engine
+                  probe_key = sorted(got)[0]
+                  try:
+                      wav, _d = t.synthesize("Systems online.", voice_style=got[probe_key], lang="en")
+                      if wav is None:
+                          raise RuntimeError("empty audio")
+                  except Exception as e:
+                      SUPER["err"] = "synthesis test failed: %s" % e
+                      _slog("probe failed: %s" % e)
+                      time.sleep(10)
+                      continue
+                  SUPER["tts"] = t
+                  SUPER["styles"] = got
+                  SUPER["voices"] = []
+                  for k in sorted(got):
+                      nm = k[3:]
+                      sex = "Female" if nm.upper().startswith("F") else "Male"
+                      SUPER["voices"].append({"id": k, "name": "Supertonic " + nm,
+                          "meta": sex + " \u00b7 on-device \u00b7 EN/HI",
+                          "group": "SUPERTONIC 3 \u00b7 ON-DEVICE", "sample": S_EN})
+                  SUPER["ready"] = True
+                  SUPER["status"] = "ready"
+                  SUPER["err"] = ""
+                  _slog("READY with %d voices" % len(got))
+                  return
+              SUPER["status"] = "error"
+              if not SUPER.get("err"):
+                  SUPER["err"] = "model could not be loaded after 3 attempts"
+              _slog("giving up: %s" % SUPER["err"])
+
+          def wait_super(seconds):
+              # Don't dump the user back to Edge just because the model is still warming
+              # up - give it a chance to finish loading first.
+              end = time.time() + seconds
+              while time.time() < end:
+                  if SUPER["ready"]:
+                      return True
+                  if SUPER["status"] in ("error", "missing", "off"):
+                      return False
+                  time.sleep(0.5)
+              return SUPER["ready"]
+
+          threading.Thread(target=_super_init, daemon=True).start()
+
+          def script_lang_srv(t):
+              for ch in t:
+                  if "\u0980" <= ch <= "\u09ff":
+                      return "bn"
+                  if "\u0900" <= ch <= "\u097f":
+                      return "hi"
+              return "en"
+
+          def supertonic_speak(text, voice, lang):
+              try:
+                  with ST_LOCK:
+                      wav, _dur = SUPER["tts"].synthesize(text[:1500],
+                          voice_style=SUPER["styles"][voice], lang=lang)
+                  p = "/tmp/st_%s.wav" % uuid.uuid4().hex
+                  SUPER["tts"].save_audio(wav, p)
+                  with open(p, "rb") as f:
+                      b = f.read()
+                  os.remove(p)
+                  return b
+              except Exception:
+                  return None
           UPLOAD_DIR = os.path.expanduser("~/.hermes/work/uploads")
+          # Anything the agent drops here is delivered straight into the chat.
+          OUT_DIR = os.path.expanduser("~/.hermes/work/outputs")
+          FILES = {}          # short id -> absolute path (download registry)
+          FILE_LOCK = threading.Lock()
+
+          IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+          VID_EXT = (".mp4", ".webm", ".mov", ".mkv", ".avi")
+          AUD_EXT = (".mp3", ".wav", ".ogg", ".oga", ".m4a", ".opus")
+          DOC_EXT = (".pdf", ".txt", ".md", ".csv", ".json", ".log", ".html", ".xml",
+                     ".yml", ".yaml", ".zip", ".tar", ".gz", ".xlsx", ".docx", ".pptx", ".py")
+          OK_EXT = IMG_EXT + VID_EXT + AUD_EXT + DOC_EXT
+
+          # Only files under these roots can ever be served.
+          SAFE_ROOTS = [os.path.realpath(os.path.expanduser(x)) for x in (
+              "~/.hermes/work", "~/Desktop", "~/Pictures", "~/Videos", "~/Downloads",
+              "~/screenshots", "/tmp",
+          )]
+
+          MIMES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                   ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+                   ".bmp": "image/bmp", ".mp4": "video/mp4", ".webm": "video/webm",
+                   ".mov": "video/quicktime", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+                   ".ogg": "audio/ogg", ".oga": "audio/ogg", ".m4a": "audio/mp4",
+                   ".opus": "audio/ogg", ".pdf": "application/pdf"}
+
+
+          def kind_of(path):
+              e = os.path.splitext(path)[1].lower()
+              if e in IMG_EXT:
+                  return "image"
+              if e in VID_EXT:
+                  return "video"
+              if e in AUD_EXT:
+                  return "audio"
+              return "file"
+
+
+          def safe_path(path):
+              """True only for real files inside SAFE_ROOTS (blocks ../ traversal)."""
+              try:
+                  rp = os.path.realpath(path)
+              except Exception:
+                  return None
+              if not os.path.isfile(rp):
+                  return None
+              for root in SAFE_ROOTS:
+                  if rp == root or rp.startswith(root + os.sep):
+                      return rp
+              return None
+
+
+          def register_file(path):
+              """Add a file to the download registry and return its chat descriptor."""
+              rp = safe_path(path)
+              if not rp:
+                  return None
+              try:
+                  size = os.path.getsize(rp)
+              except Exception:
+                  return None
+              if size <= 0 or size > 200 * 1024 * 1024:
+                  return None
+              fid = uuid.uuid4().hex[:12]
+              with FILE_LOCK:
+                  FILES[fid] = rp
+              return {"id": fid, "name": os.path.basename(rp), "size": size,
+                      "kind": kind_of(rp), "url": "/file?p=" + fid}
+
+
+          # Absolute-ish paths mentioned anywhere in the agent's reply text.
+          PATH_RE = re.compile(r"(?:(?<=\s)|^|[\"'`(\[])((?:~|/|\./)[^\s\"'`)\]<>,;]+\.[A-Za-z0-9]{1,5})")
+
+
+          def collect_files(reply, since):
+              """Find files the agent produced: any it named, plus anything new in OUT_DIR."""
+              out, seen = [], set()
+
+              def take(pth):
+                  rp = safe_path(pth)
+                  if not rp or rp in seen:
+                      return
+                  if os.path.splitext(rp)[1].lower() not in OK_EXT:
+                      return
+                  seen.add(rp)
+                  d = register_file(rp)
+                  if d:
+                      out.append(d)
+
+              for m in PATH_RE.findall(reply or ""):
+                  take(os.path.expanduser(m.rstrip(".,:;")))
+
+              # Sweep the outbox for files created/modified during this job.
+              try:
+                  for root, _dirs, names in os.walk(OUT_DIR):
+                      for n in names:
+                          fp = os.path.join(root, n)
+                          try:
+                              if os.path.getmtime(fp) >= since - 2:
+                                  take(fp)
+                          except Exception:
+                              pass
+              except Exception:
+                  pass
+              return out[:12]
+          # Lives inside ~/.hermes so it is backed up to the private repo and restored
+          # on the next run - this is what makes the voice choice stick.
+          PREFS_FILE = os.path.expanduser("~/.hermes/hud_prefs.json")
+          PREFS_KEYS = ("voice", "lang", "speak", "autoEar")
+
+          def load_prefs():
+              try:
+                  import json as _j
+                  with open(PREFS_FILE) as f:
+                      d = _j.load(f)
+                  return {k: v for k, v in d.items() if k in PREFS_KEYS}
+              except Exception:
+                  return {}
+
+          def save_prefs(new):
+              import json as _j
+              cur = load_prefs()
+              for k in PREFS_KEYS:
+                  if k in new:
+                      cur[k] = new[k]
+              try:
+                  os.makedirs(os.path.dirname(PREFS_FILE), exist_ok=True)
+                  tmp = PREFS_FILE + ".tmp"
+                  with open(tmp, "w") as f:
+                      _j.dump(cur, f)
+                  os.replace(tmp, PREFS_FILE)
+              except Exception:
+                  pass
+              return cur
+          TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          TG_CHAT = os.environ.get("TELEGRAM_USER_ID", "").strip()
+          SLACK_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
           app = Flask(__name__)
           app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024   # 200 MB uploads
           JOBS = {}
+          PUSHED = []   # files the agent pushed on its own via /share
           PROCS = {}
           ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
           HTML = open("/tmp/jarvis/index.html").read()
@@ -2063,18 +2320,22 @@ jobs:
               return None
 
           def do_stt(blob, mime, lang):
-              short = (lang or "en").split("-")[0]
+              short = (lang or "").split("-")[0]
               if GROQ:
                   try:
+                      data = {"model": "whisper-large-v3"}
+                      # Never force English: Whisper auto-detects the spoken language,
+                      # so Bangla / Hindi are recognized even when the selector says
+                      # ENGLISH. A non-English selector is passed as an accuracy hint.
+                      if short and short != "en":
+                          data["language"] = short
                       r = rq.post("https://api.groq.com/openai/v1/audio/transcriptions",
                                   headers={"Authorization": "Bearer " + GROQ},
                                   files={"file": ("audio.webm", blob, mime)},
-                                  data={"model": "whisper-large-v3", "language": short},
+                                  data=data,
                                   timeout=90)
                       if r.status_code == 200:
-                          t = (r.json().get("text") or "").strip()
-                          if t:
-                              return t
+                          return (r.json().get("text") or "").strip()
                   except Exception:
                       pass
               for k in el_keys():
@@ -2085,9 +2346,7 @@ jobs:
                                   data={"model_id": "scribe_v1"},
                                   timeout=90)
                       if r.status_code == 200:
-                          t = (r.json().get("text") or "").strip()
-                          if t:
-                              return t
+                          return (r.json().get("text") or "").strip()
                   except Exception:
                       pass
               return None
@@ -2178,7 +2437,13 @@ jobs:
               run_job(jid, text)
 
           def run_job(jid, text):
-              env = dict(os.environ, NO_COLOR="1", TERM="dumb", DISPLAY=":99")
+              started = time.time()
+              try:
+                  os.makedirs(OUT_DIR, exist_ok=True)
+              except Exception:
+                  pass
+              env = dict(os.environ, NO_COLOR="1", TERM="dumb", DISPLAY=":99",
+                         HERMES_OUTPUT_DIR=OUT_DIR)
               try:
                   p = subprocess.Popen(
                       ["hermes", "chat", "-q", text, "--source", "tool"],
@@ -2199,7 +2464,9 @@ jobs:
                   outc = ANSI.sub("", (out or "")).strip()
                   if not outc:
                       outc = ANSI.sub("", (err or "")).strip() or "(no output)"
-                  JOBS[jid] = {"done": True, "reply": extract_reply(outc)[-6000:]}
+                  rep = extract_reply(outc)[-6000:]
+                  JOBS[jid] = {"done": True, "reply": rep,
+                               "files": collect_files(rep, started)}
               except Exception as e:
                   JOBS[jid] = {"done": True, "reply": "Error: %s" % e}
               finally:
@@ -2214,7 +2481,15 @@ jobs:
               if request.headers.get("X-Token", "") != TOKEN:
                   return jsonify(error="bad token"), 401
               return jsonify(tts=EDGE, stt=bool(GROQ) or bool(el_keys()),
-                             voices=VOICES, defaults=DEFAULT_VOICES)
+                             voices=VOICES + SUPER["voices"], defaults=DEFAULT_VOICES,
+                             st=SUPER["status"], sterr=SUPER.get("err", ""),
+                             prefs=load_prefs())
+
+          @app.route("/prefs", methods=["POST"])
+          def prefs_route():
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              return jsonify(ok=True, prefs=save_prefs(request.get_json(silent=True) or {}))
 
           @app.route("/tts", methods=["POST"])
           def tts_route():
@@ -2224,10 +2499,166 @@ jobs:
               text = (data.get("text") or "").strip()
               if not text:
                   return jsonify(error="empty"), 400
-              audio = edge_speak(text, (data.get("voice") or "").strip())
+              voice = (data.get("voice") or "").strip()
+              why = ""
+              if voice.startswith("st:"):
+                  sl = script_lang_srv(text)
+                  if sl == "bn":
+                      why = "Supertonic 3 has no Bangla voice - using your Edge Bangla voice"
+                  else:
+                      if not SUPER["ready"]:
+                          wait_super(25)          # warm-up, not a real failure
+                      if SUPER["ready"] and voice in SUPER["styles"]:
+                          audio = supertonic_speak(text, voice, sl)
+                          if audio:
+                              r = Response(audio, mimetype="audio/wav")
+                              r.headers["X-TTS-Engine"] = "supertonic"
+                              return r
+                          why = "Supertonic could not synthesize that line - used Edge instead"
+                      elif SUPER["status"] == "loading":
+                          why = "Supertonic is still loading - using Edge for now"
+                      else:
+                          why = "Supertonic unavailable (%s) - using Edge" % (SUPER.get("err") or SUPER["status"])
+                  voice = (DEFAULT_VOICES["bn-BD"] if sl == "bn"
+                           else DEFAULT_VOICES["hi-IN"] if sl == "hi"
+                           else DEFAULT_VOICES["en-US"])
+              audio = edge_speak(text, voice)
               if audio:
-                  return Response(audio, mimetype="audio/mpeg")
+                  r = Response(audio, mimetype="audio/mpeg")
+                  r.headers["X-TTS-Engine"] = "edge"
+                  if why:
+                      r.headers["X-TTS-Note"] = why
+                  return r
               return jsonify(error="tts unavailable"), 503
+
+          def synth_best(text):
+              """Supertonic first (free + on-device), Edge as the safety net.
+              Returns (audio_bytes, extension, engine_name)."""
+              sl = script_lang_srv(text)
+              if sl != "bn":
+                  if not SUPER["ready"]:
+                      wait_super(30)
+                  if SUPER["ready"]:
+                      key = next((k for k in sorted(SUPER["styles"])), None)
+                      if key:
+                          a = supertonic_speak(text, key, sl)
+                          if a:
+                              return a, "wav", "supertonic"
+              v = (DEFAULT_VOICES["bn-BD"] if sl == "bn"
+                   else DEFAULT_VOICES["hi-IN"] if sl == "hi"
+                   else DEFAULT_VOICES["en-US"])
+              a = edge_speak(text, v)
+              if a:
+                  return a, "mp3", "edge"
+              return None, None, None
+
+          @app.route("/voicereply", methods=["POST"])
+          def voicereply():
+              """Speak a reply back into Telegram or Slack.
+              The agent calls this after answering a VOICE message.
+              Body: {"text": "...", "chat_id": "optional", "channel": "optional"}"""
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              d = request.get_json(silent=True) or {}
+              text = (d.get("text") or "").strip()
+              if not text:
+                  return jsonify(error="empty"), 400
+              audio, ext, engine = synth_best(text[:1500])
+              if not audio:
+                  return jsonify(error="tts unavailable"), 503
+              path = "/tmp/vr_%s.%s" % (uuid.uuid4().hex, ext)
+              with open(path, "wb") as f:
+                  f.write(audio)
+              sent = []
+              chat = (d.get("chat_id") or TG_CHAT).strip()
+              if TG_TOKEN and chat:
+                  try:
+                      # Telegram voice notes want OGG/Opus; convert when ffmpeg exists,
+                      # otherwise fall back to sendAudio which accepts mp3/wav.
+                      ogg = path.rsplit(".", 1)[0] + ".ogg"
+                      conv = subprocess.run(["ffmpeg", "-y", "-i", path, "-c:a", "libopus",
+                                             "-b:a", "32k", ogg],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      api = "https://api.telegram.org/bot" + TG_TOKEN
+                      if conv.returncode == 0 and os.path.exists(ogg):
+                          with open(ogg, "rb") as f:
+                              r = rq.post(api + "/sendVoice", data={"chat_id": chat},
+                                          files={"voice": ("reply.ogg", f, "audio/ogg")}, timeout=60)
+                          os.remove(ogg)
+                      else:
+                          with open(path, "rb") as f:
+                              r = rq.post(api + "/sendAudio", data={"chat_id": chat},
+                                          files={"audio": ("reply." + ext, f)}, timeout=60)
+                      sent.append("telegram" if r.status_code == 200 else "telegram_failed")
+                  except Exception as e:
+                      sent.append("telegram_error:%s" % e)
+              ch = (d.get("channel") or "").strip()
+              if SLACK_TOKEN and ch:
+                  try:
+                      with open(path, "rb") as f:
+                          r = rq.post("https://slack.com/api/files.upload",
+                                      headers={"Authorization": "Bearer " + SLACK_TOKEN},
+                                      data={"channels": ch, "filename": "reply." + ext,
+                                            "title": "Voice reply"},
+                                      files={"file": ("reply." + ext, f)}, timeout=60)
+                      ok = r.status_code == 200 and (r.json() or {}).get("ok")
+                      sent.append("slack" if ok else "slack_failed")
+                  except Exception as e:
+                      sent.append("slack_error:%s" % e)
+              try:
+                  os.remove(path)
+              except Exception:
+                  pass
+              if not sent:
+                  return jsonify(error="no destination: pass chat_id or channel"), 400
+              return jsonify(ok=True, engine=engine, sent=sent)
+
+          @app.route("/file")
+          def file_route():
+              # <img>/<video> tags cannot send headers, so a query token is allowed here.
+              t = request.headers.get("X-Token", "") or request.args.get("t", "")
+              if t != TOKEN:
+                  return jsonify(error="bad token"), 401
+              fid = request.args.get("p", "")
+              with FILE_LOCK:
+                  path = FILES.get(fid)
+              if not path or not safe_path(path):
+                  return jsonify(error="unknown or expired file"), 404
+              ext = os.path.splitext(path)[1].lower()
+              dl = request.args.get("dl") == "1"
+              try:
+                  return send_file(path, mimetype=MIMES.get(ext),
+                                   as_attachment=dl,
+                                   download_name=os.path.basename(path),
+                                   conditional=True)
+              except TypeError:
+                  # older Flask: attachment_filename instead of download_name
+                  return send_file(path, mimetype=MIMES.get(ext), as_attachment=dl,
+                                   attachment_filename=os.path.basename(path))
+              except Exception as e:
+                  return jsonify(error=str(e)), 500
+
+
+          @app.route("/share", methods=["POST"])
+          def share_route():
+              """Agent-facing: push a file straight into the chat, no waiting for a reply."""
+              if request.headers.get("X-Token", "") != TOKEN:
+                  return jsonify(error="bad token"), 401
+              data = request.get_json(silent=True) or {}
+              paths = data.get("paths") or ([data.get("path")] if data.get("path") else [])
+              got = []
+              for pth in paths:
+                  if isinstance(pth, str):
+                      d = register_file(os.path.expanduser(pth.strip()))
+                      if d:
+                          got.append(d)
+              if not got:
+                  return jsonify(error="no readable file at that path"), 400
+              PUSHED.append({"text": (data.get("text") or "").strip(), "files": got,
+                             "ts": time.time()})
+              del PUSHED[:-20]
+              return jsonify(ok=True, files=got)
+
 
           @app.route("/stt", methods=["POST"])
           def stt_route():
@@ -2238,9 +2669,9 @@ jobs:
                   return jsonify(error="no audio received"), 400
               text = do_stt(blob, request.headers.get("Content-Type", "audio/webm"),
                             request.args.get("lang", "en-US"))
-              if text:
-                  return jsonify(text=text)
-              return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+              if text is None:
+                  return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+              return jsonify(text=text)
 
           @app.route("/upload", methods=["POST"])
           def upload():
@@ -2315,11 +2746,21 @@ jobs:
               j = JOBS.get(request.args.get("id", ""))
               if not j:
                   return jsonify(error="unknown job"), 404
-              return jsonify(**j)
+              out = dict(j)
+              try:
+                  since = float(request.args.get("since", "0") or 0)
+              except Exception:
+                  since = 0
+              out["pushed"] = [x for x in PUSHED if x["ts"] > since]
+              out["now"] = time.time()
+              return jsonify(**out)
 
           app.run(host="0.0.0.0", port=7777, threaded=True)
           PYJARVIS
+          sudo apt-get install -y -q ffmpeg >/dev/null 2>&1 || true
           pip install -q flask requests edge-tts || true
+          # onnxruntime/soundfile are what Supertonic needs to run on CPU
+          pip install -q supertonic onnxruntime soundfile numpy > /tmp/supertonic_pip.log 2>&1 || echo '::warning::supertonic install failed - Edge TTS still works'
           nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
           sleep 2
           curl -fs http://localhost:7777/ >/dev/null || { echo '::warning::Agent HUD failed to start'; cat /tmp/jarvis.log; }
@@ -2337,19 +2778,84 @@ jobs:
 
 
 
+
+
+
+
+
+
+
+
+
+
       # ── 11. Background backup loop (every 30 min -> backup branch) ──
       - name: Start backup loop
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          # ── CRITICAL-ONLY FAST SAVE (survives cancel: finishes in seconds) ──
+          # Mirrors state out of the agent dir / XDG dirs, then pushes ONLY the
+          # small, irreplaceable stuff to the `hot` branch. No browser profiles,
+          # no caches, so it completes long before a cancel can kill it.
+          cat > /tmp/hotsave.sh <<'HOTEOF'
+          #!/bin/bash
+          mkdir -p "$HERMES_HOME/xdg-mirror/config" "$HERMES_HOME/xdg-mirror/share" "$HERMES_HOME/xdg-mirror/state" "$HERMES_HOME/agent-state"
+          for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
+          for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
+          for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
+          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+            [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
+          done
+          find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
+          rm -rf /tmp/hot && mkdir -p /tmp/hot
+          for d in agent-state xdg-mirror work skills brain brains memory memories tasks notes knowledge sessions prompts; do
+            [ -e "$HERMES_HOME/$d" ] && rsync -a --exclude='.git' --exclude='*.log' "$HERMES_HOME/$d" /tmp/hot/ || true
+          done
+          find "$HERMES_HOME" -maxdepth 1 -type f \( -name '*.json' -o -name '*.md' -o -name '*.txt' -o -name '*.yaml' -o -name '*.yml' -o -name '*.db' -o -name '*.sqlite*' \) ! -name '.env' -exec cp -a {} /tmp/hot/ \; 2>/dev/null || true
+          cd /tmp/hot || exit 0
+          find . -type f -size +90M | while read -r f; do
+            split -b 90M -d -a 3 "$f" "$f.gh-chunk."
+            rm -f "$f"
+          done
+          printf '.env\n*.log\n' > .gitignore
+          git init -q -b hot
+          git config user.email "bot@hermes" && git config user.name "hermes-bot"
+          git add -A && git commit -q -m "hot save $(date -u +%FT%TZ)" || true
+          timeout 90 git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" hot 2>/dev/null || true
+          echo "Hot save pushed at $(date)"
+          HOTEOF
+          chmod +x /tmp/hotsave.sh
+
           cat > /tmp/sync.sh <<'EOF'
           #!/bin/bash
+          # last-gasp save if this loop is signalled
+          trap '/tmp/hotsave.sh; exit 0' TERM INT HUP
+          n=0
           while true; do
-            sleep 1800
+            # hot save every 5 min; full save every 3rd cycle (15 min)
+            sleep 300 & wait $!
+            /tmp/hotsave.sh || true
+            n=$((n+1))
+            [ $((n % 3)) -eq 0 ] || continue
+            # ── STATE MIRROR: capture EVERYTHING Hermes stores outside the tree ──
+            # skills / brain / tasks / memory / config live in the (excluded)
+            # agent dir and in ~/.config, ~/.local — mirror them INTO ~/.hermes
+            # so every backup push carries them to the privatestorage repo.
+            mkdir -p "$HERMES_HOME/xdg-mirror/config" "$HERMES_HOME/xdg-mirror/share" "$HERMES_HOME/xdg-mirror/state" "$HERMES_HOME/agent-state"
+            for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
+            for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
+            for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+              [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
+            done
+            find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
             rm -rf /tmp/backup && mkdir -p /tmp/backup
             rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' \
               --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
               --exclude='browser-profile/shader-cache' \
+              --exclude='chrome-profile/Default/Cache' --exclude='chrome-profile/Default/Code Cache' \
+              --exclude='chrome-profile/Default/GPUCache' --exclude='chrome-profile/ShaderCache' \
+              --exclude='chrome-profile/GraphiteDawnCache' \
               "$HERMES_HOME/" /tmp/backup/
             cd /tmp/backup
             find . -type f -size +90M | while read -r f; do
@@ -2364,8 +2870,15 @@ jobs:
           done
           EOF
           chmod +x /tmp/sync.sh
+          # persist creds for the emergency step (runs in a fresh shell)
+          printf 'export HERMES_HOME=%s\nexport DATA_REPO=%s\nexport DATA_REPO_TOKEN=%s\n' \
+            "$HERMES_HOME" "$DATA_REPO" "$DATA_REPO_TOKEN" > /tmp/save.env
+          chmod 600 /tmp/save.env
+          export HERMES_HOME DATA_REPO DATA_REPO_TOKEN
+          setsid nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
+          # save immediately so state is protected from minute one
           HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" \
-            nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
+            /tmp/hotsave.sh || true
 
       # ── 12. Notify start on Telegram (includes panel links) ──
       - name: Notify start
@@ -2374,8 +2887,6 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
           # third quick tunnel: LIVE DESKTOP VIEW (noVNC on :6080, see step 4)
-          # Note: if the tunnel dies, the VNC watchdog (step 4) auto-restarts it.
-          # The URL will change on restart — check /tmp/liveview-tunnel.log for the new one.
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > /tmp/liveview-tunnel.log 2>&1 &
           LIVEVIEW_URL=""
           for i in $(seq 1 30); do
@@ -2399,7 +2910,7 @@ jobs:
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
         env:
-          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           # Shared virtual display :99 (browser + agent GUI + live view all
           # render here; normally started in step 4 — this is just a safety
@@ -2442,13 +2953,10 @@ jobs:
           PYSESS
 
           # watchdog: if the LiteLLM router hangs (rate-limit deadlock etc.),
-          # auto-restart it — no more force-stopping the whole Action run.
-          # Also monitors VNC services (x11vnc, websockify) for crashes.
+          # auto-restart it — no more force-stopping the whole Action run
           cat > /tmp/watchdog.sh <<'EOF'
           #!/bin/bash
           fails=0
-          export DISPLAY=:99
-          export PANEL_TOKEN="${PANEL_TOKEN:-hermes99}"
           while true; do
             sleep 60
             # ZOMBIE detection: LiteLLM's per-worker request counter can LEAK
@@ -2458,6 +2966,8 @@ jobs:
             # Restart immediately when that error shows up in recent logs.
             if docker logs litellm --since 90s 2>&1 | grep -q "Worker local total request limit reached"; then
               echo "$(date) Router counter leak detected — restarting litellm container"
+              # -t 2: kill fast. Default docker restart waits 10s for graceful
+              # stop; that downtime is what burns the gateway's quick retries.
               docker restart -t 2 litellm >/dev/null 2>&1 || true
               fails=0
               continue
@@ -2473,20 +2983,59 @@ jobs:
                 fails=0
               fi
             fi
-            # ── VNC health check: restart dead x11vnc / websockify ──
-            if ! pgrep -f "x11vnc.*:99" > /dev/null 2>&1; then
-              echo "$(date) watchdog: x11vnc dead — restarting"
-              x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
-                -passwd "$PANEL_TOKEN" -o /tmp/x11vnc.log
-            fi
-            if ! pgrep -f "websockify.*6080" > /dev/null 2>&1; then
-              echo "$(date) watchdog: websockify dead — restarting"
-              nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
-            fi
           done
           EOF
           chmod +x /tmp/watchdog.sh
           nohup /tmp/watchdog.sh > /tmp/watchdog.log 2>&1 &
+
+          # ── TELEGRAM POLLING SLOT RECLAIM ──
+          # When a previous run dies by SIGKILL / OOM / VM death, no exit path
+          # runs, so Telegram keeps that dead session's getUpdates slot open.
+          # Every new gateway then hits "Conflict: terminated by other
+          # getUpdates request" and gives up fatally. Issuing our OWN getUpdates
+          # call evicts the stale poller, so we claim the slot BEFORE starting.
+          TG_HOST="api.telegram.org"
+          tg_claim() {
+            if [ -z "${TELEGRAM_BOT_TOKEN}" ]; then
+              echo "No bot token in env - skipping Telegram slot reclaim"
+              return 0
+            fi
+            TG_API="https://${TG_HOST}/bot${TELEGRAM_BOT_TOKEN}"
+            # keep pending messages: anything sent while we were down still arrives
+            curl -s -m 20 "${TG_API}/deleteWebhook" -d "drop_pending_updates=false" >/dev/null 2>&1 || true
+            ok=0
+            i=0
+            while [ "$i" -lt 12 ]; do
+              i=$((i+1))
+              resp=$(curl -s -m 25 "${TG_API}/getUpdates?offset=-1&timeout=0" 2>/dev/null || echo "")
+              case "$resp" in
+                *'"ok":true'*)
+                  ok=$((ok+1))
+                  echo "  Telegram slot free (confirm $ok/2)"
+                  ;;
+                *Conflict*)
+                  ok=0
+                  echo "  Stale poller still holding the slot (attempt $i/12) - evicting"
+                  ;;
+                *)
+                  ok=0
+                  echo "  Telegram unreachable or error (attempt $i/12)"
+                  ;;
+              esac
+              if [ "$ok" -ge 2 ]; then
+                echo "Telegram polling slot reclaimed - safe to start gateway."
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::warning::Telegram slot still contested after 12 attempts - starting anyway"
+            return 0
+          }
+
+          # Kill any Hermes/gateway leftovers from an earlier attempt in THIS vm
+          # before we claim the slot, so we never fight ourselves.
+          pkill -f "hermes gateway" >/dev/null 2>&1 || true
+          sleep 2
 
           JOB_START=$(cat /tmp/job_start)
           END=$(( JOB_START + RUN_MINUTES * 60 ))
@@ -2499,26 +3048,68 @@ jobs:
             # keep "pool-auto" as default on every gateway (re)start — it
             # always reflects the CURRENT pool you applied from the panel
             hermes config set model.default "pool-auto" || true
+            tg_claim
             echo "Starting gateway (${REMAIN}m remaining)..."
             timeout -k 60 "${REMAIN}m" hermes gateway || true
             # 60s (not 10s): Telegram holds the previous gateway's getUpdates
             # session open for up to ~1 min after a crash. Restarting too fast
             # causes "Conflict: terminated by other getUpdates request" and a
             # fatal polling-conflict loop.
-            echo "Gateway exited, restarting in 60s..."
-            sleep 60
+            # tg_claim already frees the slot, so no need to idle a full
+            # minute; a short pause just avoids a hot crash-loop.
+            pkill -f "hermes gateway" >/dev/null 2>&1 || true
+            echo "Gateway exited, reclaiming Telegram slot and restarting in 15s..."
+            sleep 15
           done
+
+      # ── 13b. EMERGENCY SAVE ──
+      # Runs first on ANY exit - including "Cancel workflow". Small and fast
+      # (seconds), so skills / brain / tasks / memory reach the repo even when
+      # the runner is about to be killed and the big final push never finishes.
+      - name: Emergency state save
+        if: always()
+        timeout-minutes: 4
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          [ -f /tmp/save.env ] && . /tmp/save.env || true
+          export HERMES_HOME="${HERMES_HOME:-/home/runner/.hermes}"
+          export DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN"
+          if [ -x /tmp/hotsave.sh ]; then
+            /tmp/hotsave.sh || echo "::warning::hot save failed"
+          else
+            echo "::warning::hotsave.sh missing - nothing to save yet"
+          fi
 
       # ── 14. Final push to data repo (main) ──
       - name: Final data push
         if: always()
+        timeout-minutes: 12
         env:
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
+          # ── STATE MIRROR: capture EVERYTHING Hermes stores outside the tree ──
+          # skills / brain / tasks / memory / config live in the (excluded)
+          # agent dir and in ~/.config, ~/.local — mirror them INTO ~/.hermes
+          # so every backup push carries them to the privatestorage repo.
+          mkdir -p "$HERMES_HOME/xdg-mirror/config" "$HERMES_HOME/xdg-mirror/share" "$HERMES_HOME/xdg-mirror/state" "$HERMES_HOME/agent-state"
+          for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
+          for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
+          for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
+          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+            [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
+          done
+          find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
+          # critical state first - if this step gets killed mid-way, the
+          # important files are already safely on the `hot` branch
+          [ -x /tmp/hotsave.sh ] && /tmp/hotsave.sh || true
           rm -rf /tmp/final && mkdir -p /tmp/final
           rsync -a --exclude='.env' --exclude='.git' --exclude='*.log' --exclude='hermes-agent' \
             --exclude='browser-profile/cache2' --exclude='browser-profile/startupCache' \
             --exclude='browser-profile/shader-cache' \
+            --exclude='chrome-profile/Default/Cache' --exclude='chrome-profile/Default/Code Cache' \
+            --exclude='chrome-profile/Default/GPUCache' --exclude='chrome-profile/ShaderCache' \
+            --exclude='chrome-profile/GraphiteDawnCache' \
             "$HERMES_HOME/" /tmp/final/ || true
           cd /tmp/final
           find . -type f -size +90M | while read -r f; do
