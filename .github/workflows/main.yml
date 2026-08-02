@@ -893,7 +893,10 @@ jobs:
 
           # start control panel FIRST (inherits this step's env)
           nohup python3 /tmp/panel/app.py > /tmp/panel.log 2>&1 &
-          sleep 3
+          for i in $(seq 1 15); do
+            curl -fs http://localhost:7000/ >/dev/null && break
+            sleep 2
+          done
           # verify panel is up (login page must load)
           curl -fs http://localhost:7000/ >/dev/null || { cat /tmp/panel.log; exit 1; }
 
