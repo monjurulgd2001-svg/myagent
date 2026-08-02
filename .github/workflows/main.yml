@@ -218,7 +218,9 @@ jobs:
           else
             echo "::warning::No Chromium-family browser found — built-in browser tools will be headless"
           fi
-          pip install -U "camoufox[geoip]" pyvirtualdisplay
+          pip install -U "camoufox[geoip]" pyvirtualdisplay playwright
+          # Install playwright browsers (for macro recording in noVNC)
+          python3 -m playwright install --with-deps chromium
           # fetch skips the ~200MB browser download when restored from cache
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
@@ -244,9 +246,9 @@ jobs:
           # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
           # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
           # port 6080 (tunnel + link are added in the Notify start step).
-          # View-only + password so nobody can hijack the desktop. NOTE: VNC
+          # Password protected so nobody can hijack the desktop. NOTE: VNC
           # passwords only use the FIRST 8 characters of PANEL_TOKEN.
-          x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
+          x11vnc -display :99 -forever -shared -bg -quiet \
             -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           echo "Live desktop view server running on :6080"
