@@ -118,23 +118,59 @@ jobs:
             done
           fi
           rm -rf "$HERMES_HOME/hermes-agent"
-          if [ -x "$HOME/.local/bin/hermes" ]; then
-            echo "Hermes restored from cache — skipping download/install"
+          # ~/.local/bin/hermes is only a SHIM that execs
+          # $HERMES_HOME/hermes-agent/venv/bin/python. The Actions cache
+          # restores the shim but NOT the venv (we wiped it just above),
+          # so "shim exists => skip install" left a launcher pointing at
+          # nothing: every hermes call died with "No such file or
+          # directory" and exit 127. Install whenever the venv is gone.
+          if [ -x "$HOME/.local/bin/hermes" ] && [ -x "$HERMES_HOME/hermes-agent/venv/bin/python" ]; then
+            echo "Hermes launcher + venv both present — skipping download/install"
           else
+            echo "Installing Hermes (venv missing after wipe / first run)..."
             curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           fi
+          # ── KEEP HERMES CURRENT: self-update on EVERY run ──
+          # Cache restores can be days old; update to the latest release
+          # before anything is configured. Time-boxed and non-fatal: a
+          # flaky network must never kill the run, and the sanity check
+          # below reinstalls cleanly if an update leaves things broken.
+          echo "Running hermes update..."
+          timeout 300 "$HOME/.local/bin/hermes" update \
+            || echo "::warning::hermes update failed or timed out - continuing with current version"
           # ── MERGE BACKED-UP USER STATE into the fresh agent dir ──
           # skills / brain / tasks / memory added in earlier sessions come back
           # from ~/.hermes/agent-state (pulled from the privatestorage repo).
           if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
             mkdir -p "$HERMES_HOME/hermes-agent"
-            rsync -a "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            rsync -a --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
             echo "Restored agent state: $(ls "$HERMES_HOME/agent-state" | tr '\n' ' ')"
           fi
           if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
             mkdir -p "$HERMES_HOME/hermes-agent"
-            rsync -a "$KEEP/" "$HERMES_HOME/hermes-agent/"
+            rsync -a --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
           fi
+          # ── SANITY CHECK: hermes must actually be runnable ──
+          # Catch a broken install HERE with a clear message (and one
+          # self-heal attempt) instead of exit 127 five steps later.
+          if [ ! -x "$HERMES_HOME/hermes-agent/venv/bin/python" ] || ! "$HOME/.local/bin/hermes" --help >/dev/null 2>&1; then
+            echo "Hermes launcher broken — forcing one clean reinstall"
+            rm -rf "$HERMES_HOME/hermes-agent"
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+            if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
+              mkdir -p "$HERMES_HOME/hermes-agent"
+              rsync -a --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            fi
+            if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+              mkdir -p "$HERMES_HOME/hermes-agent"
+              rsync -a --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+            fi
+          fi
+          if [ ! -x "$HERMES_HOME/hermes-agent/venv/bin/python" ] || ! "$HOME/.local/bin/hermes" --help >/dev/null 2>&1; then
+            echo "::error::Hermes install is broken (venv python missing or launcher fails). Failing fast so the chain does not spam failed runs."
+            exit 1
+          fi
+          echo "Hermes launcher verified OK"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # ── 3. Start SearXNG (free web search) ──
@@ -1077,10 +1113,6 @@ jobs:
           - VOICE: when the user asks you to speak / talk / send voice, use
             the text_to_speech tool and send the audio as your reply. Keep
             spoken replies shorter than written ones.
-          - If an ElevenLabs TTS call fails with a quota or rate-limit error,
-            run `bash /tmp/rotate_elevenlabs.sh` in the terminal and retry the
-            TTS call once. If it reports all keys exhausted, it switches TTS
-            to Edge automatically — just retry and continue.
           - PROACTIVITY: if you notice something the user should know while
             working (a better approach, a risk, a broken credential), mention
             it in one line — don't wait to be asked.
@@ -1089,8 +1121,6 @@ jobs:
 
       # ── 9. Configure Hermes (active model comes ONLY from YOUR pool) ──
       - name: Configure Hermes
-        env:
-          ELEVENLABS_KEYS: ${{ secrets.ELEVENLABS_KEYS }}
         run: |
           hermes config unset providers.nvidia.base_url || true
           hermes config unset providers.nvidia.api_key_env || true
@@ -1114,71 +1144,6 @@ jobs:
           pip install -q edge-tts || true
           hermes config set tts.provider edge
 
-          # ── ELEVENLABS REALISTIC VOICE (optional, BULK keys) ──
-          # Paste ElevenLabs API keys LINE BY LINE in the ELEVENLABS_KEYS
-          # secret (same style as NVIDIA_KEYS / MISTRAL_KEYS). Every key is
-          # probed for remaining character quota; the RICHEST key becomes
-          # active. No secret / no usable key => Edge TTS stays (free).
-          python3 - <<'ELSEL'
-          import os, json, urllib.request
-          keys = [k.strip() for k in os.environ.get("ELEVENLABS_KEYS", "").splitlines() if k.strip()]
-          ranked = []
-          for k in keys:
-              try:
-                  req = urllib.request.Request(
-                      "https://api.elevenlabs.io/v1/user/subscription",
-                      headers={"xi-api-key": k})
-                  d = json.load(urllib.request.urlopen(req, timeout=15))
-                  left = int(d.get("character_limit", 0)) - int(d.get("character_count", 0))
-                  ranked.append((left, k))
-                  print("ElevenLabs key ...%s: %d chars left" % (k[-4:], left))
-              except Exception as e:
-                  print("ElevenLabs key ...%s: DEAD (%s)" % (k[-4:], e))
-          ranked.sort(reverse=True)
-          home = os.path.expanduser("~/.hermes")
-          os.makedirs(home, exist_ok=True)
-          if ranked and ranked[0][0] > 0:
-              with open(os.path.join(home, ".env"), "a") as f:
-                  f.write("\nELEVENLABS_API_KEY=%s\n" % ranked[0][1])
-              with open("/tmp/el_keys.txt", "w") as f:
-                  f.write("\n".join(k for _, k in ranked) + "\n")
-              open("/tmp/el_ok", "w").write("yes")
-              print("ACTIVE: key ...%s (%d chars left)" % (ranked[0][1][-4:], ranked[0][0]))
-          else:
-              print("No usable ElevenLabs key - staying on Edge TTS")
-          ELSEL
-          if [ -f /tmp/el_ok ]; then
-            pip install -q "hermes-agent[tts-premium]" || true
-            hermes config set tts.provider elevenlabs
-            hermes config set tts.voice_id "pNInz6obpgDQGcFmaJgB"
-            hermes config set tts.model_id "eleven_multilingual_v2"
-            echo "TTS: ElevenLabs realistic voice ACTIVE"
-          else
-            echo "TTS: Edge (no ElevenLabs keys provided or none usable)"
-          fi
-
-          # rotation script — the agent runs this when the active ElevenLabs
-          # key hits its quota; picks the next key with the most chars left,
-          # or falls back to Edge TTS when every key is exhausted
-          cat > /tmp/rotate_elevenlabs.sh <<'ROT'
-          #!/bin/bash
-          [ -f /tmp/el_keys.txt ] || { echo "no ElevenLabs key list"; exit 1; }
-          best=""; bestleft=0
-          while read -r k; do
-            [ -n "$k" ] || continue
-            left=$(curl -s -H "xi-api-key: $k" https://api.elevenlabs.io/v1/user/subscription | python3 -c "import sys,json; d=json.load(sys.stdin); print(int(d.get('character_limit',0))-int(d.get('character_count',0)))" 2>/dev/null || echo 0)
-            if [ "${left:-0}" -gt "$bestleft" ]; then bestleft=$left; best=$k; fi
-          done < /tmp/el_keys.txt
-          if [ -n "$best" ]; then
-            sed -i '/^ELEVENLABS_API_KEY=/d' ~/.hermes/.env
-            echo "ELEVENLABS_API_KEY=$best" >> ~/.hermes/.env
-            echo "rotated to ElevenLabs key ...${best: -4} ($bestleft chars left)"
-          else
-            hermes config set tts.provider edge
-            echo "all ElevenLabs keys exhausted - switched to Edge TTS"
-          fi
-          ROT
-          chmod +x /tmp/rotate_elevenlabs.sh
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
           hermes doctor || true
           echo "── Final model config ──"
@@ -1240,7 +1205,6 @@ jobs:
         env:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          ELEVENLABS_KEYS: ${{ secrets.ELEVENLABS_KEYS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -1665,7 +1629,7 @@ jobs:
           function micClick(){
             if(listening){stopListen(true);return;}
             stopVoice();
-            ensureStream(function(){if(SR&&!SRbroken){startSR();}else if(srvSTT){startRec();}else{toast('No speech engine available: this browser lacks speech recognition and no GROQ_API_KEY / ELEVENLABS_KEYS secret is set.');}});
+            ensureStream(function(){if(SR&&!SRbroken){startSR();}else if(srvSTT){startRec();}else{toast('No speech engine available: this browser lacks speech recognition and no GROQ_API_KEY secret is set.');}});
           }
           function startSR(){
             rec=new SR();rec.lang=el('lang').value;rec.interimResults=true;rec.continuous=false;srLast='';
@@ -1689,13 +1653,14 @@ jobs:
           function stopVad(){if(vadT){clearInterval(vadT);vadT=null;}if(actx){try{actx.close();}catch(e){}actx=null;}}
           function startRec(){
             if(!stream){return;}
-            var chunks=[];recSpoke=false;
+            var chunks=[];recSpoke=false;recVoiced=0;
             try{mrec=new MediaRecorder(stream);}catch(e){toast('Audio recording not supported in this browser.');return;}
             mrec.ondataavailable=function(e){chunks.push(e.data);};
             mrec.onstop=function(){stopVad();el('live').textContent='';var b=new Blob(chunks,{type:mrec.mimeType||'audio/webm'});
-              /* send when voice was detected OR the clip is big enough that the meter
-                 may simply have missed it — let Whisper decide, never discard words */
-              if((recSpoke&&b.size>2000)||b.size>12000){sendSTT(b);}
+              /* ONLY send when the meter actually heard voice. Silent clips used to
+                 slip through on size alone — and Whisper HALLUCINATES phrases like
+                 “Thank you!” on silence, which got auto-sent as fake user messages. */
+              if(recSpoke&&b.size>2000){sendSTT(b,recVoiced);}
               else{setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,150);}}};
             mrec.start();listening=true;el('mic').classList.add('on');setState('listen','LISTENING — SPEAK');
             t0=Date.now();
@@ -1711,16 +1676,16 @@ jobs:
                 if(ticks<=4){nf=Math.max(nf,m);return;} /* first 400ms: learn the room's noise floor */
                 if(m===0){flat+=100;}else{flat=0;}
                 if(flat>=2000){ /* analyser returns silence (privacy shields) -> timed mode */
-                  clearInterval(vadT);vadT=null;recSpoke=true;
+                  clearInterval(vadT);vadT=null;recSpoke=true;recVoiced=15000;
                   el('live').textContent='● voice meter blocked by browser shields — recording 15s then sending';
                   setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},Math.max(300,15000-(Date.now()-t0)));
                   return;}
                 var th=Math.max(6,Math.min(20,nf*1.8+3)); /* adaptive: just above the noise floor */
-                if(m>th){if(!recSpoke||quiet>=1200){el('live').textContent='● hearing you — pause when done and I will send';}recSpoke=true;quiet=0;}
+                if(m>th){if(!recSpoke||quiet>=1200){el('live').textContent='● hearing you — pause when done and I will send';}recSpoke=true;recVoiced+=100;quiet=0;}
                 else if(recSpoke){quiet+=100;if(quiet===1200){el('live').textContent='● finishing… keep talking to add more';}}
                 if((recSpoke&&quiet>=2200)||Date.now()-t0>60000){stopListen(false);}
               },100);
-            }catch(e){recSpoke=true;setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},15000);}
+            }catch(e){recSpoke=true;recVoiced=15000;setTimeout(function(){if(mrec&&mrec.state==='recording'){stopListen(false);}},15000);}
           }
           function stopListen(user){
             clearTimeout(srT);
@@ -1728,7 +1693,15 @@ jobs:
             if(mrec&&mrec.state==='recording'){if(user){recSpoke=true;}micOff();mrec.stop();return;}
             if(user){setState('idle','STANDBY');}
           }
-          function sendSTT(b){setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){send(j.text);}else if(j.error){toast(j.error);setState('idle','STANDBY');}else{toast('I heard audio but no clear words — speak a little closer, Boss.',1);setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,500);}}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
+          var HALL=['thank you','thanks','thank you very much','thanks for watching','thank you for watching','thank you so much','bye','goodbye','you','okay','ok','hmm','yeah','so','the end','subscribe','please subscribe','ধন্যবাদ','धन्यवाद','नमस्ते'];
+          function isHallucination(t,vms){
+            var n=t.toLowerCase().replace(/[!?.।,…"“”]+/g,' ').replace(/\s+/g,' ').trim();
+            if(!n){return true;}
+            /* Whisper's classic silence-fillers only count when almost no real voice was heard */
+            if(vms<1500&&HALL.indexOf(n)>-1){return true;}
+            if(vms<600&&n.split(' ').length<=2){return true;}
+            return false;}
+          function sendSTT(b,vms){if(vms===undefined){vms=99999;}setState('think','TRANSCRIBING');fetch('/stt?lang='+el('lang').value,{method:'POST',headers:{'X-Token':tok,'Content-Type':b.type||'audio/webm'},body:b}).then(function(r){return r.json();}).then(function(j){if(j.text){if(isHallucination(j.text,vms)){toast('(ignored background noise: “'+j.text.trim()+'”)',1);setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,300);}return;}send(j.text);}else if(j.error){toast(j.error);setState('idle','STANDBY');}else{toast('I heard audio but no clear words — speak a little closer, Boss.',1);setState('idle','STANDBY');if(el('auto').checked&&!busy){setTimeout(startRec,500);}}}).catch(function(){toast('Transcription request failed');setState('idle','STANDBY');});}
 
           /* ---------- barge-in: speak to interrupt agent voice ---------- */
           function stopBarge(){if(bargeT){clearInterval(bargeT);bargeT=null;}}
@@ -1758,7 +1731,10 @@ jobs:
           function pbShow(on){el('pbar').className=on?'show':'';}
           function pbIcon(){el('pbPause').innerHTML=paused?'&#9654;':'&#10074;&#10074;';}
           function after(){busy=false;paused=false;stopBarge();setState('idle','STANDBY');
-            if(el('auto').checked){if(SR&&!SRbroken&&stream){startSR();}else if(srvSTT&&stream){startRec();}else if(!stream){setState('idle','TAP MIC TO TALK');}}}
+            if(el('auto').checked){setTimeout(function(){ /* 600ms: let the speaker's echo tail fade before the ear opens */
+              if(busy||listening){return;}
+              if(SR&&!SRbroken&&stream){startSR();}else if(srvSTT&&stream){startRec();}else if(!stream){setState('idle','TAP MIC TO TALK');}
+            },600);}}
           function scriptLang(t){if(/[\u0980-\u09FF]/.test(t)){return 'bn';}if(/[\u0900-\u097F]/.test(t)){return 'hi';}return 'en';}
           function voiceFor(t){var sl=scriptLang(t),v=curVoice();if(v.indexOf('st:')===0){if(sl!=='bn'){return v;}return VDEF['bn-BD']||'bn-BD-PradeepNeural';}if(v.indexOf(sl)===0){return v;}if(sl==='bn'){return VDEF['bn-BD']||'bn-BD-PradeepNeural';}if(sl==='hi'){return VDEF['hi-IN']||'hi-IN-MadhurNeural';}return v;}
           function browserSpeak(t){var msg=clean(t).slice(0,600);curU=new SpeechSynthesisUtterance(msg);var sl=scriptLang(msg);curU.lang=sl==='bn'?'bn-BD':(sl==='hi'?'hi-IN':el('lang').value);var vs=speechSynthesis.getVoices();for(var i=0;i<vs.length;i++){if(vs[i].lang.indexOf(curU.lang.split('-')[0])===0){curU.voice=vs[i];break;}}
@@ -1800,32 +1776,33 @@ jobs:
             var last=cur.replace(/^\s+|\s+$/g,'');if(last){out.push(last);}
             return out.length?out:[t];
           }
-          function chunkText(t){
+          function chunkText(t,small){
             // First chunk stays tiny so audio starts almost instantly; later chunks grow.
             // no lookbehind: older iOS Safari throws on it and would kill all voice output
             var flat=String(t).replace(/\s+/g,' ').trim();
             var parts=sentSplit(flat,'.!?।…');
             if(parts.length===1){parts=sentSplit(flat,',;:');}
-            var out=[],cur='',lim=110;
+            var MAXC=small?220:320,out=[],cur='',lim=small?90:110;
             for(var i=0;i<parts.length;i++){
               var p=parts[i];
-              if(p.length>320){ // hard-wrap very long sentences on word bounds
+              if(p.length>MAXC){ // hard-wrap very long sentences on word bounds
                 var w=p.split(' '),b='';
                 for(var j=0;j<w.length;j++){
-                  if((b+' '+w[j]).length>320){out.push(b);b=w[j];}else{b=b?b+' '+w[j]:w[j];}
+                  if((b+' '+w[j]).length>MAXC){out.push(b);b=w[j];}else{b=b?b+' '+w[j]:w[j];}
                 }
                 if(b){parts[i]=b;p=b;}
               }
-              if(!cur){cur=p;}else if((cur+' '+p).length<=lim){cur=cur+' '+p;}else{out.push(cur);cur=p;lim=320;}
-              if(out.length===0&&cur.length>=lim){out.push(cur);cur='';lim=320;}
+              if(!cur){cur=p;}else if((cur+' '+p).length<=lim){cur=cur+' '+p;}else{out.push(cur);cur=p;lim=MAXC;}
+              if(out.length===0&&cur.length>=lim){out.push(cur);cur='';lim=MAXC;}
             }
             if(cur){out.push(cur);}
             return out.length?out:[String(t)];
           }
           function ttsChunk(txt,seq){
             var ctl=('AbortController' in window)?new AbortController():null;
-            var tto=ctl?setTimeout(function(){ctl.abort();},20000):null;
-            return fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:txt.slice(0,1200),voice:voiceFor(txt)}),signal:ctl?ctl.signal:undefined})
+            var vch=voiceFor(txt);
+            var tto=ctl?setTimeout(function(){ctl.abort();},vch.indexOf('st:')===0?60000:20000):null;
+            return fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:txt.slice(0,1200),voice:vch}),signal:ctl?ctl.signal:undefined})
             .then(function(r){
               if(tto){clearTimeout(tto);}
               if(r.status===401){authFail();throw new Error('auth');}
@@ -1852,7 +1829,7 @@ jobs:
             if(seq!==QSEQ){return;}
             if(i>=Q.length){QDONE=true;pbShow(false);after();return;}
             QI=i;
-            prefetch(i+1,seq); // synthesize the NEXT chunk while this one plays
+            prefetch(i+1,seq);prefetch(i+2,seq); // keep two chunks cooking while this one plays
             var u=QURL[i];
             if(u===undefined||u===null){setTimeout(function(){playChunk(i,seq);},120);return;}
             if(u===false){ // this chunk failed - speak it with the browser voice, keep going
@@ -1867,11 +1844,11 @@ jobs:
             var txt=clean(t);
             if(!txt){after();return;}
             QSEQ++;var seq=QSEQ;
-            Q=chunkText(txt);QI=0;QURL=[];QDONE=false;
+            Q=chunkText(txt,curVoice().indexOf('st:')===0);QI=0;QURL=[];QDONE=false;
             if(elTTS){
               setState('speak','SPEAKING');
               prefetch(0,seq);
-              prefetch(1,seq); // first two in parallel: audio starts as soon as chunk 1 lands
+              prefetch(1,seq);prefetch(2,seq); // pipeline: audio starts as soon as chunk 1 lands
               playChunk(0,seq);
             }else{browserSpeak(t);}
           }
@@ -1906,8 +1883,30 @@ jobs:
 
           /* ---------- jobs ---------- */
           function stopThink(){if(thinkT){clearInterval(thinkT);thinkT=null;}}
-          function poll(id){fetch('/poll?id='+id+'&since='+encodeURIComponent(pushSince),{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){authFail();return null;}return r.json();}).then(function(j){if(!j){return;}drainPushed(j);if(j.done){stopThink();curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply,null,j.files);if(j.files&&j.files.length){toast(j.files.length+' file'+(j.files.length>1?'s':'')+' delivered, Boss.',1);}speak(j.reply);}else{setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
+          function poll(id){fetch('/poll?id='+id+'&since='+encodeURIComponent(pushSince),{headers:{'X-Token':tok}}).then(function(r){if(r.status===401){authFail();return null;}return r.json();}).then(function(j){if(!j){return;}drainPushed(j);if(j.done){stopThink();stopPings();el('live').textContent='';curJob=null;hist.push({role:'assistant',content:j.reply});if(hist.length>10){hist=hist.slice(-10);}addMsg('AGENT',j.reply,null,j.files);if(j.files&&j.files.length){toast(j.files.length+' file'+(j.files.length>1?'s':'')+' delivered, Boss.',1);}speak(j.reply);}else{if(j.live){el('live').textContent='⚙ '+j.live;}setTimeout(function(){poll(id);},1000);}}).catch(function(){setTimeout(function(){poll(id);},2500);});}
           function authFail(){busy=false;stopThink();setState('idle','STANDBY');lockOut('Session token no longer valid \u2014 enter your PANEL_TOKEN secret again');}
+          var pingT=null,pingN=0,pingNext=0,pingA=null,pingSeq=0;
+          function stopPings(){pingSeq++;if(pingT){clearInterval(pingT);pingT=null;}if(pingA){try{pingA.pause();}catch(e){}pingA=null;}}
+          function pingSpeak(t){
+            var ps=pingSeq;
+            fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:t,voice:voiceFor(t)})})
+            .then(function(r){if(!r.ok){throw 0;}return r.blob();})
+            .then(function(b){if(!busy||ps!==pingSeq||!pingT){return;}if(pingA){try{pingA.pause();}catch(e){}}pingA=new Audio(URL.createObjectURL(b));pingA.play().catch(function(){});})
+            .catch(function(){});}
+          function startPings(){stopPings();pingNext=45;
+            pingT=setInterval(function(){
+              if(!busy){stopPings();return;}
+              var s=Math.floor((Date.now()-thinkStart)/1000);
+              if(s<pingNext){return;}
+              pingNext+=(pingNext<200?90:180); /* 45s, then every 1.5-3 min */
+              if(!el('voice').checked){return;}
+              var m=Math.max(1,Math.round(s/60)),mm=m+' minute'+(m>1?'s':'');
+              var opts=['Still working on it, Boss — about '+mm+' in.',
+                'On it, Boss. This one is taking a moment — '+mm+' so far.',
+                'Still processing, Boss. I will report the moment it is done.',
+                'Working, Boss — '+mm+' elapsed. Hang tight.'];
+              pingSpeak(opts[pingN++%opts.length]);
+            },5000);}
           function send(text){
             if(!text&&!files.length){return;}
             if(busy){toast('Previous task still running, Boss.');return;}
@@ -1918,6 +1917,7 @@ jobs:
             files=[];renderChips();
             thinkStart=Date.now();setState('think','PROCESSING');stopThink();
             thinkT=setInterval(function(){var s=Math.floor((Date.now()-thinkStart)/1000);var mm=String(Math.floor(s/60)).padStart(2,'0');var ss=String(s%60).padStart(2,'0');el('stateTxt').textContent='PROCESSING · '+mm+':'+ss;},1000);
+            startPings();
             var h=hist.slice(-8);hist.push({role:'user',content:text||'(files attached)'});
             fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok},body:JSON.stringify({text:text,files:paths,history:h})}).then(function(r){if(r.status===401){authFail();return null;}return r.json();}).then(function(j){if(!j){return;}if(j.job){curJob=j.job;poll(j.job);}else{busy=false;stopThink();addMsg('AGENT',j.error||'request failed');setState('idle','STANDBY');}}).catch(function(e){busy=false;stopThink();addMsg('AGENT','Connection error: '+e);setState('idle','STANDBY');});
           }
@@ -2126,18 +2126,69 @@ jobs:
                       return "hi"
               return "en"
 
+          def _st_split(text, limit=280):
+              # Supertonic chokes on long inputs - feed it sentence-sized pieces.
+              out, cur = [], ""
+              clean = text.replace("\n", " ")
+              parts, buf = [], ""
+              for ch in clean:
+                  buf += ch
+                  if ch in ".!?;" or ch == u"\u0964":
+                      parts.append(buf.strip()); buf = ""
+              if buf.strip():
+                  parts.append(buf.strip())
+              for sent in parts:
+                  while len(sent) > limit:
+                      cut = sent.rfind(" ", 40, limit)
+                      if cut < 40:
+                          cut = limit
+                      if cur:
+                          out.append(cur); cur = ""
+                      out.append(sent[:cut].strip())
+                      sent = sent[cut:].strip()
+                  if not sent:
+                      continue
+                  if len(cur) + len(sent) + 1 <= limit:
+                      cur = (cur + " " + sent).strip()
+                  else:
+                      if cur:
+                          out.append(cur)
+                      cur = sent
+              if cur:
+                  out.append(cur)
+              return out or [text[:limit]]
+
           def supertonic_speak(text, voice, lang):
+              import wave, io
               try:
-                  with ST_LOCK:
-                      wav, _dur = SUPER["tts"].synthesize(text[:1500],
-                          voice_style=SUPER["styles"][voice], lang=lang)
-                  p = "/tmp/st_%s.wav" % uuid.uuid4().hex
-                  SUPER["tts"].save_audio(wav, p)
-                  with open(p, "rb") as f:
-                      b = f.read()
-                  os.remove(p)
-                  return b
-              except Exception:
+                  frames, params = [], None
+                  for piece in _st_split(text[:1500]):
+                      with ST_LOCK:
+                          wav, _dur = SUPER["tts"].synthesize(piece,
+                              voice_style=SUPER["styles"][voice], lang=lang)
+                      p = "/tmp/st_%s.wav" % uuid.uuid4().hex
+                      SUPER["tts"].save_audio(wav, p)
+                      wf = wave.open(p, "rb")
+                      try:
+                          if params is None:
+                              params = wf.getparams()
+                          frames.append(wf.readframes(wf.getnframes()))
+                      finally:
+                          wf.close()
+                      os.remove(p)
+                  if not frames or params is None:
+                      return None
+                  buf = io.BytesIO()
+                  ow = wave.open(buf, "wb")
+                  try:
+                      ow.setparams(params)
+                      for fr in frames:
+                          ow.writeframes(fr)
+                  finally:
+                      ow.close()
+                  return buf.getvalue()
+              except Exception as e:
+                  SUPER["err"] = str(e)[:120]
                   return None
           UPLOAD_DIR = os.path.expanduser("~/.hermes/work/uploads")
           # Anything the agent drops here is delivered straight into the chat.
@@ -2284,17 +2335,6 @@ jobs:
           ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
           HTML = open("/tmp/jarvis/index.html").read()
 
-          def el_keys():
-              ks = []
-              try:
-                  with open("/tmp/el_keys.txt") as f:
-                      ks = [l.strip() for l in f if l.strip()]
-              except Exception:
-                  pass
-              if not ks:
-                  ks = [k.strip() for k in os.environ.get("ELEVENLABS_KEYS", "").splitlines() if k.strip()]
-              return ks
-
           def edge_speak(text, voice):
               # Free Microsoft Edge neural TTS - no API key needed.
               if not EDGE:
@@ -2333,17 +2373,6 @@ jobs:
                                   headers={"Authorization": "Bearer " + GROQ},
                                   files={"file": ("audio.webm", blob, mime)},
                                   data=data,
-                                  timeout=90)
-                      if r.status_code == 200:
-                          return (r.json().get("text") or "").strip()
-                  except Exception:
-                      pass
-              for k in el_keys():
-                  try:
-                      r = rq.post("https://api.elevenlabs.io/v1/speech-to-text",
-                                  headers={"xi-api-key": k},
-                                  files={"file": ("audio.webm", blob, mime)},
-                                  data={"model_id": "scribe_v1"},
                                   timeout=90)
                       if r.status_code == 200:
                           return (r.json().get("text") or "").strip()
@@ -2450,15 +2479,41 @@ jobs:
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                       text=True, start_new_session=True, env=env)
                   PROCS[jid] = p
-                  try:
-                      out, err = p.communicate(timeout=1800)
-                  except subprocess.TimeoutExpired:
+                  # Stream output as it happens (instead of communicate()) so /poll can
+                  # show the panel WHAT the agent is doing while a long task runs.
+                  buf, ebuf = [], []
+
+                  def _reader(pipe, into, live):
+                      try:
+                          for line in iter(pipe.readline, ""):
+                              into.append(line)
+                              if live:
+                                  ln = ANSI.sub("", line).strip()
+                                  ln = ln.strip("\u2502\u256d\u2570\u251c\u2500 ").strip()
+                                  if len(ln) >= 4 and not ln.startswith(("Query:", "Session", "Hermes")):
+                                      j = JOBS.get(jid)
+                                      if j is not None and not j.get("done"):
+                                          j["live"] = ln[:120]
+                      except Exception:
+                          pass
+
+                  tr1 = threading.Thread(target=_reader, args=(p.stdout, buf, True), daemon=True)
+                  tr2 = threading.Thread(target=_reader, args=(p.stderr, ebuf, False), daemon=True)
+                  tr1.start(); tr2.start()
+                  deadline = time.time() + 1800
+                  while p.poll() is None and time.time() < deadline:
+                      time.sleep(0.5)
+                  if p.poll() is None:
                       try:
                           os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                       except Exception:
                           p.kill()
                       JOBS[jid] = {"done": True, "reply": "Task timed out after 30 minutes, Boss."}
                       return
+                  tr1.join(timeout=5)
+                  tr2.join(timeout=5)
+                  out = "".join(buf)
+                  err = "".join(ebuf)
                   if JOBS.get(jid, {}).get("done"):
                       return  # already marked interrupted via /stop
                   outc = ANSI.sub("", (out or "")).strip()
@@ -2480,7 +2535,7 @@ jobs:
           def config():
               if request.headers.get("X-Token", "") != TOKEN:
                   return jsonify(error="bad token"), 401
-              return jsonify(tts=EDGE, stt=bool(GROQ) or bool(el_keys()),
+              return jsonify(tts=EDGE, stt=bool(GROQ),
                              voices=VOICES + SUPER["voices"], defaults=DEFAULT_VOICES,
                              st=SUPER["status"], sterr=SUPER.get("err", ""),
                              prefs=load_prefs())
@@ -2514,7 +2569,7 @@ jobs:
                               r = Response(audio, mimetype="audio/wav")
                               r.headers["X-TTS-Engine"] = "supertonic"
                               return r
-                          why = "Supertonic could not synthesize that line - used Edge instead"
+                          why = "Supertonic failed (%s) - used Edge for this line" % (SUPER.get("err") or "synthesis error")
                       elif SUPER["status"] == "loading":
                           why = "Supertonic is still loading - using Edge for now"
                       else:
@@ -2670,7 +2725,7 @@ jobs:
               text = do_stt(blob, request.headers.get("Content-Type", "audio/webm"),
                             request.args.get("lang", "en-US"))
               if text is None:
-                  return jsonify(error="transcription unavailable (add GROQ_API_KEY or ELEVENLABS_KEYS)"), 503
+                  return jsonify(error="transcription unavailable (add the GROQ_API_KEY secret)"), 503
               return jsonify(text=text)
 
           @app.route("/upload", methods=["POST"])
@@ -2788,6 +2843,11 @@ jobs:
 
 
 
+
+
+
+
+
       # ── 11. Background backup loop (every 30 min -> backup branch) ──
       - name: Start backup loop
         env:
@@ -2808,9 +2868,10 @@ jobs:
           done
           find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
           rm -rf /tmp/hot && mkdir -p /tmp/hot
-          for d in agent-state xdg-mirror work skills brain brains memory memories tasks notes knowledge sessions prompts; do
+          for d in agent-state xdg-mirror skills brain brains memory memories tasks notes knowledge sessions prompts; do
             [ -e "$HERMES_HOME/$d" ] && rsync -a --exclude='.git' --exclude='*.log' "$HERMES_HOME/$d" /tmp/hot/ || true
           done
+          [ -e "$HERMES_HOME/work" ] && rsync -a --exclude='.git' --exclude='*.log' --max-size=25m "$HERMES_HOME/work" /tmp/hot/ || true
           find "$HERMES_HOME" -maxdepth 1 -type f \( -name '*.json' -o -name '*.md' -o -name '*.txt' -o -name '*.yaml' -o -name '*.yml' -o -name '*.db' -o -name '*.sqlite*' \) ! -name '.env' -exec cp -a {} /tmp/hot/ \; 2>/dev/null || true
           cd /tmp/hot || exit 0
           find . -type f -size +90M | while read -r f; do
@@ -2818,11 +2879,20 @@ jobs:
             rm -f "$f"
           done
           printf '.env\n*.log\n' > .gitignore
+          echo "# Hermes hot backup - saved $(date -u +%FT%TZ)" > BACKUP-STATUS.md
+          echo "- skills: $(find skills -name SKILL.md 2>/dev/null | wc -l) skill file(s)" >> BACKUP-STATUS.md
+          echo "- memory files: $(find memories -type f 2>/dev/null | wc -l)" >> BACKUP-STATUS.md
+          echo "- session db: $(du -h state.db 2>/dev/null | cut -f1)" >> BACKUP-STATUS.md
+          echo "- total size: $(du -sh . 2>/dev/null | cut -f1)" >> BACKUP-STATUS.md
           git init -q -b hot
           git config user.email "bot@hermes" && git config user.name "hermes-bot"
           git add -A && git commit -q -m "hot save $(date -u +%FT%TZ)" || true
-          timeout 90 git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" hot 2>/dev/null || true
-          echo "Hot save pushed at $(date)"
+          if timeout 300 git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" hot >/tmp/hotpush.log 2>&1; then
+            echo "Hot save pushed at $(date)"
+          else
+            echo "::warning::HOT PUSH FAILED - skills/memory NOT saved this cycle"
+            tail -3 /tmp/hotpush.log || true
+          fi
           HOTEOF
           chmod +x /tmp/hotsave.sh
 
@@ -2862,11 +2932,20 @@ jobs:
               split -b 90M -d -a 3 "$f" "$f.gh-chunk."
               rm -f "$f"
             done
+            echo "# Hermes full backup - saved $(date -u +%FT%TZ)" > BACKUP-STATUS.md
+            echo "- skills: $(find skills -name SKILL.md 2>/dev/null | wc -l) skill file(s)" >> BACKUP-STATUS.md
+            echo "- memory files: $(find memories -type f 2>/dev/null | wc -l)" >> BACKUP-STATUS.md
+            echo "- session db: $(du -h state.db 2>/dev/null | cut -f1)" >> BACKUP-STATUS.md
+            echo "- total size: $(du -sh . 2>/dev/null | cut -f1)" >> BACKUP-STATUS.md
             git init -q -b backup
             git config user.email "bot@hermes" && git config user.name "hermes-bot"
             git add -A && git commit -q -m "backup $(date -u +%FT%TZ)" || true
-            git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" backup 2>/dev/null || true
-            echo "Backup pushed at $(date)"
+            if git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" backup >/tmp/bkpush.log 2>&1; then
+              echo "Backup pushed at $(date)"
+            else
+              echo "::warning::BACKUP PUSH FAILED"
+              tail -3 /tmp/bkpush.log || true
+            fi
           done
           EOF
           chmod +x /tmp/sync.sh
@@ -3120,31 +3199,15 @@ jobs:
           .env
           *.log
           EOF
+          echo "# Hermes final save (main) - saved $(date -u +%FT%TZ)" > BACKUP-STATUS.md
+          echo "- skills: $(find skills -name SKILL.md 2>/dev/null | wc -l) skill file(s)" >> BACKUP-STATUS.md
+          echo "- memory files: $(find memories -type f 2>/dev/null | wc -l)" >> BACKUP-STATUS.md
+          echo "- session db: $(du -h state.db 2>/dev/null | cut -f1)" >> BACKUP-STATUS.md
+          echo "- total size: $(du -sh . 2>/dev/null | cut -f1)" >> BACKUP-STATUS.md
           git init -q -b main
           git config user.email "bot@hermes" && git config user.name "hermes-bot"
           git add -A && git commit -q -m "final save $(date -u +%FT%TZ)" || true
           git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" main
-
-      # ── 15. Start next run (24/7 chaining) ──
-      # Dispatches a fresh run of THIS workflow when the current one ends.
-      # The concurrency group makes the new run QUEUE until this one exits,
-      # so two gateways never overlap (no Telegram polling conflict).
-      # Cancelling a run manually BREAKS the chain (if: !cancelled()) -
-      # cancel = stop for good, let it finish = runs 24/7.
-      - name: Start next run (24/7 chain)
-        if: ${{ !cancelled() }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          WF_FILE="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"
-          WF_FILE="${WF_FILE%%@*}"
-          echo "Chaining next run of ${WF_FILE} on ${GITHUB_REF_NAME}..."
-          curl -s -X POST \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
-            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" \
-            && echo "Next run queued OK" || echo "::warning::Could not queue next run"
 
       # ── 16. Notify failure ──
       - name: Notify failure
