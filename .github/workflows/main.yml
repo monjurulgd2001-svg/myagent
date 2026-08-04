@@ -2,6 +2,11 @@ name: Hermes Agent — Telegram + Slack + NVIDIA/Mistral Pool
 
 on:
   workflow_dispatch:
+    inputs:
+      run_hours:
+        description: "Run duration in HOURS (e.g. 0.5, 1, 3). Leave empty for the full 5.5h"
+        required: false
+        default: ""
 
 # actions:write lets the last step dispatch the NEXT run (24/7 chaining)
 # using the built-in GITHUB_TOKEN - no extra secret needed.
@@ -15,6 +20,8 @@ concurrency:
 
 env:
   RUN_MINUTES: 330
+  # optional manual-run override, raw hours string (may be empty)
+  RUN_HOURS_INPUT: ${{ github.event.inputs.run_hours }}
   HERMES_HOME: /home/runner/.hermes
   DATA_REPO: monjurulgd2001-svg/harmesprivatestorage
 
@@ -113,7 +120,7 @@ jobs:
           # (belt-and-braces: normally agent-state/ already holds a copy).
           KEEP=/tmp/hermes-keep; rm -rf "$KEEP"; mkdir -p "$KEEP"
           if [ -d "$HERMES_HOME/hermes-agent" ]; then
-            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
               [ -e "$HERMES_HOME/hermes-agent/$d" ] && cp -a "$HERMES_HOME/hermes-agent/$d" "$KEEP/" || true
             done
           fi
@@ -136,19 +143,22 @@ jobs:
           # flaky network must never kill the run, and the sanity check
           # below reinstalls cleanly if an update leaves things broken.
           echo "Running hermes update..."
-          timeout 300 "$HOME/.local/bin/hermes" update \
-            || echo "::warning::hermes update failed or timed out - continuing with current version"
+          if ! timeout 600 "$HOME/.local/bin/hermes" update; then
+            echo "::warning::hermes update failed or timed out - forcing a clean reinstall so we never run a mixed-version tree"
+            rm -rf "$HERMES_HOME/hermes-agent"
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          fi
           # ── MERGE BACKED-UP USER STATE into the fresh agent dir ──
           # skills / brain / tasks / memory added in earlier sessions come back
           # from ~/.hermes/agent-state (pulled from the privatestorage repo).
           if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
             mkdir -p "$HERMES_HOME/hermes-agent"
-            rsync -a --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
             echo "Restored agent state: $(ls "$HERMES_HOME/agent-state" | tr '\n' ' ')"
           fi
           if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
             mkdir -p "$HERMES_HOME/hermes-agent"
-            rsync -a --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+            rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
           fi
           # ── SANITY CHECK: hermes must actually be runnable ──
           # Catch a broken install HERE with a clear message (and one
@@ -159,16 +169,34 @@ jobs:
             curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
             if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
               mkdir -p "$HERMES_HOME/hermes-agent"
-              rsync -a --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
             fi
             if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
               mkdir -p "$HERMES_HOME/hermes-agent"
-              rsync -a --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
             fi
           fi
           if [ ! -x "$HERMES_HOME/hermes-agent/venv/bin/python" ] || ! "$HOME/.local/bin/hermes" --help >/dev/null 2>&1; then
             echo "::error::Hermes install is broken (venv python missing or launcher fails). Failing fast so the chain does not spam failed runs."
             exit 1
+          fi
+          # DEEP IMPORT CHECK: a stale code dir restored from backup can mix
+          # versions (old tools/registry.py + new model_tools.py) - every chat
+          # message then dies with ImportError. Catch and heal it HERE.
+          if ! (cd "$HERMES_HOME/hermes-agent" && timeout 120 ./venv/bin/python -c "import model_tools" >/dev/null 2>/tmp/impcheck.err); then
+            echo "::warning::Agent code failed the import check - forcing one clean reinstall. $(tail -c 200 /tmp/impcheck.err 2>/dev/null || true)"
+            rm -rf "$HERMES_HOME/hermes-agent"
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+            if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            fi
+            if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+            fi
+            if ! (cd "$HERMES_HOME/hermes-agent" && timeout 120 ./venv/bin/python -c "import model_tools" >/dev/null 2>&1); then
+              echo "::error::Agent code still fails to import after a clean reinstall. Failing fast."
+              exit 1
+            fi
           fi
           echo "Hermes launcher verified OK"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -206,7 +234,7 @@ jobs:
         run: |
           # Shared virtual display :99 — the browser AND all the agent's GUI
           # work render here, so the LIVE VIEW (below) shows everything.
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox xterm pcmanfm mousepad xdotool wmctrl scrot imagemagick tesseract-ocr python3-tk
           Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
           sleep 2
           export DISPLAY=:99
@@ -215,6 +243,17 @@ jobs:
           # the live view. Fluxbox = real desktop (background, taskbar, window
           # titlebars), and the status xterm keeps something moving on screen
           # at all times so you can SEE the machine is alive.
+          # Right-click launcher menu for manual work (file manager, terminal,
+          # editor). Fluxbox reads it at startup, so write it BEFORE starting.
+          mkdir -p "$HOME/.fluxbox"
+          cat > "$HOME/.fluxbox/menu" <<'EOF'
+          [begin] (Hermes Desktop)
+            [exec] (File Manager) {pcmanfm}
+            [exec] (Terminal) {xterm -fg white -bg black -geometry 110x28}
+            [exec] (Text Editor) {mousepad}
+            [restart] (Restart Fluxbox)
+          [end]
+          EOF
           fluxbox > /tmp/fluxbox.log 2>&1 &
           sleep 1
           cat > /tmp/status.sh <<'EOF'
@@ -229,32 +268,21 @@ jobs:
             echo "Running services:"
             pgrep -a -f 'hermes|camoufox|litellm|searxng|cloudflared' | cut -c1-105
             echo
-            echo "Browser windows appear here when the agent works..."
+            echo "NOTE: the Camofox browser is NOT on this desktop!"
+            echo "Open the 'Camofox browser' link from the Telegram start"
+            echo "message to watch/control it (noVNC :6081, same password)."
+            echo "Here you only see: fallback Chrome + your own script windows."
             sleep 2
           done
           EOF
           chmod +x /tmp/status.sh
           xterm -geometry 130x20+30+30 -fg green -bg black -T "Hermes Agent — status" -e /tmp/status.sh &
 
-          # VISIBLE Chrome for the agent's built-in browser tools. Hermes'
-          # browser toolset speaks CDP, which only Chromium-family browsers
-          # support — Camoufox is Firefox-based (Juggler protocol), so the
-          # built-in tools can NOT drive it; without this they auto-launch an
-          # invisible headless browser. This Chrome runs HEADED on :99, so
-          # every built-in browser action shows up in the live view.
-          # Camoufox (port 9222) stays available for stealth scripting.
-          BROWSER_BIN=$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)
-          if [ -n "$BROWSER_BIN" ]; then
-            mkdir -p "$HERMES_HOME/chrome-profile"
-            nohup "$BROWSER_BIN" --remote-debugging-port=9223 \
-              --user-data-dir="$HERMES_HOME/chrome-profile" \
-              --no-first-run --no-default-browser-check --disable-gpu \
-              --window-size=1600,900 about:blank > /tmp/chrome.log 2>&1 &
-            echo "Visible Chrome started on :99 (CDP port 9223)"
-          else
-            echo "::warning::No Chromium-family browser found — built-in browser tools will be headless"
-          fi
-          pip install -U "camoufox[geoip]" pyvirtualdisplay
+          # Chrome is NOT started here by default anymore. Camofox is the
+          # browser; a visible Chrome launches ONLY as a fallback below, and
+          # ONLY if the Camofox server fails - so on a normal run NO browser
+          # window opens on the desktop by itself.
+          pip install -U "camoufox[geoip]" pyvirtualdisplay pyautogui
           # fetch skips the ~200MB browser download when restored from cache
           python3 -m camoufox fetch
           mkdir -p "$HERMES_HOME/browser-profile"
@@ -277,12 +305,204 @@ jobs:
           done
           cat /tmp/camoufox.log || true
 
+          # ── CAMOFOX SERVER: anti-detect backend for the BUILT-IN browser
+          # tools. Hermes routes ALL browser_* tools through it when
+          # CAMOFOX_URL is set: Camoufox = Firefox fork with C++-level
+          # fingerprint spoofing, so sites cannot detect/track agentic work
+          # (no CDP automation beacons like Chrome).
+          # VISIBLE VIA ITS OWN VNC: the camofox server subprocess STRIPS
+          # DISPLAY (lib/config.js serverEnv), so the browser can never render
+          # on our :99 desktop - camoufox-js spawns its OWN private Xvfb.
+          # Official fix = bundled VNC plugin (ENABLE_VNC=1): it resizes that
+          # private Xvfb to 1920x1080, attaches x11vnc on :5901 and serves
+          # noVNC on :6081 (our own desktop owns :5900/:6080). Log into your
+          # accounts THERE - the agent works in that SAME browser and
+          # inherits your logged-in sessions.
+          # LAZY LAUNCH (tamed by fix44/46): engine warm-starts at boot, a
+          # placeholder tab keeps a window rendered, and idle/session/tab
+          # timeouts are raised to 24h so nothing dies between uses.
+          # PERSISTENT LOGINS (fix47): the server NEVER writes cookies to
+          # disk by itself (contexts are in-memory), so the keepalive
+          # exports boss-view cookies every 2 min (GET /sessions/boss-view/
+          # storage_state) into ~/.hermes/data/camofox-profiles - pushed to
+          # the data repo by the backup loop - and re-imports them (POST
+          # /sessions/boss-view/cookies) after every engine start/restart,
+          # so logins survive runs AND mid-run restarts.
+          # Fail-soft: without it, Configure falls back to visible Chrome.
+          git clone --depth 1 https://github.com/jo-inc/camofox-browser /tmp/camofox-browser 2>/dev/null || true
+          if [ -d /tmp/camofox-browser ]; then
+            mkdir -p "$HERMES_HOME/data/camofox-profiles"
+            ( cd /tmp/camofox-browser && timeout 600 npm install > /tmp/camofox-npm.log 2>&1 ) \
+              || echo "::warning::camofox-browser npm install failed - see /tmp/camofox-npm.log"
+            ( cd /tmp/camofox-browser && CAMOFOX_PORT=9377 \
+                CAMOFOX_BIND_HOST=127.0.0.1 \
+                CAMOFOX_PROFILE_DIR="$HERMES_HOME/data/camofox-profiles" \
+                ENABLE_VNC=1 VNC_RESOLUTION=1920x1080 \
+                VNC_PASSWORD="${PANEL_TOKEN:-hermes99}" \
+                VNC_PORT=5901 NOVNC_PORT=6081 \
+                SESSION_TIMEOUT_MS=86400000 TAB_INACTIVITY_MS=86400000 \
+                BROWSER_IDLE_TIMEOUT_MS=86400000 \
+                NATIVE_MEM_RESTART_THRESHOLD_MB=2048 \
+                BROWSER_RSS_RESTART_THRESHOLD_MB=4096 \
+                nohup npm start > /tmp/camofox-srv.log 2>&1 & )
+            for i in $(seq 1 40); do
+              if curl -sf http://127.0.0.1:9377/health > /dev/null 2>&1 \
+                 || curl -sf http://127.0.0.1:9377/tabs > /dev/null 2>&1; then
+                echo "http://127.0.0.1:9377" > /tmp/camofox_url
+                echo "Camofox ready on :9377 - browser visible on its OWN noVNC :6081 (warm-started at boot)"
+                break
+              fi
+              sleep 3
+            done
+          fi
+          # fix43: WARM START the browser engine NOW + keep it alive, so the
+          # noVNC view on :6081 is actually connectable from minute 1.
+          # fix46: loadConfig() reads process.env DIRECTLY when npm start
+          # runs the server (the serverEnv allowlist only filters env when
+          # the OpenClaw plugin spawns it), so the launch line raises
+          # session/tab/idle timeouts to 24h and the auto-restart
+          # thresholds (native-mem 300MB -> 2GB, browser RSS 1.5GB -> 4GB)
+          # that were closing ALL windows mid-login (the Facebook vanish).
+          # The keepalive (python) still revives the engine if down AND
+          # keeps ONE placeholder tab (userId boss-view) refreshed every 2
+          # min, so the tab-inactivity (5 min) and engine-idle (5 min)
+          # timers never fire: a window is ALWAYS rendered (no black screen,
+          # the display has no window manager so no-window = black) and the
+          # engine never dies (no VNC disconnect cycle).
+          # fix47: it also exports boss-view cookies to the data-repo dir
+          # every cycle and re-imports them into fresh sessions, so logins
+          # survive engine restarts AND whole machine runs.
+          if [ -f /tmp/camofox_url ]; then
+            curl -s --max-time 30 -X POST http://127.0.0.1:9377/start \
+              -H 'Content-Type: application/json' -d '{}' \
+              > /tmp/camofox-warmstart.log 2>&1 || true
+            cat > /tmp/camofox-keepalive.py <<'PYKA'
+          #!/usr/bin/env python3
+          # Keep the Camofox engine AND one placeholder tab alive so the
+          # noVNC view always shows a browser window (no black screen) and
+          # x11vnc never dies from the 5-min idle shutdown (no disconnects).
+          import json, os, time, urllib.request
+
+          BASE = "http://127.0.0.1:9377"
+          STATE = (os.environ.get("CAMOFOX_STATE_FILE") or
+                   "/home/runner/.hermes/data/camofox-profiles/boss-view-storage.json")
+          IDLE_PAGE = ("data:text/html,<body style='background:%23111;color:%23ddd;"
+                       "font-family:sans-serif;display:flex;align-items:center;"
+                       "justify-content:center;height:100vh;text-align:center'>"
+                       "<div><h1>&%23128058; Camofox is awake</h1>"
+                       "<p>This placeholder tab keeps the browser alive.<br>"
+                       "The agent browses in tabs of this SAME window, with your logins.<br>"
+                       "To log in yourself: use the agent's window, or open a new tab"
+                       " with the %2B button - do NOT use this tab.</p></div></body>")
+
+          def req(method, path, body=None, timeout=20):
+              data = json.dumps(body).encode() if body is not None else None
+              r = urllib.request.Request(BASE + path, data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(r, timeout=timeout) as f:
+                  raw = f.read().decode() or "{}"
+              try:
+                  return json.loads(raw)
+              except Exception:
+                  return {}
+
+          def restore_cookies():
+              # Fresh engine/session starts with ZERO cookies - re-import the
+              # saved logins so the user never has to log in again.
+              try:
+                  with open(STATE) as f:
+                      cookies = (json.load(f) or {}).get("cookies") or []
+              except Exception:
+                  return
+              for i in range(0, len(cookies), 400):
+                  try:
+                      req("POST", "/sessions/boss-view/cookies",
+                          {"cookies": cookies[i:i + 400]}, timeout=30)
+                  except Exception:
+                      pass
+
+          def save_cookies():
+              # Export boss-view cookies+localStorage into the data-repo dir;
+              # the backup loop pushes it, so logins survive machine runs.
+              try:
+                  st = req("GET", "/sessions/boss-view/storage_state", timeout=30)
+              except Exception:
+                  return
+              if not isinstance(st, dict) or not st.get("cookies"):
+                  return
+              try:
+                  os.makedirs(os.path.dirname(STATE), exist_ok=True)
+                  tmp = STATE + ".tmp"
+                  with open(tmp, "w") as f:
+                      json.dump(st, f)
+                  os.replace(tmp, STATE)
+              except Exception:
+                  pass
+
+          tab = None
+          while True:
+              try:
+                  st = req("GET", "/vnc/status", timeout=8)
+                  if not st.get("running"):
+                      try:
+                          req("POST", "/start", {}, timeout=40)
+                      except Exception:
+                          pass
+                      time.sleep(15)
+                  if tab:
+                      try:
+                          req("POST", "/tabs/" + str(tab) + "/refresh", {}, timeout=30)
+                      except Exception:
+                          tab = None
+                  if not tab:
+                      for target in (IDLE_PAGE, "about:blank"):
+                          try:
+                              resp = req("POST", "/tabs", {"userId": "boss-view",
+                                         "sessionKey": "view", "url": target}, timeout=60)
+                              tab = (resp.get("id") or resp.get("tabId") or
+                                     (resp.get("tab") or {}).get("id"))
+                              if tab:
+                                  break
+                          except Exception:
+                              continue
+                      if tab:
+                          restore_cookies()
+                  save_cookies()
+              except Exception:
+                  pass
+              time.sleep(120)
+          PYKA
+            CAMOFOX_STATE_FILE="$HERMES_HOME/data/camofox-profiles/boss-view-storage.json" nohup python3 /tmp/camofox-keepalive.py > /tmp/camofox-keepalive.log 2>&1 &
+            echo "Camofox warm start sent; keepalive keeps engine + placeholder tab alive (no more idle shutdown)"
+          fi
+          [ -f /tmp/camofox_url ] || echo "::warning::Camofox not reachable - built-in tools fall back to visible Chrome"
+          # FALLBACK ONLY: launch a visible Chrome (with CDP) if and only if
+          # the Camofox server did NOT come up, so the built-in tools still
+          # have a browser to drive. Otherwise NO Chrome opens.
+          if [ ! -f /tmp/camofox_url ]; then
+            BROWSER_BIN=$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)
+            if [ -n "$BROWSER_BIN" ]; then
+              mkdir -p "$HERMES_HOME/chrome-profile"
+              nohup "$BROWSER_BIN" --remote-debugging-port=9223 \
+                --user-data-dir="$HERMES_HOME/chrome-profile" \
+                --no-first-run --no-default-browser-check --disable-gpu \
+                --window-size=1600,900 about:blank > /tmp/chrome.log 2>&1 &
+              echo "Camofox down - started visible Chrome fallback (CDP 9223)"
+            else
+              echo "::warning::No Camofox and no Chrome found - built-in tools will be headless"
+            fi
+          else
+            echo "Camofox is the default browser - Chrome NOT started"
+          fi
+
           # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
           # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
           # port 6080 (tunnel + link are added in the Notify start step).
-          # View-only + password so nobody can hijack the desktop. NOTE: VNC
+          # FULL CONTROL: your mouse + keyboard work in the view, so you can
+          # step in for manual tasks (login pages, captchas, tweaks). Still
+          # password-gated so nobody else can hijack the desktop. NOTE: VNC
           # passwords only use the FIRST 8 characters of PANEL_TOKEN.
-          x11vnc -display :99 -forever -shared -viewonly -bg -quiet \
+          x11vnc -display :99 -forever -shared -repeat -bg -quiet \
             -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
           nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           echo "Live desktop view server running on :6080"
@@ -892,7 +1112,7 @@ jobs:
           if [ "$bad_n" -gt 0 ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="🚨 Hermes: ${bad_n} NVIDIA key(s) dead (auth failed) - ${n} still working" > /dev/null || true
+              --data-urlencode text="🚨 Hermes: ${bad_n} NVIDIA key(s) dead (auth failed) - ${n} still working" > /dev/null || true
           fi
           if [ "$n" -eq 0 ]; then
             echo "::error::No working NVIDIA key — secret is empty or every key failed the auth check"
@@ -919,7 +1139,7 @@ jobs:
           if [ "$bad_m" -gt 0 ]; then
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="🚨 Hermes: ${bad_m} Mistral key(s) dead (auth failed) - ${m} still working" > /dev/null || true
+              --data-urlencode text="🚨 Hermes: ${bad_m} Mistral key(s) dead (auth failed) - ${m} still working" > /dev/null || true
           fi
 
           # make the split keys visible to this shell + panel process
@@ -955,7 +1175,7 @@ jobs:
             TG_API="https://api.telegram.org"
             curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="⚠️ No model pool selected yet. Open the panel, tick your models and press Apply: ${PANEL_URL} (password = PANEL_TOKEN secret). Waiting up to 60 min..." > /dev/null || true
+              --data-urlencode text="⚠️ No model pool selected yet. Open the panel, tick your models and press Apply: ${PANEL_URL} (password = PANEL_TOKEN secret). Waiting up to 60 min..." > /dev/null || true
             for i in $(seq 1 240); do
               pool_ok && break
               sleep 15
@@ -971,7 +1191,7 @@ jobs:
             echo "::warning::All saved models are dead/EOL — pick a fresh pool: $PANEL_URL"
             curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="⚠️ All your saved models were retired by the provider — pool auto-cleaned. Open the panel and apply a fresh pool: ${PANEL_URL}" > /dev/null || true
+              --data-urlencode text="⚠️ All your saved models were retired by the provider — pool auto-cleaned. Open the panel and apply a fresh pool: ${PANEL_URL}" > /dev/null || true
             for i in $(seq 1 240); do
               pool_ok && break
               sleep 15
@@ -1030,6 +1250,24 @@ jobs:
           CAMOUFOX_URL=ws://127.0.0.1:9222/hermes
           GROQ_API_KEY=${GROQ_API_KEY}
           EOF
+          # Hermes official Camofox mode - routes built-in browser_* tools
+          # through the anti-detect server (flag written in step 4 on success)
+          if [ -f /tmp/camofox_url ]; then
+            echo "CAMOFOX_URL=$(cat /tmp/camofox_url)" >> "$HERMES_HOME/.env"
+            # fix48: pin built-in browser tools to the SAME Camofox identity
+            # the user watches + logs into (the keepalive placeholder
+            # session "boss-view"). Hermes docs "Externally managed Camofox
+            # sessions": setting user_id makes Hermes share that window,
+            # profile and cookie jar, skip destructive cleanup and never
+            # DELETE the session. Without it Hermes invents a RANDOM
+            # ephemeral userId per task = fresh logged-out WINDOW each time
+            # (the "multiple windows" + "ignores my logins" complaints).
+            # session_key stays UNSET on purpose: Hermes opens its OWN tab
+            # per task instead of adopting the placeholder tab, so the
+            # keepalive's 2-min refresh never reloads the agent's page.
+            echo "CAMOFOX_USER_ID=boss-view" >> "$HERMES_HOME/.env"
+            echo "CAMOFOX_URL set - built-in browsing is anti-detect (shared boss-view session)"
+          fi
 
       # ── 8. Standing instructions for the agent (auto save-to-file) ──
       - name: Write agent instructions
@@ -1054,9 +1292,10 @@ jobs:
             ~/.hermes/work/ before doing anything else with it.
             Platform uploads land in a temporary cache that gets auto-deleted;
             the ~/.hermes/work/ copy is the only one that survives.
-          - VOICE IN, VOICE OUT: if the incoming Telegram or Slack message was
-            a VOICE / audio message, reply with VOICE too. Send your normal text
-            answer first, then speak it by running:
+          - ALWAYS VOICE-REPLY ON TELEGRAM & SLACK: for EVERY reply you send
+            over Telegram or Slack, send your normal text answer first and
+            then ALSO speak it - every single time, not only when the incoming
+            message was a voice note. Speak it by running:
               curl -s -X POST http://localhost:7777/voicereply \
                 -H "X-Token: $PANEL_TOKEN" -H 'Content-Type: application/json' \
                 -d '{"text":"<your reply text>","chat_id":"<telegram chat id>"}'
@@ -1064,9 +1303,10 @@ jobs:
             chat_id to use the default Telegram chat. Keep spoken replies short
             (2-4 sentences) and skip code blocks and URLs. The endpoint speaks
             with the Supertonic on-device model (Bangla automatically uses the
-            Edge Bangla voice).
-          - SENDING FILES TO THE BOSS (screenshots, video, any file): the
-            Jarvis HUD can now show files inline in the chat. Whenever the
+            Edge Bangla voice). This voice service runs locally on
+            127.0.0.1:7777; the old Jarvis web panel has been removed.
+          - SENDING FILES TO THE BOSS (screenshots, video, any file): any
+            file you save is delivered inline into the Telegram/Slack chat. Whenever the
             user asks you for a screenshot, recording, report, export or ANY
             file, you MUST save it into the outbox folder:
               ~/.hermes/work/outputs/
@@ -1085,12 +1325,98 @@ jobs:
             the user you cannot send files - save it to the outbox instead.
             Files are served only from ~/.hermes/work, ~/Desktop, ~/Pictures,
             ~/Videos, ~/Downloads and /tmp, so keep outputs in those places.
-          - BROWSER WORK MUST BE VISIBLE: the user watches this machine's
-            desktop live over VNC. Your built-in browser tools are already
-            wired to a visible Chrome. When you write your OWN browser
-            scripts (camoufox / playwright / selenium), ALWAYS pass
-            headless=False — NEVER headless=True or headless='virtual' — so
-            the window renders on the shared display the user is watching.
+          - BROWSER: your built-in browser_* tools run through Camofox - an
+            anti-detect Camoufox browser (Firefox with C++-level fingerprint
+            spoofing), so sites cannot detect or track your automation. It
+            renders on its OWN virtual display, NOT the main :99 desktop:
+            the user watches and controls it via the dedicated "Camofox
+            browser" noVNC link from the start message. A keepalive keeps
+            the engine awake with a placeholder tab under userId
+            "boss-view" - NEVER close that tab or its session. Your browser
+            tools are PINNED to that SAME identity (CAMOFOX_USER_ID
+            boss-view): every tab you open lives in the user's ONE Camofox
+            window, sharing ONE profile and ONE cookie jar with their tabs,
+            so their logins (Facebook etc.) are ALREADY yours. USE YOUR
+            BUILT-IN browser_* TOOLS BY DEFAULT for EVERY website task -
+            visiting, logging in, posting, scraping, forms - never ask the
+            user which browser to use and never open a separate browser for
+            a job the built-in tools can do. When a task is done, CLOSE the
+            tabs you opened - but NEVER the placeholder tab or tabs the
+            user is using. The user can take the
+            mouse there to
+            log into accounts, solve captchas or step in - then you continue
+            in that SAME browser with their logged-in session. Logins persist
+            in ~/.hermes/data/camofox-profiles and survive across runs. If a
+            page needs the user's login or a captcha, OPEN a tab on that page
+            and KEEP it open (the window closes when no tabs are open), ASK
+            the user to log in via the Camofox browser link, wait for their
+            confirmation, then continue.
+            Writing your OWN browser scripts is a LAST RESORT for jobs the
+            built-in tools truly cannot do - that is a DIFFERENT browser
+            with NONE of the user's logins. If you must: connect
+            playwright/camoufox to ws://127.0.0.1:9222/hermes or ALWAYS pass
+            headless=False - NEVER headless=True or headless='virtual' - so
+            windows show on the shared display :99 (the main live desktop -
+            unlike the built-in Camofox tools). The visible Chrome
+            (CDP http://127.0.0.1:9223) is a last resort for CDP-only work;
+            assume sites can detect it.
+          - TYPING INTO WEB APPS (Facebook, Messenger, WhatsApp Web,
+            Instagram, X, Gmail, etc): NEVER inject text with CDP or
+            JavaScript (element.value=..., execCommand, innerHTML, synthetic
+            events). Rich chat boxes are React/contenteditable editors: the
+            injected text is NOT registered in the app's draft state, so the
+            send silently fails or sends empty. ALWAYS type like a human:
+            prefer your built-in browser tools (Camofox delivers REAL
+            keyboard/mouse events through Firefox's native input path), or
+            in your own scripts: page.click() the input first, then
+            page.keyboard.type(text, delay=80) - character-by-character -
+            then press Enter or click the app's real send button.
+          - VERIFY AFTER ACTING: after any send/submit/post, wait 2-3
+            seconds and CHECK the page - did the message appear in the chat
+            history? did the form advance? If not, retry ONCE with the
+            alternate submit path (Enter key vs send button). If it still
+            fails, take a screenshot, report exactly what you see, and ask
+            the user to step into the live desktop to unblock you. NEVER
+            claim success without seeing the result on the page, and NEVER
+            retry in a loop.
+          - ELEMENT MASTERY (work with ANY element on ANY website): be
+            methodical, not lucky.
+            1) SEE FIRST: take an accessibility/DOM snapshot (or a
+               screenshot) before acting. Target elements by their ROLE +
+               visible name / label / placeholder / aria-label - never by
+               guessed or brittle absolute coordinates.
+            2) WAIT FOR IT: modern sites (React/Vue/Angular) render late and
+               re-render. Wait until the element actually EXISTS, is VISIBLE
+               and STABLE before you act. Never act on the first paint.
+            3) CLEAR THE PATH: dismiss cookie banners, consent modals,
+               newsletter popups and overlays FIRST - they silently
+               intercept clicks. Then scroll the target into view.
+            4) GO DEEP: if the element is inside an IFRAME (checkouts,
+               captchas, embedded widgets) switch into that frame; if it is
+               in a SHADOW DOM, pierce the shadow root. Do not give up just
+               because a top-level query missed.
+            5) LADDER OF STRATEGIES: try role -> visible text -> label ->
+               placeholder -> aria-label -> nearby-label -> CSS/XPath. If
+               ALL selectors fail, FALL BACK TO VISION: screenshot, locate
+               the element visually, and click by its on-screen coordinates.
+            6) CONFIRM EACH STEP: after every click/type, check the page
+               actually changed (element appeared/disappeared, URL/route
+               moved) before the next step. Log what you did to the task
+               file so you can recover if interrupted.
+          - DESKTOP / PC CONTROL (drive ANY app in the live desktop, display
+            :99): you have real GUI-automation tools installed - xdotool
+            (mouse + keyboard), wmctrl (list/activate/move windows), scrot &
+            ImageMagick "import" (screenshots), tesseract-ocr (READ text off
+            the screen), and pyautogui (Python). ALWAYS export DISPLAY=:99.
+            Professional loop: SCREENSHOT -> locate the target (vision, or
+            tesseract OCR when you need exact on-screen text) -> ACT
+            (wmctrl -a "<window>" to focus, xdotool mousemove/click, xdotool
+            type --delay 80 "text", xdotool key ctrl+s / Return / Tab) ->
+            SCREENSHOT again to CONFIRM it worked. Prefer reliable keyboard
+            shortcuts over hunting through menus. Move deliberately (small
+            waits between actions) so the UI keeps up and the Boss can follow
+            on the live desktop. If you get stuck, screenshot, explain what
+            you see, and ask the Boss to step in via the live desktop.
 
           # Persona: JARVIS-style professional assistant
           - Your name is "Agent". Never call yourself JARVIS.
@@ -1137,11 +1463,28 @@ jobs:
           # more API retries — pool rotation sometimes needs several attempts
           hermes config set agent.api_max_retries 8
           hermes config set web.search_backend searxng
-          # point the built-in browser tools at the VISIBLE Chrome on :99
-          # (CDP port 9223, started in step 4) — live view shows every action
-          hermes config set browser.cdp_url "http://127.0.0.1:9223"
-          # edge-tts CLI is needed by the tts toolset (free Microsoft voices)
-          pip install -q edge-tts || true
+          # Built-in browser tools: Camofox anti-detect mode when the server
+          # came up (CAMOFOX_URL in .env routes ALL browser_* tools through
+          # it). Otherwise fall back to the visible Chrome over CDP.
+          if [ -f /tmp/camofox_url ]; then
+            # fix48: same shared identity in config.yaml too (the .env var
+            # takes precedence; this covers direct hermes runs/doctor)
+            hermes config set browser.camofox.user_id boss-view
+            echo "Built-in browser tools: Camofox anti-detect (no CDP beacons) - shared boss-view session"
+          else
+            hermes config set browser.cdp_url "http://127.0.0.1:9223"
+            echo "Built-in browser tools: visible Chrome fallback (CDP :9223)"
+          fi
+          # edge-tts CLI is needed by the tts toolset (free Microsoft voices).
+          # ALWAYS upgrade to the latest release: Microsoft periodically breaks
+          # old edge-tts versions (auth/DRM token changes), which surfaces as
+          # "NoAudioReceived" from the built-in text_to_speech tool. The hermes
+          # venv is restored from CACHE with its own stale edge_tts copy that
+          # the built-in tool imports, so upgrade BOTH copies every run.
+          pip install -q -U edge-tts || true
+          "$HERMES_HOME/hermes-agent/venv/bin/pip" install -q -U edge-tts \
+            && echo "edge-tts upgraded inside hermes venv: $("$HERMES_HOME/hermes-agent/venv/bin/pip" show edge-tts 2>/dev/null | awk '/^Version/{print $2}')" \
+            || echo "::warning::could not upgrade edge-tts inside hermes venv - built-in TTS may fail with NoAudioReceived"
           hermes config set tts.provider edge
 
           hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron"]'
@@ -1191,7 +1534,7 @@ jobs:
           echo "=================================================="
           echo "::notice title=🖥️ Hermes WebUI::$WEBUI_URL (password = PANEL_TOKEN secret)"
 
-      # ── 10b. Agent HUD — professional voice command deck (full agent brain) ──
+      # ── 10b. Voice reply service (Telegram / Slack TTS + file delivery) ──
       # Redesigned interface: professional dark HUD with a layered animated arc
       # reactor, smart end-of-speech detection (auto-sends when you stop
       # talking), barge-in interrupt (speak over the agent to cut it off),
@@ -1201,7 +1544,49 @@ jobs:
       # Every command runs the FULL Hermes agent via `hermes chat -q`.
       # Voice replies use FREE Microsoft Edge neural TTS (no key needed);
       # pick + preview voices in the VOICE MODEL panel. Protected by PANEL_TOKEN.
-      - name: Start Agent HUD interface
+      - name: Start Hermes Dashboard
+        run: |
+          # Official Nous management dashboard (settings, API keys, session
+          # monitor). Behind a public tunnel it MUST have auth: a non-loopback
+          # bind engages the built-in auth gate, and we feed it the bundled
+          # username/password provider (password = PANEL_TOKEN, like the rest).
+          # An auth-free loopback dashboard must NEVER be tunneled - it can
+          # read and write the .env secrets file.
+          DASH_SECRET=$(openssl rand -base64 32)
+          {
+            echo "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=boss"
+            echo "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${PANEL_TOKEN}"
+            echo "HERMES_DASHBOARD_BASIC_AUTH_SECRET=${DASH_SECRET}"
+          } >> "$HERMES_HOME/.env"
+          chmod 600 "$HERMES_HOME/.env" || true
+          nohup "$HOME/.local/bin/hermes" dashboard --no-open --host 0.0.0.0 --port 9119 \
+            > /tmp/dashboard.log 2>&1 &
+          ok=0
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:9119/api/status >/dev/null 2>&1 && { ok=1; break; }
+            sleep 3
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::warning::Hermes dashboard did not come up - skipping it this run"
+            tail -n 30 /tmp/dashboard.log 2>/dev/null || true
+            exit 0
+          fi
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:9119 > /tmp/dash-tunnel.log 2>&1 &
+          DASHBOARD_URL=""
+          for i in $(seq 1 30); do
+            DASHBOARD_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/dash-tunnel.log | head -n1 || true)
+            [ -n "$DASHBOARD_URL" ] && break
+            sleep 2
+          done
+          if [ -z "$DASHBOARD_URL" ]; then
+            echo "::warning::Dashboard tunnel failed - dashboard only reachable inside the runner"
+            exit 0
+          fi
+          echo "DASHBOARD_URL=$DASHBOARD_URL" >> "$GITHUB_ENV"
+          echo "::notice title=Hermes Dashboard::$DASHBOARD_URL (user: boss / password = PANEL_TOKEN secret)"
+        env:
+          PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+      - name: Start voice reply service
         env:
           PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -2810,24 +3195,17 @@ jobs:
               out["now"] = time.time()
               return jsonify(**out)
 
-          app.run(host="0.0.0.0", port=7777, threaded=True)
+          app.run(host="127.0.0.1", port=7777, threaded=True)
           PYJARVIS
           sudo apt-get install -y -q ffmpeg >/dev/null 2>&1 || true
-          pip install -q flask requests edge-tts || true
+          pip install -q flask requests || true
+          pip install -q -U edge-tts || true
           # onnxruntime/soundfile are what Supertonic needs to run on CPU
           pip install -q supertonic onnxruntime soundfile numpy > /tmp/supertonic_pip.log 2>&1 || echo '::warning::supertonic install failed - Edge TTS still works'
           nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
           sleep 2
-          curl -fs http://localhost:7777/ >/dev/null || { echo '::warning::Agent HUD failed to start'; cat /tmp/jarvis.log; }
-          nohup cloudflared tunnel --no-autoupdate --url http://localhost:7777 > /tmp/jarvis-tunnel.log 2>&1 &
-          JARVIS_URL=""
-          for i in $(seq 1 30); do
-            JARVIS_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/jarvis-tunnel.log | head -n1 || true)
-            [ -n "$JARVIS_URL" ] && break
-            sleep 2
-          done
-          echo "JARVIS_URL=$JARVIS_URL" >> "$GITHUB_ENV"
-          echo "::notice title=🤖 Agent HUD::${JARVIS_URL:-tunnel failed}"
+          curl -fs http://127.0.0.1:7777/ >/dev/null 2>&1 || { echo '::warning::voice reply service failed to start'; cat /tmp/jarvis.log; }
+          echo "Voice reply service running locally on 127.0.0.1:7777 (powers Telegram/Slack voice + inline file delivery). Jarvis web panel removed - no public tunnel."
 
 
 
@@ -2863,7 +3241,7 @@ jobs:
           for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
           for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
           for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
-          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
             [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
           done
           find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
@@ -2915,7 +3293,7 @@ jobs:
             for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
             for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
             for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
-            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
               [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
             done
             find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
@@ -2973,18 +3351,40 @@ jobs:
             [ -n "$LIVEVIEW_URL" ] && break
             sleep 2
           done
-          [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html"
+          [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
           echo "::notice title=🔭 Live desktop view::${LIVEVIEW_URL:-tunnel failed}"
+          # fourth quick tunnel: CAMOFOX BROWSER VIEW. The browser renders on
+          # its OWN private Xvfb (never :99), exposed by the camofox VNC
+          # plugin as noVNC on :6081 - see the Start Camoufox step.
+          BROWSERVIEW_URL=""
+          if [ -f /tmp/camofox_url ]; then
+            nohup cloudflared tunnel --no-autoupdate --url http://localhost:6081 > /tmp/browserview-tunnel.log 2>&1 &
+            for i in $(seq 1 30); do
+              BROWSERVIEW_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/browserview-tunnel.log | head -n1 || true)
+              [ -n "$BROWSERVIEW_URL" ] && break
+              sleep 2
+            done
+            [ -n "$BROWSERVIEW_URL" ] && BROWSERVIEW_URL="${BROWSERVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
+          fi
+          echo "::notice title=🦊 Camofox browser view::${BROWSERVIEW_URL:-not available}"
           TG_API="https://api.telegram.org"
-          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          TG_RESP=$(curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
+            --data-urlencode text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
           🎛️ Model panel: ${PANEL_URL}
           🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
-          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (pass: first 8 chars of PANEL_TOKEN)
-          🤖 Agent HUD: ${JARVIS_URL:-not available} (token: your PANEL_TOKEN)
+          📊 Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
+          ⏱ Run length: ${RUN_HOURS_INPUT:-5.5} hours
+          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (agent GUI + fallback Chrome - FULL control - pass: first 8 chars of PANEL_TOKEN)
+          🦊 Camofox browser: ${BROWSERVIEW_URL:-not available} (the agent's ACTUAL browser - log into your accounts HERE, logins are saved - the agent works in THIS same window and sees your logins (placeholder tab keeps it awake) - brief black screen/disconnect = engine restarting, self-heals in ~1 min - same pass)
           🔑 Password: your PANEL_TOKEN secret
-          Use /model in Telegram or !model in Slack to switch models" > /dev/null
+          Use /model in Telegram or !model in Slack to switch models")
+          case "$TG_RESP" in
+            *'"ok":true'*) echo "Start notification delivered to Telegram" ;;
+            *) echo "::warning::Telegram start notification FAILED - grab the links from the line below. Response: $(echo "$TG_RESP" | head -c 200)" ;;
+          esac
+          # belt-and-braces: links always land in this step log too
+          echo "LINKS: model=${PANEL_URL:-n/a} | webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a} | browser=${BROWSERVIEW_URL:-n/a}"
 
       # ── 13. Run gateway with time budget + anti-stuck watchdog ──
       - name: Run Hermes gateway
@@ -3116,6 +3516,13 @@ jobs:
           pkill -f "hermes gateway" >/dev/null 2>&1 || true
           sleep 2
 
+          # Manual run-hours input (short test runs). Clamped 6..345 min so a
+          # typo can neither instant-kill the run nor blow past the GitHub 6h
+          # job limit (job timeout-minutes: 350). Empty input = default 330.
+          if [ -n "$RUN_HOURS_INPUT" ]; then
+            RUN_MINUTES=$(awk -v h="$RUN_HOURS_INPUT" 'BEGIN{m=int(h*60+0.5); if(m<6)m=6; if(m>345)m=345; print m}')
+            echo "Manual duration selected: ${RUN_HOURS_INPUT}h -> ${RUN_MINUTES} minutes"
+          fi
           JOB_START=$(cat /tmp/job_start)
           END=$(( JOB_START + RUN_MINUTES * 60 ))
           while true; do
@@ -3175,7 +3582,7 @@ jobs:
           for d in "$HOME/.config"/hermes* "$HOME/.config"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/config/" || true; done
           for d in "$HOME/.local/share"/hermes* "$HOME/.local/share"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/share/" || true; done
           for d in "$HOME/.local/state"/hermes* "$HOME/.local/state"/nous*; do [ -e "$d" ] && rsync -a --delete "$d" "$HERMES_HOME/xdg-mirror/state/" || true; done
-          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins tools agents config configs data db; do
+          for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
             [ -e "$HERMES_HOME/hermes-agent/$d" ] && rsync -a --delete "$HERMES_HOME/hermes-agent/$d" "$HERMES_HOME/agent-state/" || true
           done
           find "$HERMES_HOME/hermes-agent" -maxdepth 1 -type f \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.txt' -o -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -exec cp -a {} "$HERMES_HOME/agent-state/" \; 2>/dev/null || true
@@ -3219,4 +3626,4 @@ jobs:
           TG_API="https://api.telegram.org"
           curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_USER_ID}" \
-            -d text="🔴 Hermes Agent run FAILED — check Actions logs" > /dev/null
+            --data-urlencode text="🔴 Hermes Agent run FAILED — check Actions logs" > /dev/null
