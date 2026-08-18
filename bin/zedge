@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec python3 "$HOME/.hermes/hermes-agent/skills/zedge-automation/scripts/zedge_tool.py" "$@"
