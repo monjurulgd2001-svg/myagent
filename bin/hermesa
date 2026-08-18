@@ -1,2 +1,0 @@
-#!/usr/bin/env bash
-exec python3 "$HOME/.hermes/hermes-agent/skills/hermesa-agent/scripts/hermesa_bot.py" "$@"
