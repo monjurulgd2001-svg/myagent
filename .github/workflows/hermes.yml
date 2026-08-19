@@ -1,0 +1,1908 @@
+name: Hermes Agent — Telegram + Slack + NVIDIA/Mistral Pool
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_hours:
+        description: "Run duration in HOURS (e.g. 0.5, 1, 3). Leave empty for the full 5.5h"
+        required: false
+        default: ""
+
+# actions:write lets the last step dispatch the NEXT run (24/7 chaining)
+# using the built-in GITHUB_TOKEN - no extra secret needed.
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: hermes-agent
+  cancel-in-progress: false
+
+env:
+  # Bangladesh time everywhere: runner shell, python, desktop clock, logs
+  TZ: Asia/Dhaka
+  RUN_MINUTES: 330
+  # optional manual-run override, raw hours string (may be empty)
+  RUN_HOURS_INPUT: ${{ github.event.inputs.run_hours }}
+  HERMES_HOME: /home/runner/.hermes
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ── Checkout: all inbuilt feature code/files now live in this repo ──
+      # (scripts/, skills/, bin/, pool/, email/, agents/, jarvis/, system/, config/)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      # ── 0. Load configuration from the Firebase secret vault ──
+      # All credentials can be managed on the config website (index.html →
+      # Firebase Realtime Database). Only the 4 FIREBASE_* bootstrap secrets
+      # need to live in GitHub. Every value found in Firebase wins; anything
+      # missing falls back to the GitHub secret of the same name, so this is
+      # fully backward compatible (no Firebase configured = works as before).
+      - name: Load configuration from Firebase vault
+        env:
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          FIREBASE_EMAIL: ${{ secrets.FIREBASE_EMAIL }}
+          FIREBASE_PASSWORD: ${{ secrets.FIREBASE_PASSWORD }}
+          GH_PANEL_TOKEN: ${{ secrets.PANEL_TOKEN }}
+          GH_NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
+          GH_MISTRAL_KEYS: ${{ secrets.MISTRAL_KEYS }}
+          GH_TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GH_TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          GH_TELEGRAM_EXTRA_ALLOWED: ${{ secrets.TELEGRAM_EXTRA_ALLOWED }}
+          GH_TELEGRAM_GROUP_IDS: ${{ secrets.TELEGRAM_GROUP_IDS }}
+          GH_TELEGRAM_GROUP_ROLE: ${{ secrets.TELEGRAM_GROUP_ROLE }}
+          GH_FACEBOOK_PAGE_TOKEN: ${{ secrets.FACEBOOK_PAGE_TOKEN }}
+          GH_FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+          GH_SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          GH_SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          GH_SLACK_USER_ID: ${{ secrets.SLACK_USER_ID }}
+          GH_GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GH_GMAIL_ACCOUNTS: ${{ secrets.GMAIL_ACCOUNTS }}
+          GH_DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          GH_STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
+          GH_HERMESA_BOT_ID: ${{ secrets.HERMESA_BOT_ID }}
+          GH_HERMESA_DB_URL: ${{ secrets.HERMESA_DB_URL }}
+          GH_ZEDGE_ACCOUNTS: ${{ secrets.ZEDGE_ACCOUNTS }}
+          GH_ZEDGE_PROXIES: ${{ secrets.ZEDGE_PROXIES }}
+          GH_ZEDGE_WG_1: ${{ secrets.ZEDGE_WG_1 }}
+          GH_ZEDGE_WG_2: ${{ secrets.ZEDGE_WG_2 }}
+          GH_ZEDGE_WG_3: ${{ secrets.ZEDGE_WG_3 }}
+          GH_ZEDGE_R2_WORKER_URL: ${{ secrets.ZEDGE_R2_WORKER_URL }}
+          GH_ZEDGE_DB_URL_1: ${{ secrets.ZEDGE_DB_URL_1 }}
+          GH_ZEDGE_DB_URL_2: ${{ secrets.ZEDGE_DB_URL_2 }}
+          GH_ZEDGE_DB_URL_3: ${{ secrets.ZEDGE_DB_URL_3 }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/firebase_vault.py"
+
+          # small publisher the runner uses to push live links / heartbeat
+          # to runtime/<uid> in Firebase (shown on the config website).
+          cp "$GITHUB_WORKSPACE/scripts/fbpub.py" /tmp/fbpub.py
+
+          # pool puller: re-reads MODEL_POOL from the website vault at any
+          # time and rewrites pool.json. This is what makes the config
+          # website the ONLY place you ever touch — no model panel needed.
+          #   exit 0 = pool on disk   exit 1 = nothing applied yet
+          #   prints CHANGED... when the pool differs from what is on disk
+          cp "$GITHUB_WORKSPACE/scripts/fbpool.py" /tmp/fbpool.py
+
+          # keep the Firebase session details available to later steps
+          {
+            echo "FIREBASE_API_KEY=${FIREBASE_API_KEY:-}"
+            echo "FIREBASE_DB_URL=${FIREBASE_DB_URL:-}"
+            echo "FIREBASE_EMAIL=${FIREBASE_EMAIL:-}"
+            echo "FIREBASE_PASSWORD=${FIREBASE_PASSWORD:-}"
+          } >> "$GITHUB_ENV"
+
+      # ── 1. Pull persisted data from private repo ──
+      - name: Pull data repo
+        run: |
+          date +%s > /tmp/job_start
+          mkdir -p "$HERMES_HOME"
+          # ── UNIFIED STATE RESTORE (single source of truth) ──
+          # EVERYTHING (files, skills, chats db, memory, config) is saved to
+          # ONE branch: `state`. When it exists we restore ONLY from it - no
+          # more mixing three differently-aged branches into a frankenstein.
+          # The legacy main/backup/hot restore below runs only as a one-time
+          # migration fallback for repos that pre-date the unified branch.
+          git clone --depth 1 -b state "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/datastate 2>/dev/null || true
+          if [ -d /tmp/datastate/.git ] && [ -n "$(ls -A /tmp/datastate 2>/dev/null | grep -v '^\.git$')" ]; then
+            echo "Unified state branch found - single-source restore (saved $(git -C /tmp/datastate log -1 --format=%cI))"
+            rm -rf /tmp/data
+            mv /tmp/datastate /tmp/data
+          else
+            echo "No unified state branch yet - legacy restore (main+backup+hot); will migrate on first save"
+            git clone --depth 1 "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/data || true
+            # ── RESTORE FROM BACKUP BRANCH TOO ──
+            # 30-min backups go to the `backup` branch; the final push goes to
+            # `main`. If the previous run crashed or was cancelled, `backup` is
+            # NEWER than `main` — overlay it so nothing since the last final
+            # push is lost.
+            git clone --depth 1 -b backup "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/databk 2>/dev/null || true
+            if [ -d /tmp/databk/.git ] && [ -d /tmp/data/.git ]; then
+              MAIN_TS=$(git -C /tmp/data log -1 --format=%ct 2>/dev/null || echo 0)
+              BK_TS=$(git -C /tmp/databk log -1 --format=%ct 2>/dev/null || echo 0)
+              if [ "$BK_TS" -gt "$MAIN_TS" ]; then
+                echo "backup branch is newer — overlaying it onto main restore"
+                rsync -a --exclude='.git' /tmp/databk/ /tmp/data/ || true
+              fi
+            fi
+            # ── `hot` branch: 5-min critical saves + cancel-time emergency save.
+            # Almost always the freshest copy of skills / brain / tasks, so it is
+            # overlaid last when it is newer than what we already restored.
+            git clone --depth 1 -b hot "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" /tmp/datahot 2>/dev/null || true
+            if [ -d /tmp/datahot/.git ] && [ -d /tmp/data/.git ]; then
+              CUR_TS=$(git -C /tmp/data log -1 --format=%ct 2>/dev/null || echo 0)
+              [ -d /tmp/databk/.git ] && BK2=$(git -C /tmp/databk log -1 --format=%ct 2>/dev/null || echo 0) || BK2=0
+              [ "$BK2" -gt "$CUR_TS" ] && CUR_TS=$BK2
+              HOT_TS=$(git -C /tmp/datahot log -1 --format=%ct 2>/dev/null || echo 0)
+              if [ "$HOT_TS" -ge "$CUR_TS" ]; then
+                echo "hot branch is freshest — overlaying skills/brain/tasks"
+                rsync -a --exclude='.git' /tmp/datahot/ /tmp/data/ || true
+              fi
+            elif [ -d /tmp/datahot/.git ]; then
+              mkdir -p /tmp/data
+              rsync -a --exclude='.git' /tmp/datahot/ /tmp/data/ || true
+            fi
+          fi
+          if [ -d /tmp/data ]; then
+            rm -f /tmp/data/.env
+            rsync -a --exclude='.git' /tmp/data/ "$HERMES_HOME/" || true
+            find "$HERMES_HOME" -name "*.gh-chunk.000" | while read -r first; do
+              base="${first%.gh-chunk.000}"
+              cat "${base}".gh-chunk.* > "$base"
+              rm -f "${base}".gh-chunk.*
+              echo "Reassembled: $base"
+            done
+            # a restored WAL-mode SQLite db must never start with a stale
+            # journal from a different copy of the main file
+            rm -f "$HERMES_HOME/state.db-wal" "$HERMES_HOME/state.db-shm"
+          fi
+
+          # ── Put restored OUTSIDE-tree Hermes state back in place ──
+          # The backup loop mirrors ~/.config/hermes*, ~/.local/share/hermes*
+          # and ~/.local/state/hermes* into ~/.hermes/xdg-mirror/. Restore them
+          # to their real homes so skills/brain/config are live again.
+          for pair in "config:.config" "share:.local/share" "state:.local/state"; do
+            srcd="$HERMES_HOME/xdg-mirror/${pair%%:*}"
+            dstd="$HOME/${pair##*:}"
+            if [ -d "$srcd" ] && [ -n "$(ls -A "$srcd" 2>/dev/null)" ]; then
+              mkdir -p "$dstd"
+              rsync -a "$srcd/" "$dstd/"
+              echo "Restored $dstd from backup"
+            fi
+          done
+
+          # ── PREFETCH (speed): download cloudflared in the BACKGROUND now,
+          # in parallel with the setup steps in between, so it is already
+          # installed when the router step needs it. (LiteLLM's 1-2 GB
+          # docker image is GONE — replaced by the built-in pool router.)
+          nohup bash -c 'curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared.dl && sudo install -m 755 /tmp/cloudflared.dl /usr/local/bin/cloudflared' > /tmp/cloudflared-dl.log 2>&1 &
+
+      # ── 1b. Preinstalled environment cache ──
+      # The runner VM is WIPED after every run, so nothing can be truly
+      # "pre-installed". This cache is the next best thing: a snapshot of
+      # installed Hermes + all pip wheels + the Camoufox browser binary,
+      # restored in seconds at the start of each run instead of being
+      # re-downloaded. The first run builds it; every later run refreshes
+      # it automatically (rolling key).
+      - name: Restore preinstalled Hermes environment (cache)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local
+            ~/.cache/pip
+            ~/.cache/camoufox
+            ~/.cache/camofox-browser
+          key: hermes-env-v1-${{ github.run_id }}
+          restore-keys: |
+            hermes-env-v1-
+
+      # ── 2. Install Hermes Agent (skipped when restored from cache) ����─
+      - name: Install Hermes Agent
+        run: |
+          # Stash any user state sitting in the agent dir BEFORE wiping it
+          # (belt-and-braces: normally agent-state/ already holds a copy).
+          KEEP=/tmp/hermes-keep; rm -rf "$KEEP"; mkdir -p "$KEEP"
+          if [ -d "$HERMES_HOME/hermes-agent" ]; then
+            for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts plugins agents config configs data db; do
+              [ -e "$HERMES_HOME/hermes-agent/$d" ] && cp -a "$HERMES_HOME/hermes-agent/$d" "$KEEP/" || true
+            done
+          fi
+          # ── FORCE-RESTORE HELPER (fix: user state must WIN) ──
+          # The --ignore-existing merges below protect fresh CODE, but they
+          # also let installer-created defaults (same-named skill/config
+          # files) SHADOW the user's saved versions, silently reverting
+          # skills/notes every run. This helper force-overlays the user's
+          # STATE dirs on top after each merge, so saved state always wins.
+          force_restore_state() {
+            for srcroot in "$KEEP" "$HERMES_HOME/agent-state"; do
+              [ -d "$srcroot" ] || continue
+              for d in skills skill brain brains memory memories tasks task knowledge notes sessions session prompts agents config configs data db; do
+                [ -e "$srcroot/$d" ] && rsync -a --exclude='venv' --exclude='.venv' "$srcroot/$d" "$HERMES_HOME/hermes-agent/" || true
+              done
+            done
+          }
+          rm -rf "$HERMES_HOME/hermes-agent"
+          # ~/.local/bin/hermes is only a SHIM that execs
+          # $HERMES_HOME/hermes-agent/venv/bin/python. The Actions cache
+          # restores the shim but NOT the venv (we wiped it just above),
+          # so "shim exists => skip install" left a launcher pointing at
+          # nothing: every hermes call died with "No such file or
+          # directory" and exit 127. Install whenever the venv is gone.
+          if [ -x "$HOME/.local/bin/hermes" ] && [ -x "$HERMES_HOME/hermes-agent/venv/bin/python" ]; then
+            echo "Hermes launcher + venv both present — skipping download/install"
+          else
+            echo "Installing Hermes (venv missing after wipe / first run)..."
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          fi
+          # ── KEEP HERMES CURRENT: self-update on EVERY run ──
+          # Cache restores can be days old; update to the latest release
+          # before anything is configured. Time-boxed and non-fatal: a
+          # flaky network must never kill the run, and the sanity check
+          # below reinstalls cleanly if an update leaves things broken.
+          echo "Running hermes update..."
+          if ! timeout 600 "$HOME/.local/bin/hermes" update; then
+            echo "::warning::hermes update failed or timed out - forcing a clean reinstall so we never run a mixed-version tree"
+            rm -rf "$HERMES_HOME/hermes-agent"
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          fi
+          # ── MERGE BACKED-UP USER STATE into the fresh agent dir ──
+          # skills / brain / tasks / memory added in earlier sessions come back
+          # from ~/.hermes/agent-state (pulled from the privatestorage repo).
+          if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
+            mkdir -p "$HERMES_HOME/hermes-agent"
+            rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            echo "Restored agent state: $(ls "$HERMES_HOME/agent-state" | tr '\n' ' ')"
+          fi
+          if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+            mkdir -p "$HERMES_HOME/hermes-agent"
+            rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+          fi
+          force_restore_state
+          # ── SANITY CHECK: hermes must actually be runnable ──
+          # Catch a broken install HERE with a clear message (and one
+          # self-heal attempt) instead of exit 127 five steps later.
+          if [ ! -x "$HERMES_HOME/hermes-agent/venv/bin/python" ] || ! "$HOME/.local/bin/hermes" --help >/dev/null 2>&1; then
+            echo "Hermes launcher broken — forcing one clean reinstall"
+            rm -rf "$HERMES_HOME/hermes-agent"
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+            if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
+              mkdir -p "$HERMES_HOME/hermes-agent"
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            fi
+            if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+              mkdir -p "$HERMES_HOME/hermes-agent"
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+            fi
+            force_restore_state
+          fi
+          if [ ! -x "$HERMES_HOME/hermes-agent/venv/bin/python" ] || ! "$HOME/.local/bin/hermes" --help >/dev/null 2>&1; then
+            echo "::error::Hermes install is broken (venv python missing or launcher fails). Failing fast so the chain does not spam failed runs."
+            exit 1
+          fi
+          # DEEP IMPORT CHECK: a stale code dir restored from backup can mix
+          # versions (old tools/registry.py + new model_tools.py) - every chat
+          # message then dies with ImportError. Catch and heal it HERE.
+          if ! (cd "$HERMES_HOME/hermes-agent" && timeout 120 ./venv/bin/python -c "import model_tools" >/dev/null 2>/tmp/impcheck.err); then
+            echo "::warning::Agent code failed the import check - forcing one clean reinstall. $(tail -c 200 /tmp/impcheck.err 2>/dev/null || true)"
+            rm -rf "$HERMES_HOME/hermes-agent"
+            curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+            if [ -d "$HERMES_HOME/agent-state" ] && [ -n "$(ls -A "$HERMES_HOME/agent-state" 2>/dev/null)" ]; then
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$HERMES_HOME/agent-state/" "$HERMES_HOME/hermes-agent/"
+            fi
+            if [ -n "$(ls -A "$KEEP" 2>/dev/null)" ]; then
+              rsync -a --ignore-existing --exclude='venv' --exclude='.venv' "$KEEP/" "$HERMES_HOME/hermes-agent/"
+            fi
+            force_restore_state
+            if ! (cd "$HERMES_HOME/hermes-agent" && timeout 120 ./venv/bin/python -c "import model_tools" >/dev/null 2>&1); then
+              echo "::error::Agent code still fails to import after a clean reinstall. Failing fast."
+              exit 1
+            fi
+          fi
+          echo "Hermes launcher verified OK"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # ── 2b. Setup Ringtone Auto-Silence Removal Generator Skill ──
+      - name: Setup Ringtone Auto-Silence Removal Generator Skill
+        run: |
+          echo "Installing Ringtone Generator Node.js & FFmpeg dependencies..."
+          npm install --prefix "$GITHUB_WORKSPACE" playwright playwright-extra puppeteer-extra-plugin-stealth ffmpeg-static fluent-ffmpeg || true
+          npx playwright install chromium --with-deps || true
+
+          # Create Hermes skills directories
+          SKILL_DEST="$HERMES_HOME/hermes-agent/skills/ringtone-generator"
+          mkdir -p "$SKILL_DEST"
+          mkdir -p "$HERMES_HOME/skills/ringtone-generator"
+
+          # ── EMBEDDED ringtone_generator.js (guaranteed on EVERY run) ──
+          # The repo checkout does not always contain this file, so the skill
+          # silently did nothing on machines without it. The full script is
+          # embedded here; a copy committed to the repo still wins below.
+          if [ ! -f "$GITHUB_WORKSPACE/ringtone_generator.js" ]; then
+            cp "$GITHUB_WORKSPACE/skills/ringtone-generator/ringtone_generator.js" "$GITHUB_WORKSPACE/ringtone_generator.js"
+            echo "ringtone_generator.js written from embedded copy ($(wc -l < "$GITHUB_WORKSPACE/ringtone_generator.js") lines)"
+          fi
+          # Deploy ringtone_generator.js and SKILL.md into runtime
+          if [ -f "$GITHUB_WORKSPACE/ringtone_generator.js" ]; then
+            cp -f "$GITHUB_WORKSPACE/ringtone_generator.js" "$HERMES_HOME/hermes-agent/"
+            cp -f "$GITHUB_WORKSPACE/ringtone_generator.js" "$HERMES_HOME/"
+            cp -f "$GITHUB_WORKSPACE/ringtone_generator.js" "$SKILL_DEST/"
+            cp -f "$GITHUB_WORKSPACE/ringtone_generator.js" "$HERMES_HOME/skills/ringtone-generator/"
+          fi
+          if [ -f "$GITHUB_WORKSPACE/skills/ringtone-generator/SKILL.md" ]; then
+            cp -f "$GITHUB_WORKSPACE/skills/ringtone-generator/SKILL.md" "$SKILL_DEST/"
+            cp -f "$GITHUB_WORKSPACE/skills/ringtone-generator/SKILL.md" "$HERMES_HOME/skills/ringtone-generator/"
+          elif [ -f "$GITHUB_WORKSPACE/SKILL.md" ]; then
+            cp -f "$GITHUB_WORKSPACE/SKILL.md" "$SKILL_DEST/"
+            cp -f "$GITHUB_WORKSPACE/SKILL.md" "$HERMES_HOME/skills/ringtone-generator/"
+          fi
+          # Fallback SKILL.md (only when the repo does not ship one) so the
+          # skill shows up in the run-start SKILL INDEX and `skill` command.
+          if [ ! -f "$SKILL_DEST/SKILL.md" ]; then
+            cp "$GITHUB_WORKSPACE/skills/ringtone-generator/SKILL.md" "$SKILL_DEST/SKILL.md"
+            sed -i "s|__WORKSPACE__|$GITHUB_WORKSPACE|g" "$SKILL_DEST/SKILL.md"
+            cp -f "$SKILL_DEST/SKILL.md" "$HERMES_HOME/skills/ringtone-generator/"
+            echo "Fallback SKILL.md written for ringtone-generator"
+          fi
+          # ── FIX: deployed SKILL.md used to keep the literal __WORKSPACE__
+          # placeholder (sed only ran in the fallback branch), so the agent
+          # could not cd to the real workspace and ran the script from the
+          # skill dir where node_modules does not exist
+          # (ERR_MODULE_NOT_FOUND: ffmpeg-static). Substitute EVERY deployed
+          # copy, and symlink node_modules so the skill works from ANY dir.
+          for f in "$SKILL_DEST/SKILL.md" "$HERMES_HOME/skills/ringtone-generator/SKILL.md"; do
+            [ -f "$f" ] && sed -i "s|__WORKSPACE__|$GITHUB_WORKSPACE|g" "$f" || true
+          done
+          for d in "$SKILL_DEST" "$HERMES_HOME/skills/ringtone-generator" "$HERMES_HOME" "$HERMES_HOME/hermes-agent"; do
+            [ -e "$d/node_modules" ] || ln -sfn "$GITHUB_WORKSPACE/node_modules" "$d/node_modules" || true
+          done
+          echo "Ringtone Generator skill & FFmpeg silence removal setup complete!"
+
+      # ── 2c. Setup Hermesa phone-notification skill (inbuilt) ──
+      - name: Setup Hermesa Phone Notification Skill
+        run: |
+          # Embedded like the ringtone skill: guaranteed on EVERY run.
+          # BOT_ID comes from the config panel (vault) or GitHub secret;
+          # DB URL from the HERMESA_DB_URL vault value / secret (NO default
+          # baked in - each user sets their own in the config panel).
+          SKILL_DIR="$HERMES_HOME/hermes-agent/skills/hermesa-agent"
+          mkdir -p "$SKILL_DIR/scripts" "$HERMES_HOME/skills/hermesa-agent/scripts"
+          cp "$GITHUB_WORKSPACE/skills/hermesa-phone/SKILL.md" "$SKILL_DIR/SKILL.md"
+          cp "$GITHUB_WORKSPACE/skills/hermesa-phone/scripts/hermesa_bot.py" "$SKILL_DIR/scripts/hermesa_bot.py"
+          chmod +x "$SKILL_DIR/scripts/hermesa_bot.py"
+          cp -f "$SKILL_DIR/SKILL.md" "$HERMES_HOME/skills/hermesa-agent/"
+          cp -f "$SKILL_DIR/scripts/hermesa_bot.py" "$HERMES_HOME/skills/hermesa-agent/scripts/"
+          # `hermesa` terminal command shim: survives context compaction.
+          # Even when a weak model has lost the prompt, typing `hermesa`
+          # works and self-documents (argparse --help), same trick as the
+          # mail CLI shims.
+          mkdir -p "$HOME/.local/bin"
+          cp "$GITHUB_WORKSPACE/bin/hermesa" "$HOME/.local/bin/hermesa"
+          chmod +x "$HOME/.local/bin/hermesa"
+          if [ -n "${HERMESA_BOT_ID:-}" ]; then
+            echo "Hermesa skill installed - BOT_ID configured"
+          else
+            echo "::warning::Hermesa skill installed but HERMESA_BOT_ID is empty - set it in the config panel (Hermesa section)"
+          fi
+
+      # ── 2d. Setup Zedge Automation skill (inbuilt) ──
+      - name: Setup Zedge Automation Skill
+        run: |
+          # Inbuilt control of the user's 3 Zedge upload pipelines. Config
+          # (repo, token, accounts, DB URLs, R2 gateway) comes from the
+          # Firebase vault / config panel; no defaults are baked in.
+          SKILL_DIR="$HERMES_HOME/hermes-agent/skills/zedge-automation"
+          mkdir -p "$SKILL_DIR/scripts" "$HERMES_HOME/skills/zedge-automation/scripts"
+          # per-instance Zedge logins (line N = instance N, "email : password")
+          printf '%s\n' "${ZEDGE_ACCOUNTS:-}" > "$HERMES_HOME/zedge-accounts.txt"
+          chmod 600 "$HERMES_HOME/zedge-accounts.txt"
+          # per-instance proxies (line N = instance N; empty or "-" = direct)
+          printf '%s\n' "${ZEDGE_PROXIES:-}" > "$HERMES_HOME/zedge-proxies.txt"
+          chmod 600 "$HERMES_HOME/zedge-proxies.txt"
+          printf '%s\n' "${ZEDGE_R2_WORKER_URL:-}" > "$HERMES_HOME/zedge-r2.txt"
+          chmod 600 "$HERMES_HOME/zedge-r2.txt"
+          # per-instance WireGuard configs (browser-only VPN via network namespace)
+          mkdir -p "$HERMES_HOME/zedge-vpn"
+          chmod 700 "$HERMES_HOME/zedge-vpn"
+          printf '%s\n' "${ZEDGE_WG_1:-}" > "$HERMES_HOME/zedge-vpn/zedge1.conf"
+          printf '%s\n' "${ZEDGE_WG_2:-}" > "$HERMES_HOME/zedge-vpn/zedge2.conf"
+          printf '%s\n' "${ZEDGE_WG_3:-}" > "$HERMES_HOME/zedge-vpn/zedge3.conf"
+          chmod 600 "$HERMES_HOME/zedge-vpn"/* 2>/dev/null || true
+          if [ -n "${ZEDGE_WG_1:-}${ZEDGE_WG_2:-}${ZEDGE_WG_3:-}" ]; then
+            sudo apt-get install -y wireguard-tools >/dev/null 2>&1 || true
+          fi
+          cp "$GITHUB_WORKSPACE/skills/zedge-automation/SKILL.md" "$SKILL_DIR/SKILL.md"
+          cp "$GITHUB_WORKSPACE/skills/zedge-automation/scripts/zedge_tool.py" "$SKILL_DIR/scripts/zedge_tool.py"
+          chmod +x "$SKILL_DIR/scripts/zedge_tool.py"
+          # inbuilt Playwright upload bot (runs locally - no external repo)
+          cp "$GITHUB_WORKSPACE/skills/zedge-automation/scripts/zedge_bot.py.b64" /tmp/zedge_bot.b64
+          base64 -d /tmp/zedge_bot.b64 | gunzip > "$SKILL_DIR/scripts/zedge_bot.js"
+          rm -f /tmp/zedge_bot.b64
+          cp -f "$SKILL_DIR/SKILL.md" "$HERMES_HOME/skills/zedge-automation/"
+          cp -f "$SKILL_DIR/scripts/zedge_tool.py" "$HERMES_HOME/skills/zedge-automation/scripts/"
+          cp -f "$SKILL_DIR/scripts/zedge_bot.js" "$HERMES_HOME/skills/zedge-automation/scripts/"
+          # `zedge` terminal command shim: survives context compaction -
+          # even if the model forgets the prompt, `zedge --help` self-documents.
+          mkdir -p "$HOME/.local/bin"
+          cp "$GITHUB_WORKSPACE/bin/zedge" "$HOME/.local/bin/zedge"
+          chmod +x "$HOME/.local/bin/zedge"
+          echo "Zedge automation skill installed (instances 1-3, local Playwright runner)"
+
+      # ── 2d-2. Setup Screen Capture skill (inbuilt screenshot + recorder) ──
+      - name: Setup Screen Capture Skill
+        run: |
+          # Inbuilt screenshot + screen recording of the shared :99 desktop.
+          # `cap` terminal command: cap shot / cap clip 30 / cap start|stop|status
+          HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+          CAP_DIR="$HOME/.hermes/hermes-agent/skills/screen-capture"
+          mkdir -p "$CAP_DIR/scripts" "$HERMES_HOME/skills/screen-capture/scripts" "$HOME/.hermes/work/captures"
+          cp "$GITHUB_WORKSPACE/skills/screen-capture/SKILL.md" "$CAP_DIR/SKILL.md"
+          cp "$GITHUB_WORKSPACE/skills/screen-capture/scripts/cap_tool.py" "$CAP_DIR/scripts/cap_tool.py"
+          chmod +x "$CAP_DIR/scripts/cap_tool.py"
+          cp -f "$CAP_DIR/SKILL.md" "$HERMES_HOME/skills/screen-capture/"
+          cp -f "$CAP_DIR/scripts/cap_tool.py" "$HERMES_HOME/skills/screen-capture/scripts/"
+          # `cap` terminal command shim (same pattern as `zedge`)
+          mkdir -p "$HOME/.local/bin"
+          cp "$GITHUB_WORKSPACE/bin/cap" "$HOME/.local/bin/cap"
+          chmod +x "$HOME/.local/bin/cap"
+          # ffmpeg is preinstalled on GitHub runners; install only if missing
+          command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true
+          echo "Screen capture skill installed (cap shot | cap clip N | cap start/stop/status)"
+
+      # ── 2e. Setup Telegram Group Manager skill (inbuilt) ──
+      - name: Setup Telegram Group Manager Skill
+        run: |
+          # Inbuilt ADMIN control of the boss's Telegram group(s): group
+          # replies (incl. bot-to-bot), ban/kick/mute, add-via-invite-link,
+          # pin posts, promote/demote and more. The bot must be a group
+          # admin ONLY on the group owner's deployment. Other users'
+          # deployments run member-level (TELEGRAM_GROUP_ROLE=member or
+          # simply a non-admin bot - tg verifies real rights per action).
+          # Group ids come from the config panel (TELEGRAM_GROUP_IDS);
+          # every command also accepts -g.
+          SKILL_DIR="$HERMES_HOME/hermes-agent/skills/telegram-group-manager"
+          mkdir -p "$SKILL_DIR/scripts" "$HERMES_HOME/skills/telegram-group-manager/scripts"
+          cp "$GITHUB_WORKSPACE/skills/telegram-group-manager/SKILL.md" "$SKILL_DIR/SKILL.md"
+          cp "$GITHUB_WORKSPACE/skills/telegram-group-manager/scripts/tg_group.py" "$SKILL_DIR/scripts/tg_group.py"
+          cp -f "$SKILL_DIR/SKILL.md" "$HERMES_HOME/skills/telegram-group-manager/"
+          cp -f "$SKILL_DIR/scripts/tg_group.py" "$HERMES_HOME/skills/telegram-group-manager/scripts/"
+          # `tg` terminal command shim: survives context compaction -
+          # even if the model forgets the prompt, `tg --help` self-documents.
+          mkdir -p "$HOME/.local/bin"
+          cp "$GITHUB_WORKSPACE/bin/tg" "$HOME/.local/bin/tg"
+          chmod +x "$HOME/.local/bin/tg"
+          # schedule daemon: fires tg schedule / auto-unlock / poll-close
+          # jobs; background process survives into later steps
+          pkill -f "tg_group.py _daemon" 2>/dev/null || true
+          nohup python3 "$SKILL_DIR/scripts/tg_group.py" _daemon >> "$HERMES_HOME/tg_scheduler.log" 2>&1 &
+          echo "tg schedule daemon started (log: $HERMES_HOME/tg_scheduler.log)"
+          if [ -n "${TELEGRAM_GROUP_IDS:-}" ]; then
+            N=$(echo "$TELEGRAM_GROUP_IDS" | tr ',' '\n' | grep -c .)
+            echo "Telegram group manager installed - $N group(s) configured, first is default"
+          else
+            echo "::warning::Telegram group manager installed but TELEGRAM_GROUP_IDS is empty - set it in the config panel (Telegram section) or pass -g <chat-id> per command"
+          fi
+
+      # ── 2f. Setup Facebook Page Manager skill (inbuilt) ──
+      - name: Setup Facebook Page Manager Skill
+        run: |
+          set -e
+          SKILL_DIR="$HERMES_HOME/hermes-agent/skills/facebook-page-manager"
+          mkdir -p "$SKILL_DIR/scripts" "$HERMES_HOME/skills/facebook-page-manager/scripts"
+          cp "$GITHUB_WORKSPACE/skills/facebook-page-manager/SKILL.md" "$SKILL_DIR/SKILL.md"
+          cp "$GITHUB_WORKSPACE/skills/facebook-page-manager/scripts/fb_page.py" "$SKILL_DIR/scripts/fb_page.py"
+          chmod +x "$SKILL_DIR/scripts/fb_page.py"
+          cp -f "$SKILL_DIR/SKILL.md" "$HERMES_HOME/skills/facebook-page-manager/"
+          cp -f "$SKILL_DIR/scripts/fb_page.py" "$HERMES_HOME/skills/facebook-page-manager/scripts/"
+          mkdir -p "$HOME/.local/bin"
+          cp "$GITHUB_WORKSPACE/bin/fb" "$HOME/.local/bin/fb"
+          chmod +x "$HOME/.local/bin/fb"
+          if [ -n "${FACEBOOK_PAGE_TOKEN:-}" ]; then
+            echo "Facebook Page manager installed - token present"
+          else
+            echo "::warning::Facebook Page manager installed but FACEBOOK_PAGE_TOKEN is empty - set it in the config panel (Facebook Page section)"
+          fi
+
+      # ── 3. Start SearXNG (free web search) ──
+      - name: Start SearXNG
+        run: |
+          mkdir -p /tmp/searxng
+          cp "$GITHUB_WORKSPACE/config/searxng-settings.yml" /tmp/searxng/settings.yml
+          docker run -d --name searxng -p 8080:8080 \
+            -v /tmp/searxng:/etc/searxng \
+            searxng/searxng:latest
+          echo "Waiting for SearXNG..."
+          for i in $(seq 1 30); do
+            if curl -s "http://localhost:8080/search?q=test&format=json" | grep -q results; then
+              echo "SearXNG is ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "SearXNG failed to start"; exit 1
+
+      # ── 4. Start Camoufox (stealth browser, NON-headless via virtual display) ──
+      - name: Start Camoufox
+        run: |
+          # Shared virtual display :99 — the browser AND all the agent's GUI
+          # work render here, so the LIVE VIEW (below) shows everything.
+          # ---- Bangladesh clock for the runner AND the desktop ----
+          sudo ln -sf /usr/share/zoneinfo/Asia/Dhaka /etc/localtime 2>/dev/null || true
+          echo "Asia/Dhaka" | sudo tee /etc/timezone >/dev/null 2>&1 || true
+          sudo timedatectl set-timezone Asia/Dhaka 2>/dev/null || true
+          export TZ=Asia/Dhaka
+          echo "Runner clock now: $(date '+%A, %d %B %Y  %I:%M:%S %p  %Z')"
+
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc novnc websockify fluxbox tint2 xterm pcmanfm gvfs gvfs-backends mousepad xdotool wmctrl scrot imagemagick tesseract-ocr python3-tk fonts-dejavu fonts-noto-color-emoji fonts-cantarell papirus-icon-theme hicolor-icon-theme xcompmgr
+          Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
+          sleep 2
+          export DISPLAY=:99
+
+          # ---- Wallpaper: Hollow Knight 4K (downloaded, with fallback) ----
+          mkdir -p "$HOME/Pictures"
+          WALL="$HOME/Pictures/hermes-wallpaper.png"
+          WALL_URL="https://4kwallpapers.com/images/wallpapers/hollow-knight-3840x2160-24147.png"
+          if curl -fsSL --max-time 90 -A "Mozilla/5.0" "$WALL_URL" -o /tmp/wall-src.png && [ -s /tmp/wall-src.png ]; then
+            convert /tmp/wall-src.png -resize "1920x1080^" -gravity center -extent 1920x1080 "$WALL" \
+              || cp /tmp/wall-src.png "$WALL"
+            echo "wallpaper: Hollow Knight 4K downloaded and fitted to 1920x1080"
+          else
+            echo "::warning::wallpaper download failed - using a generated fallback"
+            convert -size 480x270 plasma:fractal -blur 0x6 -modulate 115,170,100 \
+                    -resize "1920x1080!" "$WALL" 2>/dev/null \
+              || convert -size 1920x1080 gradient:"#101a2b"-"#2b1055" "$WALL"
+          fi
+          # keep a copy so a later run can reuse it if the site is offline
+          cp -f "$WALL" "$HERMES_HOME/wallpaper.png" 2>/dev/null || true
+
+          # ---- Compositor: real translucency + soft shadows (macOS feel) ----
+          nohup xcompmgr -c -C -f -D 4 > /tmp/xcompmgr.log 2>&1 &
+
+          # ---- App entries (used by the Dock and the desktop) ----
+          APPDIR="$HOME/.local/share/applications"
+          mkdir -p "$APPDIR" "$HOME/Desktop" "$HERMES_HOME/work/outputs" "$HOME/Documents" "$HOME/Downloads"
+          write_app() {
+            cat > "$APPDIR/$1.desktop" <<ICON
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=$2
+          Comment=$2
+          Icon=$3
+          Exec=$4
+          Terminal=false
+          StartupNotify=true
+          ICON
+            chmod +x "$APPDIR/$1.desktop"
+          }
+          TERMCMD="xterm -fa DejaVuSansMono -fs 11 -fg #e6edf3 -bg #101418 -geometry 110x30"
+          write_app finder     "Finder"          system-file-manager      "pcmanfm $HOME"
+          write_app macintosh  "Macintosh HD"    drive-harddisk           "pcmanfm /"
+          write_app drives     "Drives"          drive-multidisk          "pcmanfm computer:///"
+          write_app hermes     "Hermes Drive"    folder-documents         "pcmanfm $HERMES_HOME"
+          write_app outputs    "Agent Output"    folder-download          "pcmanfm $HERMES_HOME/work/outputs"
+          write_app terminal   "Terminal"        utilities-terminal       "$TERMCMD"
+          write_app editor     "TextEdit"        accessories-text-editor  "mousepad"
+          write_app monitor    "Activity Monitor" utilities-system-monitor "xterm -fa DejaVuSansMono -fs 11 -T ActivityMonitor -e top"
+
+          # macOS keeps the desktop clean: only drives + working folders
+          for a in macintosh hermes outputs; do
+            cp -f "$APPDIR/$a.desktop" "$HOME/Desktop/$a.desktop"
+            chmod +x "$HOME/Desktop/$a.desktop"
+          done
+
+          # ---- Desktop layer (wallpaper + icons + mounted volumes) ----
+          mkdir -p "$HOME/.config/pcmanfm/default"
+          cat > "$HOME/.config/pcmanfm/default/desktop-items-0.conf" <<EOF
+          [*]
+          wallpaper_mode=stretch
+          wallpaper_common=1
+          wallpaper=$WALL
+          desktop_bg=#0b1622
+          desktop_fg=#ffffff
+          desktop_shadow=#000000
+          desktop_font=Cantarell 11
+          show_wm_menu=0
+          sort=name;ascending;
+          show_documents=0
+          show_trash=1
+          show_mounts=1
+          EOF
+          cat > "$HOME/.config/pcmanfm/default/pcmanfm.conf" <<EOF
+          [config]
+          bm_open_method=0
+          [volume]
+          mount_on_startup=1
+          mount_removable=1
+          autorun=0
+          [ui]
+          always_show_tabs=0
+          show_statusbar=1
+          side_pane_mode=places
+          view_mode=icon
+          show_hidden=0
+          big_icon_size=48
+          EOF
+
+          # ---- Window manager: thin titlebars, buttons on the LEFT ----
+          mkdir -p "$HOME/.fluxbox"
+          STYLE=""
+          for st in Meta Emerge Nyz bloe arch Flat Squared_blue ; do
+            [ -e "/usr/share/fluxbox/styles/$st" ] && STYLE="/usr/share/fluxbox/styles/$st" && break
+          done
+          cat > "$HOME/.fluxbox/init" <<EOF
+          session.screen0.toolbar.visible: false
+          session.screen0.workspaces: 2
+          session.screen0.windowPlacement: CascadePlacement
+          session.screen0.focusModel: ClickToFocus
+          session.screen0.defaultDeco: NORMAL
+          session.screen0.titlebar.left: Close Minimize Maximize
+          session.screen0.titlebar.right: Stick
+          session.screen0.tab.placement: TopLeft
+          session.screen0.fullMaximization: false
+          EOF
+          [ -n "$STYLE" ] && echo "session.styleFile: $STYLE" >> "$HOME/.fluxbox/init"
+          cat > "$HOME/.fluxbox/menu" <<EOF
+          [begin] (Hermes)
+            [exec] (Finder) {pcmanfm $HOME}
+            [exec] (Macintosh HD) {pcmanfm /}
+            [exec] (Hermes Drive) {pcmanfm $HERMES_HOME}
+            [exec] (Terminal) {$TERMCMD}
+            [exec] (TextEdit) {mousepad}
+            [exec] (Activity Monitor) {xterm -fa DejaVuSansMono -fs 11 -T ActivityMonitor -e top}
+            [separator]
+            [restart] (Restart Desktop)
+          [end]
+          EOF
+          fluxbox > /tmp/fluxbox.log 2>&1 &
+          sleep 1
+          nohup pcmanfm --desktop --profile default > /tmp/pcmanfm-desktop.log 2>&1 &
+          sleep 1
+
+          # ---- macOS style MENU BAR (top) ----
+          mkdir -p "$HOME/.config/tint2"
+          cat > "$HOME/.config/tint2/menubar.tint2rc" <<EOF
+          rounded = 0
+          border_width = 0
+          background_color = #1c1c1e 78
+          border_color = #000000 0
+
+          rounded = 6
+          border_width = 0
+          background_color = #ffffff 12
+          border_color = #000000 0
+
+          panel_items = LTSC
+          panel_monitor = all
+          panel_position = top center horizontal
+          panel_size = 100% 28
+          panel_margin = 0 0
+          panel_padding = 8 0 10
+          panel_background_id = 1
+          panel_layer = top
+          panel_dock = 0
+          wm_menu = 1
+          strut_policy = follow_size
+          font_shadow = 1
+
+          launcher_padding = 2 0 8
+          launcher_icon_size = 18
+          launcher_icon_theme = Papirus-Dark
+          launcher_item_app = /home/runner/.local/share/applications/finder.desktop
+
+          taskbar_mode = single_desktop
+          taskbar_padding = 4 0 6
+          taskbar_background_id = 0
+          task_maximum_size = 190 22
+          task_padding = 8 1
+          task_text = 1
+          task_icon = 0
+          task_centered = 0
+          task_font = Cantarell Bold 10
+          task_font_color = #f5f5f7 100
+          task_background_id = 0
+          task_active_background_id = 2
+
+          systray_padding = 4 0 6
+          systray_icon_size = 16
+
+          time1_format = %a %d %b  %I:%M %p
+          time1_font = Cantarell 11
+          time2_format =
+          clock_font_color = #f5f5f7 100
+          clock_padding = 10 0
+          clock_background_id = 0
+          clock_tooltip = %A %d %B %Y  %I:%M:%S %p (Bangladesh)
+          clock_tooltip_timezone = :Asia/Dhaka
+          EOF
+
+          # ---- macOS style DOCK (bottom, floating, translucent) ----
+          cat > "$HOME/.config/tint2/dock.tint2rc" <<EOF
+          rounded = 18
+          border_width = 1
+          border_sides = TBLR
+          background_color = #2c2c2e 62
+          border_color = #ffffff 16
+
+          panel_items = L
+          panel_monitor = all
+          panel_position = bottom center horizontal
+          panel_size = 0 74
+          panel_margin = 0 10
+          panel_padding = 10 6 10
+          panel_background_id = 1
+          panel_layer = top
+          panel_dock = 0
+          wm_menu = 0
+          strut_policy = none
+          autohide = 0
+
+          launcher_padding = 6 4 10
+          launcher_icon_size = 46
+          launcher_icon_theme = Papirus-Dark
+          launcher_tooltip = 1
+          mouse_effects = 1
+          launcher_icon_asb = 100 0 0
+          mouse_over_icon_asb = 100 12 12
+          mouse_pressed_icon_asb = 100 0 -12
+          launcher_item_app = /home/runner/.local/share/applications/finder.desktop
+          launcher_item_app = /home/runner/.local/share/applications/terminal.desktop
+          launcher_item_app = /home/runner/.local/share/applications/editor.desktop
+          launcher_item_app = /home/runner/.local/share/applications/hermes.desktop
+          launcher_item_app = /home/runner/.local/share/applications/outputs.desktop
+          launcher_item_app = /home/runner/.local/share/applications/drives.desktop
+          launcher_item_app = /home/runner/.local/share/applications/monitor.desktop
+          EOF
+
+          TZ=Asia/Dhaka nohup tint2 -c "$HOME/.config/tint2/menubar.tint2rc" > /tmp/tint2-menubar.log 2>&1 &
+          sleep 1
+          TZ=Asia/Dhaka nohup tint2 -c "$HOME/.config/tint2/dock.tint2rc" > /tmp/tint2-dock.log 2>&1 &
+          sleep 1
+
+          # ---- Small status console, bottom-right above the dock ----
+          cat > /tmp/status.sh <<EOF
+          #!/bin/bash
+          export TZ=Asia/Dhaka
+          while true; do
+            clear
+            echo "  Hermes Workstation - display :99"
+            echo "  \$(date '+%A, %d %B %Y   %I:%M:%S %p')  Bangladesh"
+            echo "  ----------------------------------------------"
+            echo "  Load: \$(cut -d' ' -f1-3 /proc/loadavg)   Disk: \$(df -h / | awk 'NR==2{print \$4}') free"
+            echo "  Services:"
+            pgrep -a -f 'hermes|camoufox|litellm|searxng|cloudflared' | cut -c1-84 | sed 's/^/    /'
+            echo
+            echo "  Camofox browser has its OWN view (noVNC :6081, same password)."
+            sleep 2
+          done
+          EOF
+          chmod +x /tmp/status.sh
+          xterm -fa DejaVuSansMono -fs 10 -fg "#9ef0a2" -bg "#101418" \
+                -geometry 88x15-24-96 -T "Hermes - status" -e /tmp/status.sh &
+
+          # Chrome is NOT started here by default anymore. Camofox is the
+          # browser; a visible Chrome launches ONLY as a fallback below, and
+          # ONLY if the Camofox server fails - so on a normal run NO browser
+          # window opens on the desktop by itself.
+          # Skip PyPI entirely when the cached install already works. The
+          # old "-U" forced an upgrade check every run AND version bumps
+          # invalidated the cached ~200MB Camoufox browser (a new camoufox
+          # wheel wants a new browser build), causing a full re-download.
+          python3 -c "import camoufox, pyvirtualdisplay, pyautogui" 2>/dev/null \
+            && echo "camoufox python stack already installed (cache) - skipping pip" \
+            || pip install "camoufox[geoip]" pyvirtualdisplay pyautogui
+
+          # ---- Document tooling (PDF / DOCX / XLSX) ----
+          # The agent used to crash-loop on PDFs: it kept trying to import
+          # pymupdf / marker / marker_pdf, none of which were installed.
+          # Install real readers ONCE here and give it a ready-made command.
+          sudo apt-get install -y -qq poppler-utils >/dev/null 2>&1 || true
+          python3 -c "import fitz, pdfplumber, pypdf, pytesseract, pdf2image, docx, openpyxl" 2>/dev/null \
+            || pip install -q pymupdf pdfplumber pypdf pytesseract pdf2image python-docx openpyxl \
+            || echo "::warning::document tooling install failed - PDF reading may be limited"
+
+          sudo cp "$GITHUB_WORKSPACE/bin/pdf2md" /usr/local/bin/pdf2md
+          sudo chmod +x /usr/local/bin/pdf2md
+          python3 -c "import fitz, pdfplumber, pypdf" 2>/dev/null \
+            && echo "document tooling ready: pdf2md, fitz, pdfplumber, pypdf" \
+            || echo "::warning::PDF libraries missing after install"
+          # fetch skips the ~200MB browser download when restored from cache;
+          # when the cached browser dir is already populated we skip even the
+          # fetch version-check (network round trip) - the pinned pip install
+          # above guarantees the cached browser still matches the wheel
+          if [ -d "$HOME/.cache/camoufox" ] && [ -n "$(ls -A "$HOME/.cache/camoufox" 2>/dev/null)" ]; then
+            echo "Camoufox browser already in cache - skipping fetch"
+          else
+            python3 -m camoufox fetch
+          fi
+          mkdir -p "$HERMES_HOME/browser-profile"
+          nohup python3 -c "
+          from camoufox.server import launch_server
+          launch_server(
+              headless=False,  # real headed browser on the shared :99 display
+              port=9222, ws_path='hermes',
+              persistent_context=True,
+              user_data_dir='/home/runner/.hermes/browser-profile',
+              os='windows',
+          )
+          " > /tmp/camoufox.log 2>&1 &
+          echo "Waiting for Camoufox (headed/virtual)..."
+          for i in $(seq 1 30); do
+            if grep -q 'ws://' /tmp/camoufox.log 2>/dev/null; then
+              echo 'Camoufox ready (non-headless, virtual display)'; break
+            fi
+            sleep 3
+          done
+          cat /tmp/camoufox.log || true
+
+          # ── CAMOFOX SERVER: anti-detect backend for the BUILT-IN browser
+          # tools. Hermes routes ALL browser_* tools through it when
+          # CAMOFOX_URL is set: Camoufox = Firefox fork with C++-level
+          # fingerprint spoofing, so sites cannot detect/track agentic work
+          # (no CDP automation beacons like Chrome).
+          # VISIBLE VIA ITS OWN VNC: the camofox server subprocess STRIPS
+          # DISPLAY (lib/config.js serverEnv), so the browser can never render
+          # on our :99 desktop - camoufox-js spawns its OWN private Xvfb.
+          # Official fix = bundled VNC plugin (ENABLE_VNC=1): it resizes that
+          # private Xvfb to 1920x1080, attaches x11vnc on :5901 and serves
+          # noVNC on :6081 (our own desktop owns :5900/:6080). Log into your
+          # accounts THERE - the agent works in that SAME browser and
+          # inherits your logged-in sessions.
+          # LAZY LAUNCH (tamed by fix44/46): engine warm-starts at boot, a
+          # placeholder tab keeps a window rendered, and idle/session/tab
+          # timeouts are raised to 24h so nothing dies between uses.
+          # PERSISTENT LOGINS (fix47): the server NEVER writes cookies to
+          # disk by itself (contexts are in-memory), so the keepalive
+          # exports boss-view cookies every 2 min (GET /sessions/boss-view/
+          # storage_state) into ~/.hermes/data/camofox-profiles - pushed to
+          # the data repo by the backup loop - and re-imports them (POST
+          # /sessions/boss-view/cookies) after every engine start/restart,
+          # so logins survive runs AND mid-run restarts.
+          # Fail-soft: without it, Configure falls back to visible Chrome.
+          # camofox-browser lives in ~/.cache (restored by the env cache in
+          # step 1b), so the git clone + npm install (minutes!) only happens
+          # on a cold cache. Later runs reuse node_modules instantly.
+          CFB_DIR="$HOME/.cache/camofox-browser"
+          if [ ! -d "$CFB_DIR/node_modules" ]; then
+            rm -rf "$CFB_DIR"
+            git clone --depth 1 https://github.com/jo-inc/camofox-browser "$CFB_DIR" 2>/dev/null || true
+            if [ -d "$CFB_DIR" ]; then
+              ( cd "$CFB_DIR" && timeout 600 npm install > /tmp/camofox-npm.log 2>&1 ) \
+                || echo "::warning::camofox-browser npm install failed - see /tmp/camofox-npm.log"
+            fi
+          else
+            echo "camofox-browser restored from cache - skipping clone + npm install"
+          fi
+          if [ -d "$CFB_DIR" ]; then
+            mkdir -p "$HERMES_HOME/data/camofox-profiles"
+            ( cd "$CFB_DIR" && CAMOFOX_PORT=9377 \
+                CAMOFOX_BIND_HOST=127.0.0.1 \
+                CAMOFOX_PROFILE_DIR="$HERMES_HOME/data/camofox-profiles" \
+                ENABLE_VNC=1 VNC_RESOLUTION=1920x1080 \
+                VNC_PASSWORD="${PANEL_TOKEN:-hermes99}" \
+                VNC_PORT=5901 NOVNC_PORT=6081 \
+                SESSION_TIMEOUT_MS=86400000 TAB_INACTIVITY_MS=86400000 \
+                BROWSER_IDLE_TIMEOUT_MS=86400000 \
+                NATIVE_MEM_RESTART_THRESHOLD_MB=2048 \
+                BROWSER_RSS_RESTART_THRESHOLD_MB=4096 \
+                nohup npm start > /tmp/camofox-srv.log 2>&1 & )
+            for i in $(seq 1 40); do
+              if curl -sf http://127.0.0.1:9377/health > /dev/null 2>&1 \
+                 || curl -sf http://127.0.0.1:9377/tabs > /dev/null 2>&1; then
+                echo "http://127.0.0.1:9377" > /tmp/camofox_url
+                echo "Camofox ready on :9377 - browser visible on its OWN noVNC :6081 (warm-started at boot)"
+                break
+              fi
+              sleep 3
+            done
+          fi
+          # fix43: WARM START the browser engine NOW + keep it alive, so the
+          # noVNC view on :6081 is actually connectable from minute 1.
+          # fix46: loadConfig() reads process.env DIRECTLY when npm start
+          # runs the server (the serverEnv allowlist only filters env when
+          # the OpenClaw plugin spawns it), so the launch line raises
+          # session/tab/idle timeouts to 24h and the auto-restart
+          # thresholds (native-mem 300MB -> 2GB, browser RSS 1.5GB -> 4GB)
+          # that were closing ALL windows mid-login (the Facebook vanish).
+          # The keepalive (python) still revives the engine if down AND
+          # keeps ONE placeholder tab (userId boss-view) refreshed every 2
+          # min, so the tab-inactivity (5 min) and engine-idle (5 min)
+          # timers never fire: a window is ALWAYS rendered (no black screen,
+          # the display has no window manager so no-window = black) and the
+          # engine never dies (no VNC disconnect cycle).
+          # fix47: it also exports boss-view cookies to the data-repo dir
+          # every cycle and re-imports them into fresh sessions, so logins
+          # survive engine restarts AND whole machine runs.
+          if [ -f /tmp/camofox_url ]; then
+            curl -s --max-time 30 -X POST http://127.0.0.1:9377/start \
+              -H 'Content-Type: application/json' -d '{}' \
+              > /tmp/camofox-warmstart.log 2>&1 || true
+            cp "$GITHUB_WORKSPACE/scripts/camofox_keepalive.py" /tmp/camofox-keepalive.py
+            CAMOFOX_STATE_FILE="$HERMES_HOME/data/camofox-profiles/boss-view-storage.json" nohup python3 /tmp/camofox-keepalive.py > /tmp/camofox-keepalive.log 2>&1 &
+            echo "Camofox warm start sent; keepalive keeps engine + placeholder tab alive (no more idle shutdown)"
+          fi
+          [ -f /tmp/camofox_url ] || echo "::warning::Camofox not reachable - built-in tools fall back to visible Chrome"
+          # FALLBACK ONLY: launch a visible Chrome (with CDP) if and only if
+          # the Camofox server did NOT come up, so the built-in tools still
+          # have a browser to drive. Otherwise NO Chrome opens.
+          if [ ! -f /tmp/camofox_url ]; then
+            BROWSER_BIN=$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)
+            if [ -n "$BROWSER_BIN" ]; then
+              mkdir -p "$HERMES_HOME/chrome-profile"
+              nohup "$BROWSER_BIN" --remote-debugging-port=9223 \
+                --user-data-dir="$HERMES_HOME/chrome-profile" \
+                --no-first-run --no-default-browser-check --disable-gpu \
+                --window-size=1600,900 about:blank > /tmp/chrome.log 2>&1 &
+              echo "Camofox down - started visible Chrome fallback (CDP 9223)"
+            else
+              echo "::warning::No Camofox and no Chrome found - built-in tools will be headless"
+            fi
+          else
+            echo "Camofox is the default browser - Chrome NOT started"
+          fi
+
+          # ── LIVE DESKTOP VIEW: watch the agent work, from your browser ──
+          # x11vnc mirrors display :99, noVNC serves a browser-based viewer on
+          # port 6080 (tunnel + link are added in the Notify start step).
+          # FULL CONTROL: your mouse + keyboard work in the view, so you can
+          # step in for manual tasks (login pages, captchas, tweaks). Still
+          # password-gated so nobody else can hijack the desktop. NOTE: VNC
+          # passwords only use the FIRST 8 characters of PANEL_TOKEN.
+          x11vnc -display :99 -forever -shared -repeat -bg -quiet \
+            -passwd "${PANEL_TOKEN:-hermes99}" -o /tmp/x11vnc.log
+          nohup websockify --web=/usr/share/novnc 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
+          echo "Live desktop view server running on :6080"
+
+      # ── 5. Write the model pool controller (headless) ──
+      # The old Flask control panel is GONE. The config website is the only
+      # UI: it writes MODEL_POOL into the Firebase vault, and this script
+      # turns that pool into the LiteLLM config and keeps it pruned.
+      - name: Write model pool controller
+        run: |
+          cp "$GITHUB_WORKSPACE/pool/poolctl.py" /tmp/poolctl.py
+
+          # sanitize pool: drop any old ollama entries from backup; default if empty
+          python3 "$GITHUB_WORKSPACE/scripts/model_pool_init.py"
+
+      # ── 6. Start the built-in model pool router (replaces LiteLLM) ──
+      - name: Start pool router
+        run: |
+          # ── PANEL_TOKEN: ANY value is accepted - no length or format rules.
+          # It is loaded from the config panel (Firebase vault) first, then
+          # the PANEL_TOKEN GitHub secret. Only when BOTH are empty do we
+          # fall back to the default 'hermes99' so the run never dies here.
+          if [ -z "${PANEL_TOKEN:-}" ]; then
+            echo "::warning::PANEL_TOKEN not set in the config panel (or secrets) - using default 'hermes99'. Set your own token in the panel."
+            PANEL_TOKEN=hermes99
+            echo "PANEL_TOKEN=hermes99" >> "$GITHUB_ENV"
+          fi
+
+          # ── split + VALIDATE bulk NVIDIA_KEYS (one per line; commas also OK) ──
+          # every key is auth-checked against the live API; keys that return
+          # 401/403 (revoked/banned/typo) are DROPPED so they never poison the
+          # rotation pool. 429/timeouts do NOT drop a key (fail-open).
+          : > /tmp/litellm.env
+          # SPEED FIX: keys were checked ONE BY ONE with a 20s timeout plus
+          # a forced 'sleep 1' after every key ������������� with a big key pool that
+          # alone wasted minutes. Now ALL keys (NVIDIA + Mistral) are checked
+          # in PARALLEL with a 12s timeout. Same rules: 401/403 drops a key,
+          # 429/timeout keeps it (fail-open).
+          rm -rf /tmp/keychk && mkdir -p /tmp/keychk
+          i=0
+          while IFS= read -r k; do
+            k=$(echo "$k" | tr -d ' \r')
+            [ -z "$k" ] && continue
+            i=$((i+1))
+            (
+              code=$(curl -s -o /dev/null -m 12 -w '%{http_code}' \
+                -H "Authorization: Bearer ${k}" https://integrate.api.nvidia.com/v1/models)
+              if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+                echo "BAD $code" > "/tmp/keychk/nv_$(printf '%03d' $i)"
+              else
+                echo "$k" > "/tmp/keychk/nv_$(printf '%03d' $i)"
+              fi
+            ) &
+          done < <(printf '%s\n' "$NVIDIA_KEYS" | tr ',' '\n')
+          j=0
+          while IFS= read -r k; do
+            k=$(echo "$k" | tr -d ' \r')
+            [ -z "$k" ] && continue
+            j=$((j+1))
+            (
+              code=$(curl -s -o /dev/null -m 12 -w '%{http_code}' \
+                -H "Authorization: Bearer ${k}" https://api.mistral.ai/v1/models)
+              if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+                echo "BAD $code" > "/tmp/keychk/mi_$(printf '%03d' $j)"
+              else
+                echo "$k" > "/tmp/keychk/mi_$(printf '%03d' $j)"
+              fi
+            ) &
+          done < <(printf '%s\n' "$MISTRAL_KEYS" | tr ',' '\n')
+          wait
+          n=0; bad_n=0
+          for f in /tmp/keychk/nv_*; do
+            [ -e "$f" ] || continue
+            v=$(cat "$f")
+            case "$v" in
+              BAD*) bad_n=$((bad_n+1)); echo "::warning::Dropping NVIDIA key — auth check failed (HTTP ${v#BAD })";;
+              *) n=$((n+1)); echo "NVIDIA_KEY_${n}=${v}" >> /tmp/litellm.env;;
+            esac
+          done
+          echo "NVIDIA keys: $n valid, $bad_n dropped"
+          if [ "$bad_n" -gt 0 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              --data-urlencode text="🚨 Hermes: ${bad_n} NVIDIA key(s) dead (auth failed) - ${n} still working" > /dev/null || true
+          fi
+          if [ "$n" -eq 0 ]; then
+            echo "::error::No working NVIDIA key — secret is empty or every key failed the auth check"
+            exit 1
+          fi
+
+          # ── collect the parallel Mistral key check results ──
+          m=0; bad_m=0
+          for f in /tmp/keychk/mi_*; do
+            [ -e "$f" ] || continue
+            v=$(cat "$f")
+            case "$v" in
+              BAD*) bad_m=$((bad_m+1)); echo "::warning::Dropping Mistral key — auth check failed (HTTP ${v#BAD })";;
+              *) m=$((m+1)); echo "MISTRAL_KEY_${m}=${v}" >> /tmp/litellm.env;;
+            esac
+          done
+          rm -rf /tmp/keychk
+          echo "Mistral keys: $m valid, $bad_m dropped"
+          if [ "$bad_m" -gt 0 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              --data-urlencode text="🚨 Hermes: ${bad_m} Mistral key(s) dead (auth failed) - ${m} still working" > /dev/null || true
+          fi
+
+          # make the split keys visible to this shell + the pool controller
+          set -a; source /tmp/litellm.env; set +a
+
+          # cloudflared: EVERY public link goes through a trycloudflare quick
+          # tunnel — WebUI, dashboard, live desktop and the browser view.
+          # Links are random and change on every run.
+          # SPEED FIX: cloudflared is prefetched in the background at run
+          # start (see "Pull data repo"); download here only if that
+          # prefetch has not landed yet.
+          for w in $(seq 1 10); do [ -x /usr/local/bin/cloudflared ] && break; sleep 2; done
+          if [ ! -x /usr/local/bin/cloudflared ]; then
+            sudo curl -fsSL \
+              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+              -o /usr/local/bin/cloudflared
+            sudo chmod +x /usr/local/bin/cloudflared
+          fi
+
+          # ── the pool comes from the CONFIG WEBSITE, nothing else ──
+          # index.html → Model pool → Apply pool writes MODEL_POOL into the
+          # Firebase vault. We re-read the vault here and keep re-reading it
+          # while waiting, so applying it mid-run is picked up automatically.
+          POOL_FILE="$HERMES_HOME/pool.json"
+          pool_ok() { python3 -c "import json,sys; sys.exit(0 if json.load(open('$POOL_FILE')) else 1)" 2>/dev/null; }
+          python3 /tmp/fbpool.py || true          # fresh read of the website pool
+          if ! pool_ok; then
+            echo "::warning::No model pool applied on the config website yet — open it, tick your models and press Apply pool"
+            TG_API="https://api.telegram.org"
+            curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              --data-urlencode text="⚠️ No model pool selected yet. Open your config website → Model pool, tick your models and press Apply pool. I re-check every 15s, waiting up to 60 min..." > /dev/null || true
+            for i in $(seq 1 240); do
+              python3 /tmp/fbpool.py >/dev/null 2>&1 || true
+              pool_ok && break
+              sleep 15
+            done
+            pool_ok || { echo "::error::No model pool applied on the website within 60 minutes"; exit 1; }
+            echo "Pool received from the website vault."
+          fi
+
+          # generate litellm config from YOUR pool (nothing hardcoded)
+          # --init also PRUNES models the provider has retired (HTTP 410 EOL)
+          python3 /tmp/poolctl.py --init
+          if ! pool_ok; then
+            echo "::warning::All saved models are dead/EOL — apply a fresh pool on the config website"
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              --data-urlencode text="⚠️ All your saved models were retired by the provider — pool auto-cleaned. Open your config website → Model pool and apply a fresh pool." > /dev/null || true
+            for i in $(seq 1 240); do
+              python3 /tmp/fbpool.py >/dev/null 2>&1 || true
+              pool_ok && break
+              sleep 15
+            done
+            pool_ok || { echo "::error::No model pool applied on the website within 60 minutes"; exit 1; }
+            python3 /tmp/poolctl.py --init
+          fi
+
+          # ── live sync: watch the website vault for pool changes ──
+          # Press Apply pool on the site at ANY time → within ~60s the runner
+          # rewrites pool.json, regenerates the LiteLLM config and reloads the
+          # router. No restart of this action is ever needed.
+          nohup bash -c '
+            while sleep 60; do
+              out=$(python3 /tmp/fbpool.py 2>&1)
+              case "$out" in
+                CHANGED*)
+                  echo "$(TZ=Asia/Dhaka date +"%I:%M:%S %p") $out"
+                  python3 /tmp/poolctl.py --init >/dev/null 2>&1 \
+                    && echo "pool.json refreshed - the router picks it up live (no restart needed)"
+                  ;;
+              esac
+            done' > /tmp/poolwatch.log 2>&1 &
+          echo "pool watcher started — website → runner sync every 60s"
+
+          # auto-prune watcher: every 30 min drop models the provider retired
+          # mid-run and hot-reload the router (used to live inside the panel)
+          nohup python3 /tmp/poolctl.py --watch > /tmp/poolprune.log 2>&1 &
+          echo "auto-prune watcher started"
+
+          # ── BUILT-IN POOL ROUTER (replaces LiteLLM) ──
+          # LiteLLM needed a 1-2 GB docker image, 4 workers, and a leaky
+          # per-worker request counter that required a watchdog. This is ONE
+          # stdlib-only python file: starts in <1s, zero downloads, and does
+          # exactly what this setup needs:
+          #   - OpenAI-compatible /v1/chat/completions + /v1/models on :4000
+          #   - "pool-auto" rotates across YOUR selected models x ALL keys
+          #   - 429 -> that key cools 30s -> next key; 401/403 -> key dropped
+          #   - a specific model name NEVER silently falls back to another
+          #   - re-reads pool.json on EVERY request: pressing Apply pool on
+          #     the website is live within ~60s, no restart ever needed
+          cp "$GITHUB_WORKSPACE/pool/pool_router.py" /tmp/pool-router.py
+
+          # keys live in a chmod-600 env file so the watchdog can restart
+          # the router with the same environment
+          cp /tmp/litellm.env /tmp/router.env
+          printf 'HERMES_HOME=%s\n' "$HERMES_HOME" >> /tmp/router.env
+          chmod 600 /tmp/router.env
+          rm -f /tmp/litellm.env
+
+          pkill -f pool-router.py 2>/dev/null || true
+          setsid nohup python3 /tmp/pool-router.py > /tmp/pool-router.log 2>&1 &
+
+          echo "Waiting for the pool router..."
+          for i in $(seq 1 15); do
+            curl -fs http://localhost:4000/v1/models >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fs http://localhost:4000/v1/models || { cat /tmp/pool-router.log; exit 1; }
+
+
+      # ── 7. Write .env (Telegram + Slack) ──
+      - name: Write .env
+        run: |
+          mkdir -p "$HERMES_HOME"
+          # Optional per-user extra allowlist WITHOUT touching GitHub secrets:
+          # ~/.hermes/telegram-allowed-extra.txt - one numeric Telegram user
+          # id per line (# comments allowed). The file lives inside the
+          # backed-up ~/.hermes tree, so the agent itself (or you via DM) can
+          # add/remove ids and they survive every restart. Ids are merged
+          # into TELEGRAM_ALLOWED_USERS together with TELEGRAM_USER_ID and
+          # the optional TELEGRAM_EXTRA_ALLOWED secret. No file = no change.
+          EXTRA_FILE_IDS=""
+          if [ -f "$HERMES_HOME/telegram-allowed-extra.txt" ]; then
+            EXTRA_FILE_IDS=$(grep -oE '^-?[0-9]+' "$HERMES_HOME/telegram-allowed-extra.txt" | paste -sd, -)
+            [ -n "$EXTRA_FILE_IDS" ] && echo "Extra Telegram allowlist ids loaded from telegram-allowed-extra.txt: ${EXTRA_FILE_IDS}"
+          fi
+          # Email multi-account (Gmail / Yahoo / Outlook): GMAIL_ACCOUNTS holds
+          # one "email : app-password" per line (panel or GitHub secret).
+          # Every line is normalized - ALL whitespace is stripped from both
+          # the address and the app password (Google shows app passwords as
+          # "xxxx xxxx xxxx xxxx" but logins need them space-free). Cleaned
+          # lines go into a 600-perm file for the agent; the FIRST line also
+          # becomes the default EMAIL_ADDRESS / EMAIL_APP_PASSWORD (plus
+          # legacy GMAIL_ADDRESS / GMAIL_APP_PASSWORD) pair in .env.
+          EMAIL_FILE="$HERMES_HOME/email-accounts.txt"
+          GMAIL_ADDRESS="" ; GMAIL_APP_PASSWORD=""
+          if [ -n "${GMAIL_ACCOUNTS:-}" ]; then
+            ( umask 077; printf '%s\n' "${GMAIL_ACCOUNTS}" | sed '/^[[:space:]]*$/d' | awk '{ i=index($0,":"); if (i==0) next; addr=substr($0,1,i-1); pass=substr($0,i+1); gsub(/[ \t\r]/,"",addr); gsub(/[ \t\r]/,"",pass); if (addr!="" && pass!="") print addr" : "pass }' > "$EMAIL_FILE" )
+            # legacy path kept in sync so nothing that still reads the old
+            # gmail-accounts.txt name ever breaks
+            ( umask 077; cp "$EMAIL_FILE" "$HERMES_HOME/gmail-accounts.txt" )
+            FIRST_ACCOUNT=$(head -1 "$EMAIL_FILE")
+            GMAIL_ADDRESS=$(printf '%s' "$FIRST_ACCOUNT" | cut -d: -f1 | tr -d ' \t')
+            GMAIL_APP_PASSWORD=$(printf '%s' "$FIRST_ACCOUNT" | cut -d: -f2- | tr -d ' \t')
+            echo "Email accounts configured: $(wc -l < "$EMAIL_FILE") (default: hidden)"
+          else
+            rm -f "$EMAIL_FILE" "$HERMES_HOME/gmail-accounts.txt"
+          fi
+          # Ready-made email toolkit - one CLI for every email task (list,
+          # read, search, stats, send, reply, forward, bulk-send, clean,
+          # delete, archive, move, attachments) - multi-account, provider
+          # auto-detect (Gmail / Yahoo / Outlook). The agent uses this
+          # FIRST for all email work instead of writing scripts from zero.
+          cp "$GITHUB_WORKSPACE/email/email_tool.py" "$HERMES_HOME/email_tool.py"
+          chmod 600 "$HERMES_HOME/email_tool.py"
+          echo "email_tool.py installed ($(wc -l < "$HERMES_HOME/email_tool.py") lines)"
+          # Mail-CLI shims: after context compaction weak models forget the
+          # prompt and reach for himalaya/mutt/mailx/sendmail again. Every
+          # such command now prints the working toolkit usage (instead of
+          # "command not found") so the agent self-corrects in ONE step -
+          # this works even when the prompt is long gone from context.
+          mkdir -p "$HOME/.local/bin"
+          for shim in himalaya mutt mailx neomutt mail msmtp sendmail; do
+            cp "$GITHUB_WORKSPACE/bin/mailshim" "$HOME/.local/bin/$shim"
+            chmod +x "$HOME/.local/bin/$shim"
+          done
+          echo "mail CLI shims installed -> ~/.local/bin (himalaya mutt mailx neomutt mail msmtp sendmail)"
+          # `skill` terminal command: deterministic, typo-tolerant skill
+          # lookup (the built-in skill_view fails on inexact names like
+          # 'himlaya'; this never does). `skill list` lists, `skill <query>`
+          # fuzzy-finds and prints the SKILL.md.
+          cp "$GITHUB_WORKSPACE/bin/skill" "$HOME/.local/bin/skill"
+          chmod +x "$HOME/.local/bin/skill"
+          ln -sf "$HOME/.local/bin/skill" "$HOME/.local/bin/skills"
+          echo "skill command installed -> ~/.local/bin/skill (fuzzy, typo-tolerant)"
+          cat > "$HERMES_HOME/.env" <<EOF
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          TELEGRAM_ALLOWED_USERS=${TELEGRAM_USER_ID}${TELEGRAM_EXTRA_ALLOWED:+,${TELEGRAM_EXTRA_ALLOWED}}${EXTRA_FILE_IDS:+,${EXTRA_FILE_IDS}}
+          TELEGRAM_GROUP_IDS=${TELEGRAM_GROUP_IDS:-}
+          TELEGRAM_GROUP_ROLE=${TELEGRAM_GROUP_ROLE:-auto}
+          FACEBOOK_PAGE_TOKEN=${FACEBOOK_PAGE_TOKEN:-}
+          FACEBOOK_PAGE_ID=${FACEBOOK_PAGE_ID:-}
+          SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+          SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+          SLACK_ALLOWED_USERS=${SLACK_USER_ID}
+          GMAIL_ADDRESS=${GMAIL_ADDRESS:-}
+          GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD:-}
+          EMAIL_ADDRESS=${GMAIL_ADDRESS:-}
+          EMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD:-}
+          SEARXNG_URL=http://localhost:8080
+          CAMOUFOX_URL=ws://127.0.0.1:9222/hermes
+          GROQ_API_KEY=${GROQ_API_KEY}
+          HERMESA_BOT_ID=${HERMESA_BOT_ID:-}
+          # No baked-in endpoints: these come ONLY from the config panel
+          # (Firebase vault) or GitHub secrets. Empty = the user has not set
+          # theirs yet, and the feature that needs it errors clearly at use.
+          HERMESA_DB_URL=${HERMESA_DB_URL:-}
+          ZEDGE_R2_WORKER_URL=${ZEDGE_R2_WORKER_URL:-}
+          ZEDGE_DB_URL_1=${ZEDGE_DB_URL_1:-}
+          ZEDGE_DB_URL_2=${ZEDGE_DB_URL_2:-}
+          ZEDGE_DB_URL_3=${ZEDGE_DB_URL_3:-}
+          EOF
+          # Hermes official Camofox mode - routes built-in browser_* tools
+          # through the anti-detect server (flag written in step 4 on success)
+          if [ -f /tmp/camofox_url ]; then
+            echo "CAMOFOX_URL=$(cat /tmp/camofox_url)" >> "$HERMES_HOME/.env"
+            # fix48: pin built-in browser tools to the SAME Camofox identity
+            # the user watches + logs into (the keepalive placeholder
+            # session "boss-view"). Hermes docs "Externally managed Camofox
+            # sessions": setting user_id makes Hermes share that window,
+            # profile and cookie jar, skip destructive cleanup and never
+            # DELETE the session. Without it Hermes invents a RANDOM
+            # ephemeral userId per task = fresh logged-out WINDOW each time
+            # (the "multiple windows" + "ignores my logins" complaints).
+            # session_key stays UNSET on purpose: Hermes opens its OWN tab
+            # per task instead of adopting the placeholder tab, so the
+            # keepalive's 2-min refresh never reloads the agent's page.
+            echo "CAMOFOX_USER_ID=boss-view" >> "$HERMES_HOME/.env"
+            echo "CAMOFOX_URL set - built-in browsing is anti-detect (shared boss-view session)"
+          fi
+
+      # ── 8. Standing instructions for the agent (auto save-to-file) ──
+      - name: Write agent instructions
+        run: |
+          mkdir -p "$HERMES_HOME/work"
+          cp "$GITHUB_WORKSPACE/agents/AGENTS.md" "$HOME/AGENTS.md"
+          # ── PERSISTENT MEMORY & USER NOTES (fix: survive every run) ──
+          # AGENTS.md is REGENERATED on every run, so anything the agent
+          # "remembers" by editing it is wiped. Notes and standing rules now
+          # live in ~/.hermes/memory/ (inside the backed-up tree) and are
+          # re-injected into the instructions here at every run start.
+          mkdir -p "$HERMES_HOME/memory"
+          touch "$HERMES_HOME/memory/MEMORY.md" "$HERMES_HOME/memory/custom-instructions.md"
+          cat "$GITHUB_WORKSPACE/agents/MEMORY.md" >> "$HOME/AGENTS.md"
+          {
+            echo
+            echo "# USER'S SAVED STANDING RULES (auto-injected from ~/.hermes/memory/custom-instructions.md)"
+            cat "$HERMES_HOME/memory/custom-instructions.md"
+            echo
+            echo "# USER'S SAVED MEMORIES & NOTES (auto-injected from ~/.hermes/memory/MEMORY.md)"
+            # cap runaway memory growth: keep the NEWEST 15000 chars (notes
+            # are appended chronologically, so the tail is the recent part)
+            MEMSIZE=$(wc -c < "$HERMES_HOME/memory/MEMORY.md")
+            if [ "$MEMSIZE" -gt 15000 ]; then
+              echo "(memory file is ${MEMSIZE} chars - newest 15000 shown; full file: ~/.hermes/memory/MEMORY.md)"
+              tail -c 15000 "$HERMES_HOME/memory/MEMORY.md"
+            else
+              cat "$HERMES_HOME/memory/MEMORY.md"
+            fi
+          } >> "$HOME/AGENTS.md"
+          # ── SKILL-FIRST PROTOCOL + LIVE SKILL INDEX ──
+          # The model keeps re-solving tasks from scratch (wrong, buggy code)
+          # even when a proven skill already exists, because it never LOOKS.
+          # Fix: generate an index of every installed skill and inject it into
+          # the instructions at run start, with hard reuse rules. The index is
+          # deterministic (shell, no LLM cooperation needed) and survives
+          # context compaction because it lives in the system instructions.
+          {
+            echo
+            echo "# SKILL-FIRST PROTOCOL (critical - REUSE, never reinvent)"
+            echo "- Below is the full list of installed skills. BEFORE starting ANY task, scan this list for a match."
+            echo "- If a skill matches the task: open it FIRST (terminal: skill <name>) and follow its steps EXACTLY as written. Do NOT write new code or invent new commands for a task an existing skill already solves. The skill is the tested, working solution."
+            echo "- Copy skill names EXACTLY from this list - never guess or abbreviate. The terminal command 'skill <name-or-keyword>' is typo-tolerant and fuzzy-matches; 'skill list' shows all skills."
+            echo "- If NO skill matches and you solve the task successfully: IMMEDIATELY save it as a skill - create ~/.hermes/hermes-agent/skills/<short-name>/SKILL.md containing the goal, the EXACT working commands/code you ran, inputs, and pitfalls. Next run must be able to repeat it without thinking."
+            echo "- If a skill's steps FAIL: fix the problem, then UPDATE that same SKILL.md with the corrected steps and a dated note. Never leave a broken skill as-is and never fork a duplicate skill."
+            echo "- Doing a task from scratch when a matching skill exists is an ERROR, even if you are confident."
+            echo
+            echo "## INSTALLED SKILLS (auto-generated at run start)"
+            sfound=0
+            for sk in "$HERMES_HOME/hermes-agent/skills"/*/SKILL.md "$HERMES_HOME/skills"/*/SKILL.md; do
+              [ -f "$sk" ] || continue
+              sfound=1
+              sname=$(basename "$(dirname "$sk")")
+              # Prefer the YAML front-matter `description:` (incl. folded >-
+              # multi-line) so the index says WHAT the skill does, not just
+              # `name: <name>`; fall back to the first text line otherwise.
+              sdesc=$(awk '/^---[ ]*$/{fm++;next} fm==1&&/^description:/{d=1;sub(/^description:[ ]*[>|]?-?[ ]*/,"");if(length($0))printf "%s ",$0;next} fm==1&&d&&/^[A-Za-z_-]+:/{d=0} fm==1&&d{gsub(/^[ ]+/,"");printf "%s ",$0} fm>=2{exit}' "$sk" | head -c 200)
+              [ -n "$sdesc" ] || sdesc=$(grep -m1 -E '[A-Za-z]' "$sk" | sed 's/^#* *//' | head -c 160)
+              echo "- $sname — $sdesc  [open with: skill $sname]"
+            done
+            [ "$sfound" = "1" ] || echo "- (no skills installed yet - when you solve a new task, save it as a skill per the rules above)"
+          } >> "$HOME/AGENTS.md"
+          # ── SIZE GUARD: never exceed the pinned context budget ──
+          # context_file_max_chars is pinned to 60000 in the Configure Hermes
+          # step; hard-cap the assembled file at 55000 so the prompt_builder
+          # can NEVER hit its truncation path again.
+          ASIZE=$(wc -c < "$HOME/AGENTS.md")
+          if [ "$ASIZE" -gt 55000 ]; then
+            head -c 55000 "$HOME/AGENTS.md" > /tmp/agents.trim
+            printf '\n\n# (auto-trimmed at run start: %s chars exceeded the 55000 budget - clean old notes in ~/.hermes/memory/MEMORY.md)\n' "$ASIZE" >> /tmp/agents.trim
+            mv /tmp/agents.trim "$HOME/AGENTS.md"
+            echo "::warning::AGENTS.md was ${ASIZE} chars - auto-trimmed to 55000 (prune ~/.hermes/memory/MEMORY.md)"
+          fi
+          echo "Agent instructions written to $HOME/AGENTS.md ($(wc -c < "$HOME/AGENTS.md") chars, budget 55000 of 60000)"
+
+      # ── 9. Configure Hermes (active model comes ONLY from YOUR pool) ──
+      - name: Configure Hermes
+        run: |
+          hermes config unset providers.nvidia.base_url || true
+          hermes config unset providers.nvidia.api_key_env || true
+          hermes config unset providers.nim.base_url || true
+          hermes config unset providers.nim.api_key_env || true
+          hermes config set model.provider custom
+          hermes config set model.base_url "http://localhost:4000/v1"
+          hermes config set model.api_key "sk-local"
+          # ★ default = "pool-auto": the router alias that auto-rotates across
+          #   ALL models YOU selected in the panel (never a hardcoded model)
+          hermes config set model.default "pool-auto"
+          echo "Active model: pool-auto (rotates across your whole selected pool)"
+          hermes config set model.context_length 65536
+          # more API retries — pool rotation sometimes needs several attempts
+          hermes config set agent.api_max_retries 8
+          # ── approvals: OFF - auto-approve EVERYTHING, never ask ──
+          # User's choice: headless runner, no approval prompts ever. "off"
+          # equals --yolo; HERMES_YOLO_MODE=1 doubles down so no code path
+          # can re-enable prompts. Worst case is limited to this throwaway
+          # runner VM, and the state repo is backed up every few minutes.
+          hermes config set approvals.mode off
+          echo "HERMES_YOLO_MODE=1" >> "$GITHUB_ENV"
+          export HERMES_YOLO_MODE=1
+          # ── model alias: /model pool ──
+          # Hermes' /model picker does NOT fetch the model list from a custom
+          # endpoint's /v1/models (known limitation: hermes-agent issue
+          # #20582 — picker shows only 1 model for custom providers). So we
+          # register an explicit "pool" alias so /model pool (Telegram) or
+          # !model pool (Slack) always jumps back to the auto-rotating pool.
+          # hermes config set only writes scalars, so patch config.yaml here.
+          python3 -c "import yaml" 2>/dev/null || pip install -q pyyaml
+          python3 "$GITHUB_WORKSPACE/scripts/model_alias.py"
+          # ── context budget: kill the "AGENTS.md TRUNCATED" warning ──
+          # The assembled AGENTS.md (base + memory + skill index) is ~37k+
+          # chars while the default context_file_max_chars is 20000, so the
+          # prompt_builder silently threw away ~45% of the instructions every
+          # turn. Pin a 60000 budget (try both key spellings - hermes
+          # versions differ on where the key lives).
+          hermes config set context_file_max_chars 60000 || true
+          hermes config set agent.context_file_max_chars 60000 || true
+          hermes config set web.search_backend searxng
+          # Built-in browser tools: Camofox anti-detect mode when the server
+          # came up (CAMOFOX_URL in .env routes ALL browser_* tools through
+          # it). Otherwise fall back to the visible Chrome over CDP.
+          if [ -f /tmp/camofox_url ]; then
+            # fix48: same shared identity in config.yaml too (the .env var
+            # takes precedence; this covers direct hermes runs/doctor)
+            hermes config set browser.camofox.user_id boss-view
+            echo "Built-in browser tools: Camofox anti-detect (no CDP beacons) - shared boss-view session"
+          else
+            hermes config set browser.cdp_url "http://127.0.0.1:9223"
+            echo "Built-in browser tools: visible Chrome fallback (CDP :9223)"
+          fi
+          # edge-tts CLI is needed by the tts toolset (free Microsoft voices).
+          # ALWAYS upgrade to the latest release: Microsoft periodically breaks
+          # old edge-tts versions (auth/DRM token changes), which surfaces as
+          # "NoAudioReceived" from the built-in text_to_speech tool. The hermes
+          # venv is restored from CACHE with its own stale edge_tts copy that
+          # the built-in tool imports, so upgrade BOTH copies every run.
+          pip install -q -U edge-tts || true
+          "$HERMES_HOME/hermes-agent/venv/bin/pip" install -q -U edge-tts \
+            && echo "edge-tts upgraded inside hermes venv: $("$HERMES_HOME/hermes-agent/venv/bin/pip" show edge-tts 2>/dev/null | awk '/^Version/{print $2}')" \
+            || echo "::warning::could not upgrade edge-tts inside hermes venv - built-in TTS may fail with NoAudioReceived"
+          hermes config set tts.provider edge
+
+          # ── Kanban (multi-agent board) ──
+          # Enable the durable task board so the gateway acts as an
+          # orchestrator (gets kanban_create etc.) and the embedded
+          # dispatcher spawns the assigned worker profile. This is generic
+          # infrastructure - it does NOTHING until you actually create a
+          # worker profile and start assigning tasks, so it is safe for
+          # everyone sharing this workflow. Per-user worker profiles live in
+          # ~/.hermes/profiles/<name>/ (backed up), not in this file.
+          hermes config set kanban.dispatch_in_gateway true || true
+          hermes config set kanban.dispatch_interval_seconds 30 || true
+          hermes config set kanban.review_dispatch true || true
+
+          hermes config set toolsets '["terminal","files","web","browser","code","vision","tts","memory","skills","delegation","cron","kanban"]'
+          hermes doctor || true
+          echo "── Final model config ──"
+          hermes config get model || true
+
+      # ── 10. Hermes WebUI (visual chat panel, password-protected) ──
+      - name: Start Hermes WebUI
+        run: |
+          # community panel with built-in password auth — safe behind a public tunnel
+          git clone --depth 1 https://github.com/nesquena/hermes-webui.git /tmp/hermes-webui \
+            || { echo "::warning::Hermes WebUI clone failed — skipping visual panel"; exit 0; }
+          cd /tmp/hermes-webui
+          export HERMES_WEBUI_PASSWORD="$PANEL_TOKEN"   # same password as model panel
+          export HERMES_WEBUI_PORT=8787
+          export HERMES_WEBUI_HOST=127.0.0.1
+          export HERMES_WEBUI_AUTO_INSTALL=1
+          ./ctl.sh start \
+            || { echo "::warning::Hermes WebUI failed to start — skipping"; tail -n 50 "$HERMES_HOME/webui.log" 2>/dev/null || true; exit 0; }
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:8787/ >/dev/null 2>&1 && break
+            sleep 3
+          done
+
+          # cloudflare quick tunnel for the WebUI (retried, since
+          # trycloudflare occasionally refuses the first connection)
+          WEBUI_URL=""
+          for try in 1 2 3; do
+            pkill -f "cloudflared tunnel --no-autoupdate --url http://localhost:8787" >/dev/null 2>&1 || true
+            : > /tmp/webui-tunnel.log
+            nohup cloudflared tunnel --no-autoupdate --url http://localhost:8787 > /tmp/webui-tunnel.log 2>&1 &
+            for i in $(seq 1 30); do
+              WEBUI_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/webui-tunnel.log | head -n1 || true)
+              [ -n "$WEBUI_URL" ] && break
+              sleep 2
+            done
+            [ -n "$WEBUI_URL" ] && break
+            echo "WebUI tunnel attempt ${try} failed, retrying..."
+          done
+          if [ -z "$WEBUI_URL" ]; then
+            echo "::warning::WebUI tunnel failed — panel only reachable inside runner"
+            exit 0
+          fi
+          echo "WEBUI_URL=$WEBUI_URL" >> "$GITHUB_ENV"
+          echo "=================================================="
+          echo "🖥️  HERMES WEBUI (visual chat panel):"
+          echo ""
+          echo "    $WEBUI_URL"
+          echo ""
+          echo "    (password = your PANEL_TOKEN secret)"
+          echo "=================================================="
+          echo "::notice title=🖥️ Hermes WebUI::$WEBUI_URL (password = PANEL_TOKEN secret)"
+
+      # ── 10b. Voice reply service (Telegram / Slack TTS + file delivery) ──
+      # Redesigned interface: professional dark HUD with a layered animated arc
+      # reactor, smart end-of-speech detection (auto-sends when you stop
+      # talking), barge-in interrupt (speak over the agent to cut it off),
+      # pause / resume / replay controls for the agent's voice, a task
+      # interrupt button, and drag-and-drop file uploads saved into
+      # ~/.hermes/work/uploads/ (persisted) so the agent can work on them.
+      # Every command runs the FULL Hermes agent via `hermes chat -q`.
+      # Voice replies: LOCAL Supertonic 3 (on-device ONNX, free, no API) speaks
+      # English & other languages; FREE Microsoft Edge neural TTS speaks Bangla
+      # (Supertonic has no Bangla voice). The user switches engine/voice from
+      # Telegram with "/edge vocal" or "/supersonic vocal" - every voice is sent
+      # as a playable sample to pick from - or in the VOICE MODEL panel.
+      # Protected by PANEL_TOKEN.
+      - name: Start Hermes Dashboard
+        run: |
+          # Official Nous management dashboard (settings, API keys, session
+          # monitor). Behind a public tunnel it MUST have auth: a non-loopback
+          # bind engages the built-in auth gate, and we feed it the bundled
+          # username/password provider (password = PANEL_TOKEN, like the rest).
+          # An auth-free loopback dashboard must NEVER be tunneled - it can
+          # read and write the .env secrets file.
+          DASH_SECRET=$(openssl rand -base64 32)
+          {
+            echo "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=boss"
+            echo "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${PANEL_TOKEN}"
+            echo "HERMES_DASHBOARD_BASIC_AUTH_SECRET=${DASH_SECRET}"
+          } >> "$HERMES_HOME/.env"
+          chmod 600 "$HERMES_HOME/.env" || true
+          nohup "$HOME/.local/bin/hermes" dashboard --no-open --host 0.0.0.0 --port 9119 \
+            > /tmp/dashboard.log 2>&1 &
+          ok=0
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:9119/api/status >/dev/null 2>&1 && { ok=1; break; }
+            sleep 3
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::warning::Hermes dashboard did not come up - skipping it this run"
+            tail -n 30 /tmp/dashboard.log 2>/dev/null || true
+            exit 0
+          fi
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:9119 > /tmp/dash-tunnel.log 2>&1 &
+          DASHBOARD_URL=""
+          for i in $(seq 1 30); do
+            DASHBOARD_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/dash-tunnel.log | head -n1 || true)
+            [ -n "$DASHBOARD_URL" ] && break
+            sleep 2
+          done
+          if [ -z "$DASHBOARD_URL" ]; then
+            echo "::warning::Dashboard tunnel failed - dashboard only reachable inside the runner"
+            exit 0
+          fi
+          echo "DASHBOARD_URL=$DASHBOARD_URL" >> "$GITHUB_ENV"
+          echo "::notice title=Hermes Dashboard::$DASHBOARD_URL (user: boss / password = PANEL_TOKEN secret)"
+      - name: Start voice reply service
+        run: |
+          mkdir -p /tmp/jarvis
+          cp "$GITHUB_WORKSPACE/jarvis/index.html" /tmp/jarvis/index.html
+          cp "$GITHUB_WORKSPACE/jarvis/app.py" /tmp/jarvis/app.py
+          sudo apt-get install -y -q ffmpeg >/dev/null 2>&1 || true
+          pip install -q flask requests || true
+          pip install -q -U edge-tts || true
+          # onnxruntime/soundfile are what Supertonic needs to run on CPU
+          pip install -q supertonic onnxruntime soundfile numpy > /tmp/supertonic_pip.log 2>&1 || echo '::warning::supertonic install failed - Edge TTS still works'
+          nohup python3 /tmp/jarvis/app.py > /tmp/jarvis.log 2>&1 &
+          sleep 2
+          curl -fs http://127.0.0.1:7777/ >/dev/null 2>&1 || { echo '::warning::voice reply service failed to start'; cat /tmp/jarvis.log; }
+          echo "Voice reply service running locally on 127.0.0.1:7777 (powers Telegram/Slack voice + inline file delivery). Jarvis web panel removed - no public tunnel."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      # ── 11. Unified state save loop (every 5 min -> ONE `state` branch) ──
+      - name: Start unified state save loop
+        run: |
+          # ── UNIFIED STATE SAVE: ONE script, ONE branch, EVERYTHING ──
+          # Replaces the old hot/backup/final 3-way split. Every 5 minutes
+          # (and on cancel, emergency exit and final push) the SAME script
+          # mirrors ALL state to the single `state` branch:
+          #   * agent-state/ = the FULL hermes-agent tree (skills + ANY file
+          #     the agent created, any name, any depth - NO whitelists)
+          #   * xdg-mirror/  = ~/.config, ~/.local/share, ~/.local/state
+          #   * state.db     = WAL-safe snapshot of ALL chats + sessions
+          #   * plus everything else inside ~/.hermes (work/, memory/,
+          #     skills/, uploads/, notes/, email-accounts.txt, ...)
+          # /tmp/statesnap persists between cycles so pushes are incremental
+          # and finish in seconds.
+          cp "$GITHUB_WORKSPACE/system/statesave.sh" /tmp/statesave.sh
+          chmod +x /tmp/statesave.sh
+          # old name kept as an alias so anything still calling it works
+          ln -sf /tmp/statesave.sh /tmp/hotsave.sh
+
+          cp "$GITHUB_WORKSPACE/system/sync.sh" /tmp/sync.sh
+          chmod +x /tmp/sync.sh
+          # persist creds for the emergency step (runs in a fresh shell)
+          printf 'export HERMES_HOME=%s\nexport DATA_REPO=%s\nexport DATA_REPO_TOKEN=%s\n' \
+            "$HERMES_HOME" "$DATA_REPO" "$DATA_REPO_TOKEN" > /tmp/save.env
+          chmod 600 /tmp/save.env
+          export HERMES_HOME DATA_REPO DATA_REPO_TOKEN
+          setsid nohup /tmp/sync.sh > /tmp/sync.log 2>&1 &
+          # save immediately so state is protected from minute one
+          HERMES_HOME="$HERMES_HOME" DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN" \
+            /tmp/statesave.sh || true
+
+      # ── 11b. File auto-sweeper: the user should NEVER have to say where ──
+      # to save a file. Platform uploads land in temp caches that get
+      # auto-deleted; this background loop copies anything new into the
+      # persisted ~/.hermes/work/inbox/ and auto-installs SKILL.md files
+      # into the skills dir - deterministic, zero LLM cooperation needed.
+      - name: Start file auto-sweeper
+        run: |
+          cp "$GITHUB_WORKSPACE/system/sweeper.sh" /tmp/sweeper.sh
+          chmod +x /tmp/sweeper.sh
+          export HERMES_HOME
+          setsid nohup /tmp/sweeper.sh > /tmp/sweeper.log 2>&1 &
+          echo "File auto-sweeper started (inbox: ~/.hermes/work/inbox)"
+
+      # ── 12. Notify start on Telegram (includes panel links) ──
+      - name: Notify start
+        run: |
+          # LIVE DESKTOP VIEW (noVNC on :6080, see step 4) over a
+          # cloudflare quick tunnel, retried up to 3 times
+          LIVEVIEW_URL=""
+          for try in 1 2 3; do
+            pkill -f "cloudflared tunnel --no-autoupdate --url http://localhost:6080" >/dev/null 2>&1 || true
+            : > /tmp/liveview-tunnel.log
+            nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > /tmp/liveview-tunnel.log 2>&1 &
+            for i in $(seq 1 30); do
+              LIVEVIEW_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/liveview-tunnel.log | head -n1 || true)
+              [ -n "$LIVEVIEW_URL" ] && break
+              sleep 2
+            done
+            [ -n "$LIVEVIEW_URL" ] && break
+            echo "live desktop tunnel attempt ${try} failed, retrying..."
+          done
+          [ -n "$LIVEVIEW_URL" ] && LIVEVIEW_URL="${LIVEVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
+          echo "::notice title=🔭 Live desktop view::${LIVEVIEW_URL:-tunnel failed}"
+          # fourth quick tunnel: CAMOFOX BROWSER VIEW. The browser renders on
+          # its OWN private Xvfb (never :99), exposed by the camofox VNC
+          # plugin as noVNC on :6081 - see the Start Camoufox step.
+          BROWSERVIEW_URL=""
+          if [ -f /tmp/camofox_url ]; then
+            nohup cloudflared tunnel --no-autoupdate --url http://localhost:6081 > /tmp/browserview-tunnel.log 2>&1 &
+            for i in $(seq 1 30); do
+              BROWSERVIEW_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/browserview-tunnel.log | head -n1 || true)
+              [ -n "$BROWSERVIEW_URL" ] && break
+              sleep 2
+            done
+            [ -n "$BROWSERVIEW_URL" ] && BROWSERVIEW_URL="${BROWSERVIEW_URL}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
+          fi
+          echo "::notice title=🦊 Camofox browser view::${BROWSERVIEW_URL:-not available}"
+          TG_API="https://api.telegram.org"
+          TG_RESP=$(curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_USER_ID}" \
+            --data-urlencode text="🟢 Hermes Agent ONLINE (Telegram + Slack, NVIDIA/Mistral pool)
+          🖥️ Hermes WebUI: ${WEBUI_URL:-not available}
+          �� Dashboard: ${DASHBOARD_URL:-not available} (user: boss)
+          ⏱ Run length: ${RUN_HOURS_INPUT:-5.5} hours
+          🔭 Live desktop: ${LIVEVIEW_URL:-not available} (agent GUI + fallback Chrome - FULL control - pass: first 8 chars of PANEL_TOKEN)
+          🦊 Camofox browser: ${BROWSERVIEW_URL:-not available} (the agent's ACTUAL browser - log into your accounts HERE, logins are saved - the agent works in THIS same window and sees your logins (placeholder tab keeps it awake) - brief black screen/disconnect = engine restarting, self-heals in ~1 min - same pass)
+          🔑 Password: your PANEL_TOKEN secret
+          📌 Address type: random cloudflare links — they change every run, always use the newest message
+          Model: pool-auto — auto-rotates across your whole selected pool")
+          case "$TG_RESP" in
+            *'"ok":true'*) echo "Start notification delivered to Telegram" ;;
+            *) echo "::warning::Telegram start notification FAILED - grab the links from the line below. Response: $(echo "$TG_RESP" | head -c 200)" ;;
+          esac
+          # belt-and-braces: links always land in this step log too
+          echo "LINKS: webui=${WEBUI_URL:-n/a} | dashboard=${DASHBOARD_URL:-n/a} | live=${LIVEVIEW_URL:-n/a} | browser=${BROWSERVIEW_URL:-n/a}"
+
+          # publish live links to Firebase so the config website's "Live run"
+          # tab always shows the current addresses (no-op without FIREBASE_*)
+          python3 /tmp/fbpub.py \
+            "state=online" \
+            "startedAt=$(date -u +%FT%TZ)" \
+            "tunnel=cloudflare" \
+            "permanent=false" \
+            "webuiUrl=${WEBUI_URL:-}" \
+            "dashboardUrl=${DASHBOARD_URL:-}" \
+            "liveUrl=${LIVEVIEW_URL:-}" \
+            "browserUrl=${BROWSERVIEW_URL:-}" || true
+          # heartbeat every 2 min - the site marks the run offline when the
+          # heartbeat is older than 5 min
+          setsid nohup bash -c 'while true; do python3 /tmp/fbpub.py >/dev/null 2>&1; sleep 120; done' > /dev/null 2>&1 &
+
+      # ── 13. Run gateway with time budget + anti-stuck watchdog ──
+      - name: Run Hermes gateway
+        run: |
+          # Shared virtual display :99 (browser + agent GUI + live view all
+          # render here; normally started in step 4 — this is just a safety
+          # net). Every terminal the agent opens inherits DISPLAY=:99.
+          export TZ=Asia/Dhaka
+          if ! pgrep -f "Xvfb :99" >/dev/null; then
+            Xvfb :99 -screen 0 1920x1080x24 > /tmp/xvfb99.log 2>&1 &
+            sleep 2
+          fi
+          export DISPLAY=:99
+          # keep the desktop looking like a real PC even if a piece died:
+          # window manager, wallpaper + icons layer, taskbar clock
+          pgrep -x fluxbox >/dev/null || (fluxbox > /tmp/fluxbox.log 2>&1 &)
+          pgrep -f "pcmanfm --desktop" >/dev/null || (nohup pcmanfm --desktop --profile default > /tmp/pcmanfm-desktop.log 2>&1 &)
+          pgrep -f "tint2 -c $HOME/.config/tint2/menubar.tint2rc" >/dev/null || (TZ=Asia/Dhaka nohup tint2 -c "$HOME/.config/tint2/menubar.tint2rc" > /tmp/tint2-menubar.log 2>&1 &)
+          pgrep -f "tint2 -c $HOME/.config/tint2/dock.tint2rc" >/dev/null || (TZ=Asia/Dhaka nohup tint2 -c "$HOME/.config/tint2/dock.tint2rc" > /tmp/tint2-dock.log 2>&1 &)
+          pgrep -x xcompmgr >/dev/null || (nohup xcompmgr -c -C -f -D 4 > /tmp/xcompmgr.log 2>&1 &)
+
+          # ── SMART SESSION RESET ──
+          # Only start a fresh chat session when the saved context is actually
+          # huge. Blindly resetting every run loses the conversation the user
+          # was in the middle of — that caused real data loss before.
+          python3 "$GITHUB_WORKSPACE/scripts/session_restore.py"
+
+          # ── TELEGRAM DEPENDENCY PREFLIGHT (fix: "Any cannot be instantiated") ──
+          # That cryptic error means python-telegram-bot FAILED TO IMPORT in
+          # the Hermes venv. The adapter then stubs every telegram class to
+          # typing.Any, and instantiating Any raises exactly this TypeError.
+          # Newer Hermes versions ship Telegram as a plugin and don't always
+          # install python-telegram-bot, so verify + repair it EVERY run
+          # before the gateway starts.
+          VENVPY="$HERMES_HOME/hermes-agent/venv/bin/python"
+          if [ -x "$VENVPY" ]; then
+            # Hermes builds its venv with uv, which ships WITHOUT pip —
+            # "python -m pip" fails with "No module named pip". So use a
+            # 3-level installer: uv pip → ensurepip → get-pip.py bootstrap.
+            venv_install() {
+              if "$VENVPY" -m pip --version >/dev/null 2>&1; then
+                "$VENVPY" -m pip install -q -U "$@" && return 0
+              fi
+              UV_BIN=$(command -v uv 2>/dev/null || true)
+              [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ] && UV_BIN="$HOME/.local/bin/uv"
+              [ -z "$UV_BIN" ] && [ -x "$HOME/.local/share/uv/uv" ] && UV_BIN="$HOME/.local/share/uv/uv"
+              if [ -n "$UV_BIN" ]; then
+                "$UV_BIN" pip install --python "$VENVPY" -q "$@" && return 0
+              fi
+              "$VENVPY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+              if ! "$VENVPY" -m pip --version >/dev/null 2>&1; then
+                curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+                  && "$VENVPY" /tmp/get-pip.py --quiet || true
+              fi
+              "$VENVPY" -m pip install -q -U "$@"
+            }
+            if ! "$VENVPY" -c "from telegram.request import HTTPXRequest" 2>/tmp/tgimport.err; then
+              echo "python-telegram-bot missing or broken in the venv - repairing:"
+              cat /tmp/tgimport.err || true
+              venv_install "python-telegram-bot[http2]" || venv_install python-telegram-bot || true
+              # a mismatched httpx/httpcore/anyio set can also break the import
+              if ! "$VENVPY" -c "from telegram.request import HTTPXRequest" 2>/dev/null; then
+                venv_install --force-reinstall httpx httpcore anyio h11 sniffio certifi || true
+                venv_install --force-reinstall python-telegram-bot || true
+              fi
+              if "$VENVPY" -c "from telegram.request import HTTPXRequest" 2>/dev/null; then
+                echo "python-telegram-bot repaired - Telegram will connect normally."
+              else
+                echo "::warning::python-telegram-bot still not importable - Telegram will stay offline this run"
+                curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  -d chat_id="${TELEGRAM_USER_ID}" \
+                  --data-urlencode text="🚨 Hermes: python-telegram-bot venv-e install kora gelo na - Telegram offline ei run e. Action log dekhun." > /dev/null || true
+              fi
+            else
+              echo "Telegram dependency preflight OK"
+            fi
+          fi
+
+          # watchdog: if the pool router ever hangs or dies, restart it in
+          # seconds — no more force-stopping the whole Action run. (LiteLLM's
+          # zombie/worker-leak detection is gone along with LiteLLM itself.)
+          cp "$GITHUB_WORKSPACE/system/watchdog.sh" /tmp/watchdog.sh
+          chmod +x /tmp/watchdog.sh
+          nohup /tmp/watchdog.sh > /tmp/watchdog.log 2>&1 &
+
+          # ── TELEGRAM POLLING SLOT RECLAIM ──
+          # When a previous run dies by SIGKILL / OOM / VM death, no exit path
+          # runs, so Telegram keeps that dead session's getUpdates slot open.
+          # Every new gateway then hits "Conflict: terminated by other
+          # getUpdates request" and gives up fatally. Issuing our OWN getUpdates
+          # call evicts the stale poller, so we claim the slot BEFORE starting.
+          TG_HOST="api.telegram.org"
+          tg_claim() {
+            if [ -z "${TELEGRAM_BOT_TOKEN}" ]; then
+              echo "No bot token in env - skipping Telegram slot reclaim"
+              return 0
+            fi
+            TG_API="https://${TG_HOST}/bot${TELEGRAM_BOT_TOKEN}"
+            # keep pending messages: anything sent while we were down still arrives
+            curl -s -m 20 "${TG_API}/deleteWebhook" -d "drop_pending_updates=false" >/dev/null 2>&1 || true
+            ok=0
+            i=0
+            while [ "$i" -lt 12 ]; do
+              i=$((i+1))
+              resp=$(curl -s -m 25 "${TG_API}/getUpdates?offset=-1&timeout=0" 2>/dev/null || echo "")
+              case "$resp" in
+                *'"ok":true'*)
+                  ok=$((ok+1))
+                  echo "  Telegram slot free (confirm $ok/2)"
+                  ;;
+                *Conflict*)
+                  ok=0
+                  echo "  Stale poller still holding the slot (attempt $i/12) - evicting"
+                  ;;
+                *)
+                  ok=0
+                  echo "  Telegram unreachable or error (attempt $i/12)"
+                  ;;
+              esac
+              if [ "$ok" -ge 2 ]; then
+                echo "Telegram polling slot reclaimed - safe to start gateway."
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::warning::Telegram slot still contested after 12 attempts - starting anyway"
+            return 0
+          }
+
+          # Kill any Hermes/gateway leftovers from an earlier attempt in THIS vm
+          # before we claim the slot, so we never fight ourselves.
+          pkill -f "hermes gateway" >/dev/null 2>&1 || true
+          sleep 2
+
+          # Manual run-hours input (short test runs). Clamped 6..345 min so a
+          # typo can neither instant-kill the run nor blow past the GitHub 6h
+          # job limit (job timeout-minutes: 350). Empty input = default 330.
+          if [ -n "$RUN_HOURS_INPUT" ]; then
+            RUN_MINUTES=$(awk -v h="$RUN_HOURS_INPUT" 'BEGIN{m=int(h*60+0.5); if(m<6)m=6; if(m>345)m=345; print m}')
+            echo "Manual duration selected: ${RUN_HOURS_INPUT}h -> ${RUN_MINUTES} minutes"
+          fi
+          JOB_START=$(cat /tmp/job_start)
+          END=$(( JOB_START + RUN_MINUTES * 60 ))
+          # Live vault sync: panel Save -> runner config files within ~45s,
+          # NO restart needed for Zedge / Hermesa / group settings.
+          nohup python3 "$GITHUB_WORKSPACE/scripts/vault_sync.py" >> /tmp/vault_sync.log 2>&1 &
+          echo "vault-sync daemon started (pid $!) - panel changes go live without restart"
+          while true; do
+            NOW=$(date +%s)
+            REMAIN=$(( (END - NOW) / 60 ))
+            if [ "$REMAIN" -le 2 ]; then
+              echo "Time budget exhausted"; break
+            fi
+            # keep "pool-auto" as default on every gateway (re)start — it
+            # always reflects the CURRENT pool you applied from the panel
+            hermes config set model.default "pool-auto" || true
+            tg_claim
+            echo "Starting gateway (${REMAIN}m remaining)..."
+            timeout -k 60 "${REMAIN}m" hermes gateway || true
+            # 60s (not 10s): Telegram holds the previous gateway's getUpdates
+            # session open for up to ~1 min after a crash. Restarting too fast
+            # causes "Conflict: terminated by other getUpdates request" and a
+            # fatal polling-conflict loop.
+            # tg_claim already frees the slot, so no need to idle a full
+            # minute; a short pause just avoids a hot crash-loop.
+            pkill -f "hermes gateway" >/dev/null 2>&1 || true
+            echo "Gateway exited, reclaiming Telegram slot and restarting in 15s..."
+            sleep 15
+          done
+
+      # ── 13b. EMERGENCY SAVE ──
+      # Runs first on ANY exit - including "Cancel workflow". Small and fast
+      # (seconds), so skills / brain / tasks / memory reach the repo even when
+      # the runner is about to be killed and the big final push never finishes.
+      - name: Emergency state save
+        if: always()
+        timeout-minutes: 4
+        run: |
+          [ -f /tmp/save.env ] && . /tmp/save.env || true
+          export HERMES_HOME="${HERMES_HOME:-/home/runner/.hermes}"
+          export DATA_REPO="$DATA_REPO" DATA_REPO_TOKEN="$DATA_REPO_TOKEN"
+          if [ -x /tmp/statesave.sh ]; then
+            /tmp/statesave.sh || echo "::warning::emergency state save failed"
+          else
+            echo "::warning::statesave.sh missing - nothing to save yet"
+          fi
+
+      # ── 14. Final push to data repo (main) ──
+      - name: Final data push
+        if: always()
+        timeout-minutes: 12
+        run: |
+          # ── UNIFIED FINAL SAVE ──
+          # Same single code path as the 5-min loop: run statesave.sh one
+          # last time so `state` holds the complete final snapshot, then
+          # mirror that exact snapshot to `main` so anything still reading
+          # main sees identical data (never a third, different copy).
+          [ -f /tmp/save.env ] && . /tmp/save.env || true
+          export HERMES_HOME="${HERMES_HOME:-/home/runner/.hermes}"
+          if [ -x /tmp/statesave.sh ]; then
+            /tmp/statesave.sh || echo "::warning::final state save failed"
+            if [ -d /tmp/statesnap/.git ]; then
+              cd /tmp/statesnap
+              timeout 300 git push -f "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" state:main \
+                && echo "state mirrored to main" \
+                || echo "::warning::main mirror push failed (state branch itself is saved)"
+            fi
+          else
+            echo "::warning::statesave.sh missing - nothing to save"
+          fi
+
+      # ── 16. Notify failure ──
+      - name: Notify failure
+        if: failure()
+        run: |
+          TG_API="https://api.telegram.org"
+          curl -s -X POST "${TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_USER_ID}" \
+            --data-urlencode text="🔴 Hermes Agent run FAILED — check Actions logs" > /dev/null
