@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# hermesa-group - act in the Hermesa app's group chat as the bot.
+#
+# FIX: the old version only searched the "hermesa-agent" skill folder, but
+# the skill actually installs as "hermesa-phone" - so group image/file
+# sending died with "not installed". Now every known location is searched.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+for d in "$HOME/.hermes/hermes-agent/skills/hermesa-phone/scripts" \
+         "$HOME/.hermes/skills/hermesa-phone/scripts" \
+         "$HOME/.hermes/hermes-agent/skills/hermesa-agent/scripts" \
+         "$HOME/.hermes/skills/hermesa-agent/scripts" \
+         "$SELF_DIR/../skills/hermesa-phone/scripts"; do
+  if [ -f "$d/hermesa_group.py" ]; then
+    exec python3 "$d/hermesa_group.py" "$@"
+  fi
+done
+echo "hermesa-group: hermesa_group.py is not installed (searched hermesa-phone and hermesa-agent skill folders)" >&2
+exit 1
