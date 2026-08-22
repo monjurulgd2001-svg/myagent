@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+exec python3 - "$@" <<'PYSKILL'
+import sys, os, glob, difflib
+home = os.path.expanduser("~")
+paths = glob.glob(home + "/.hermes/hermes-agent/skills/*/SKILL.md") + glob.glob(home + "/.hermes/skills/*/SKILL.md")
+skills = {}
+for p in paths:
+    skills.setdefault(os.path.basename(os.path.dirname(p)), p)
+if not skills:
+    print("No skills installed yet. Save one: ~/.hermes/hermes-agent/skills/<name>/SKILL.md")
+    sys.exit(0)
+q = " ".join(sys.argv[1:]).strip().lower()
+names = sorted(skills)
+if not q or q in ("list", "--list", "-l", "--help", "-h", "ls"):
+    print("Installed skills (view one with: skill <name>):")
+    for n in names:
+        print(" - " + n)
+    sys.exit(0)
+hit = q if q in skills else None
+if not hit:
+    subs = [n for n in names if q in n.lower() or n.lower() in q]
+    if subs:
+        hit = subs[0]
+if not hit:
+    close = difflib.get_close_matches(q, [n.lower() for n in names], n=1, cutoff=0.5)
+    if close:
+        hit = next(n for n in names if n.lower() == close[0])
+if not hit:
+    print("No skill matches '%s'. Installed skills:" % q)
+    for n in names:
+        print(" - " + n)
+    sys.exit(1)
+print("SKILL: %s (%s)" % (hit, skills[hit]))
+print("-" * 60)
+print(open(skills[hit], encoding="utf-8", errors="replace").read())
+PYSKILL

@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""pdf2md <file.pdf> [out.md] - PDF to Markdown, OCR fallback."""
+import sys, os
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: pdf2md <file.pdf> [out.md]"); return 2
+    src = sys.argv[1]
+    if not os.path.exists(src):
+        print("no such file: " + src); return 2
+    out = sys.argv[2] if len(sys.argv) > 2 else os.path.splitext(src)[0] + ".md"
+    import fitz  # PyMuPDF
+    doc = fitz.open(src)
+    parts = []
+    for n, page in enumerate(doc, 1):
+        txt = page.get_text("text").strip()
+        if len(txt) < 25:      # scanned page -> OCR it
+            try:
+                import pytesseract
+                from PIL import Image
+                import io
+                pix = page.get_pixmap(dpi=200)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                txt = pytesseract.image_to_string(img).strip()
+            except Exception as e:
+                txt = txt + "\n<!-- OCR failed: %s -->" % e
+        try:
+            for t in page.find_tables().tables:
+                rows = t.extract()
+                if not rows:
+                    continue
+                hdr = [str(c or "") for c in rows[0]]
+                parts.append("| " + " | ".join(hdr) + " |")
+                parts.append("|" + "---|" * len(hdr))
+                for r in rows[1:]:
+                    parts.append("| " + " | ".join(str(c or "") for c in r) + " |")
+        except Exception:
+            pass
+        parts.append("\n## Page %d\n\n%s" % (n, txt))
+    md = "\n".join(parts)
+    open(out, "w", encoding="utf-8").write(md)
+    print("wrote %s (%d pages, %d chars)" % (out, doc.page_count, len(md)))
+    return 0
+
+sys.exit(main())
