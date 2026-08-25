@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+echo "NOTE: '$(basename "$0")' is not the email tool on this system."
+if [ -f "$HOME/.hermes/email_tool.py" ]; then
+  echo "USE THIS INSTEAD: python3 $HOME/.hermes/email_tool.py <command>"
+  echo "It handles every email task for all configured accounts."
+  exec python3 "$HOME/.hermes/email_tool.py" --help
+else
+  echo "Write a short python smtplib/imaplib script instead (accounts in ~/.hermes/email-accounts.txt)."
+  exit 2
+fi
