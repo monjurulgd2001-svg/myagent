@@ -1,2 +1,0 @@
-#!/usr/bin/env bash
-exec python3 "$HOME/.hermes/hermes-agent/skills/telegram-group-manager/scripts/tg_group.py" "$@"
