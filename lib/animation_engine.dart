@@ -407,15 +407,20 @@ class AnimationEngine {
       // v94 — the failure detail (e.g. the HTTP status) rides along
       // so the next report names the cause, not just the step.
       final detail = e is TaskBackendException ? e.message : '$e';
-      final short = detail.length > 120
-          ? '${detail.substring(0, 120)}…'
+      final short = detail.length > 80
+          ? '${detail.substring(0, 80)}…'
           : detail;
-      // Never pop open the browser when Task mode is on — fail cleanly
-      // with the exact backend step so the app stays background-only.
-      _jobTimer?.cancel();
-      if (taskMode) ForegroundKeepAlive.release();
-      _setPhase(AnimationPhase.error, 'Backend hoyni ($step — $short)');
-      currentJobId = '';
+      status = 'Backend hoyni ($step — $short) — browser diye cholche…';
+      _emit();
+      try {
+        await _openBrowser(kGeminiChatUrl);
+        await _sendVideoJob(prompt, currentModelId, jobId);
+      } catch (err) {
+        _jobTimer?.cancel();
+        if (taskMode) ForegroundKeepAlive.release();
+        _setPhase(AnimationPhase.error, 'Browser khola jayni: $err');
+        currentJobId = '';
+      }
     }
   }
 

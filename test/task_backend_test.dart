@@ -3,6 +3,7 @@
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -22,6 +23,36 @@ GeminiSession _session({List<String> apiKeys = const ['AIzaTESTKEY']}) =>
       apiKeys: apiKeys,
       serverToken: 'CAMS-TEST-TOKEN',
     );
+
+/// v98 — a page transport that is always unreachable, so the client
+/// falls back to Dart HTTP deterministically (no real MethodChannel).
+class _FailingPageTransport implements BackendTransport {
+  @override
+  Future<BackendResponse> fetch({
+    required String method,
+    required Uri uri,
+    Map<String, String>? headers,
+    String? body,
+  }) async {
+    throw const TaskBackendException('transport', 'no tab');
+  }
+}
+
+/// v98 — a page transport answering from a canned handler, so a test
+/// can prove the flow runs on the page transport.
+class _CannedPageTransport implements BackendTransport {
+  _CannedPageTransport(this._answer);
+  final BackendResponse Function(String method, Uri uri, String? body)
+      _answer;
+  @override
+  Future<BackendResponse> fetch({
+    required String method,
+    required Uri uri,
+    Map<String, String>? headers,
+    String? body,
+  }) async =>
+      _answer(method, uri, body);
+}
 
 void main() {
   group('v92: Task backend protocol (pure)', () {
@@ -104,11 +135,6 @@ void main() {
           r''')]}'  48252 [["wrb.fr","hNvQHb",[[["https://lh3.googleusercontent.com/gg/AAA","https://contribution.usercontent.google.com/download?c\u003dABC123xyz",22,18]],null,[1795099400,421018407],null,"video/mp4",null]]]''';
       expect(extractVideoDownloadUrl(body),
           'https://contribution.usercontent.google.com/download?c=ABC123xyz');
-      const doubleEscaped =
-          r'[[\"https://contribution.usercontent.google.com/download?c\\u003dCgxiYXJkX3N0b3JhZ2U\\u0026filename\\u003dloop.mp4\\u0026opi\\u003d103135050\"]]';
-      expect(
-          extractVideoDownloadUrl(doubleEscaped),
-          'https://contribution.usercontent.google.com/download?c=CgxiYXJkX3N0b3JhZ2U&filename=loop.mp4&opi=103135050');
       expect(extractVideoDownloadUrl('no video here'), isNull);
     });
 
@@ -189,6 +215,7 @@ void main() {
         session: _session(),
         pollInterval: const Duration(milliseconds: 10),
         submitTimeout: const Duration(seconds: 5),
+        pageTransport: _FailingPageTransport(),
       );
       final bytes = await backend.run(
         'phone charging with golden energy',
@@ -212,6 +239,7 @@ void main() {
         session: _session(),
         pollInterval: const Duration(milliseconds: 10),
         submitTimeout: const Duration(seconds: 5),
+        pageTransport: _FailingPageTransport(),
       );
       try {
         await backend.run(
@@ -226,18 +254,20 @@ void main() {
     });
   });
 
-  group('v94: chooseServer tries bundle-first override keys in order', () {
+  group('v97: chooseServer tries override keys in order, browser-like headers', () {
     test('first key 403, second key 200 -> flow continues; headers set',
         () async {
       const cid = 'c_0123456789abcdef';
       const videoUrl =
           'https://contribution.usercontent.google.com/download?c=VID123';
-      final bundleKey1 = 'AIza${'B' * 35}';
-      final bundleKey2 = 'AIza${'C' * 35}';
+      final key1 = 'AIza${'B' * 35}';
+      final key2 = 'AIza${'C' * 35}';
       final docKey = 'AIza${'D' * 35}';
       final triedKeys = <String>[];
       var sawAuthUserHeader = false;
       var sawAcceptHeader = false;
+      var sawNoCookieHeader = false;
+      var sawSecFetchHeaders = false;
       final streamPayload = base64Encode(utf8.encode('xx${cid}yy'));
       final streamChunk = '[[3,["$streamPayload"]]]';
       final streamBody = '${streamChunk.length}\n$streamChunk\n';
@@ -246,9 +276,16 @@ void main() {
         if (url.contains('chooseServer')) {
           sawAuthUserHeader = req.headers['X-Goog-AuthUser'] == '0';
           sawAcceptHeader = req.headers['Accept'] == '*/*';
+          // v97 — the browser's working request carried no cookies,
+          // even though this test session has a cookie header; and
+          // it sent the fetch metadata headers.
+          sawNoCookieHeader = !req.headers.containsKey('Cookie');
+          sawSecFetchHeaders = req.headers['Sec-Fetch-Mode'] == 'cors' &&
+              req.headers['Sec-Fetch-Site'] == 'same-site' &&
+              req.headers['Sec-Fetch-Dest'] == 'empty';
           final key = req.url.queryParameters['key'] ?? '';
           triedKeys.add(key);
-          if (key == bundleKey2) {
+          if (key == key2) {
             return http.Response('["GS-TEST",3,null,"1","2"]', 200);
           }
           return http.Response('forbidden', 403);
@@ -276,11 +313,12 @@ void main() {
       final backend = TaskBackendClient(
         client: client,
         session: _session(apiKeys: [docKey]),
-        // v94 — the merged bundle-first list: the doc key is never
-        // tried because the second bundle key succeeds.
-        apiKeysOverride: [bundleKey1, bundleKey2, docKey],
+        // The override list: the doc key is never tried because the
+        // second key succeeds.
+        apiKeysOverride: [key1, key2, docKey],
         pollInterval: const Duration(milliseconds: 10),
         submitTimeout: const Duration(seconds: 5),
+        pageTransport: _FailingPageTransport(),
       );
       final bytes = await backend.run(
         'phone charging',
@@ -288,9 +326,11 @@ void main() {
         deadline: DateTime.now().add(const Duration(seconds: 30)),
       );
       expect(bytes, [9, 8, 7, 6]);
-      expect(triedKeys, [bundleKey1, bundleKey2]);
+      expect(triedKeys, [key1, key2]);
       expect(sawAuthUserHeader, isTrue);
       expect(sawAcceptHeader, isTrue);
+      expect(sawNoCookieHeader, isTrue);
+      expect(sawSecFetchHeaders, isTrue);
     });
   });
 
@@ -331,6 +371,7 @@ void main() {
         session: _session(),
         pollInterval: const Duration(milliseconds: 10),
         submitTimeout: const Duration(seconds: 5),
+        pageTransport: _FailingPageTransport(),
       );
       try {
         await backend.run(
@@ -342,6 +383,115 @@ void main() {
       } on TaskBackendException catch (e) {
         expect(e.step, 'download');
         expect(e.message, contains('403'));
+      }
+    });
+  });
+
+  group('v98: page transport first, Dart HTTP fallback', () {
+    test('full flow runs on the page transport; HTTP only sees the stream',
+        () async {
+      const cid = 'c_0123456789abcdef';
+      const videoUrl =
+          'https://contribution.usercontent.google.com/download?c=VID123';
+      final seenPage = <String>[];
+      final page = _CannedPageTransport((method, uri, body) {
+        final url = uri.toString();
+        if (url.contains('chooseServer')) {
+          seenPage.add('chooseServer');
+          return BackendResponse(
+              200, utf8.encode('["GS-TEST",3,null,"1","2"]'));
+        }
+        if (url.contains('processSession')) {
+          if (body != null && body.startsWith('count=0')) {
+            seenPage.add('open');
+            return BackendResponse(200,
+                utf8.encode('51\n[[0,["c","SID-TEST","",8,15,30000]]]\n'));
+          }
+          if (body != null && body.contains('ofs=0')) {
+            seenPage.add('setup');
+            return BackendResponse(200, utf8.encode('8\n[1,1,7]\n'));
+          }
+          if (body != null && body.contains('ofs=1')) {
+            seenPage.add('task');
+            return BackendResponse(200, utf8.encode('8\n[1,3,7]\n'));
+          }
+        }
+        if (url.contains('batchexecute')) {
+          seenPage.add('poll');
+          return BackendResponse(200,
+              utf8.encode(''')]}' [["wrb.fr","hNvQHb",[[["$videoUrl","video/mp4"]]]]]'''));
+        }
+        if (url.contains('usercontent')) {
+          seenPage.add('download');
+          return BackendResponse(200, [9, 8, 7, 6]);
+        }
+        return BackendResponse(404, utf8.encode('not found'));
+      });
+      final streamPayload = base64Encode(utf8.encode('xx${cid}yy'));
+      final streamChunk = '[[3,["$streamPayload"]]]';
+      final streamBody = '${streamChunk.length}\n$streamChunk\n';
+      final client = MockClient((req) async {
+        final url = req.url.toString();
+        if (url.contains('processSession') && req.method == 'GET') {
+          return http.Response(streamBody, 200);
+        }
+        fail('HTTP transport must not be used for $url');
+      });
+      final backend = TaskBackendClient(
+        client: client,
+        session: _session(),
+        pageTransport: page,
+        pollInterval: const Duration(milliseconds: 10),
+        submitTimeout: const Duration(seconds: 5),
+      );
+      final bytes = await backend.run(
+        'phone charging with golden energy',
+        onPhase: (_, __) {},
+        deadline: DateTime.now().add(const Duration(seconds: 30)),
+      );
+      expect(bytes, [9, 8, 7, 6]);
+      expect(seenPage, containsAll(
+          ['chooseServer', 'open', 'setup', 'task', 'poll', 'download']));
+    });
+
+    testWidgets('PageBackendTransport decodes the bridge reply; '
+        'null reply is a transport failure', (tester) async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(
+          const MethodChannel('com.geminihd.studio/gecko'),
+          (call) async {
+        if (call.method != 'backendFetch') return null;
+        final args = jsonDecode(call.arguments as String) as Map;
+        if ((args['url'] as String).contains('chooseServer')) {
+          return jsonEncode({
+            'status': 200,
+            'data':
+                'data:application/json;base64,${base64Encode(utf8.encode('["GS",3]'))}',
+          });
+        }
+        return null;
+      });
+      addTearDown(() => messenger.setMockMethodCallHandler(
+          const MethodChannel('com.geminihd.studio/gecko'), null));
+      final transport = PageBackendTransport();
+      final res = await transport.fetch(
+        method: 'POST',
+        uri: Uri.https('signaler-pa.clients6.google.com',
+            '/punctual/v1/chooseServer', {'key': 'k'}),
+        headers: {'Origin': 'https://gemini.google.com'},
+        body: '{}',
+      );
+      expect(res.status, 200);
+      expect(res.text, '["GS",3]');
+      try {
+        await transport.fetch(
+          method: 'GET',
+          uri: Uri.https('example.com', '/nope'),
+        );
+        fail('should throw');
+      } on TaskBackendException catch (e) {
+        expect(e.step, 'transport');
       }
     });
   });

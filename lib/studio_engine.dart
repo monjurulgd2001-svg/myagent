@@ -219,17 +219,14 @@ class StudioEngine {
     http.Client? httpClient,
   }) async {
     final session = await gemini.getSession();
-    // v94 — the signaler key lives in the UI JS bundle; fetch it
-    // once per UI version (cached) before the backend tries
-    // chooseServer, so the backend no longer burns its attempts on
-    // the page HTML's Firebase keys.
-    onPhase('opening', 'Backend key khujche…');
-    final apiKeys = await gemini.ensureBundleApiKeys(session);
+    // v97 — the signaler key is one of the page HTML's own keys
+    // (v94's bundle-keys idea was wrong, and fetching the 6 MB
+    // bundle stalled 180s on a slow network). The client tries
+    // session.apiKeys directly.
     final owned = httpClient == null;
     final client = TaskBackendClient(
       client: httpClient ?? http.Client(),
       session: session,
-      apiKeysOverride: apiKeys,
     );
     try {
       return await client.run(taskText, onPhase: onPhase, deadline: deadline);

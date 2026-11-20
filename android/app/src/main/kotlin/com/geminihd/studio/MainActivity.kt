@@ -208,6 +208,10 @@ class MainActivity : FlutterActivity() {
                         GeckoBridge.browserVideo(call.arguments as String)
                         result.success(true)
                     }
+                    "backendFetch" -> GeckoBridge.backendFetch(
+                        this, call.arguments as String) {
+                        result.success(it)
+                    }
                     "browserFetch" -> GeckoBridge.browserFetch(
                         this, call.arguments as String) {
                         result.success(it)

@@ -82,4 +82,46 @@ void main() {
     await tester.pump(const Duration(milliseconds: 100));
     expect(find.byTooltip('Light theme'), findsOneWidget);
   });
+
+  test('v99: light theme fields are white with a visible border, '
+      'chip labels are explicitly dark', () {
+    final light = buildStudioTheme(light: true);
+    final scheme = light.colorScheme;
+    expect(light.inputDecorationTheme.fillColor, scheme.surface);
+    expect(light.inputDecorationTheme.labelStyle?.color,
+        scheme.onSurfaceVariant);
+    expect(light.inputDecorationTheme.floatingLabelStyle?.color,
+        scheme.primary);
+    final border = light.inputDecorationTheme.enabledBorder
+        as OutlineInputBorder;
+    expect(border.borderSide.color, scheme.outline);
+    expect(light.chipTheme.labelStyle?.color, scheme.onSurface);
+    expect(light.chipTheme.secondaryLabelStyle?.color, scheme.onSurface);
+  });
+
+  testWidgets('v99: the selected mode chip is solid primary with an '
+      'onPrimary label in light mode', (tester) async {
+    await _pump(tester);
+    themeModeNotifier.value = ThemeMode.light;
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 300));
+    final chip = tester.widget<ChoiceChip>(find.ancestor(
+      of: find.text('24-Hour Set (4)').first,
+      matching: find.byType(ChoiceChip),
+    ));
+    expect(chip.selected, isTrue);
+    expect(chip.selectedColor, const Color(0xFF6C5CE7));
+    final label = tester.widget<Text>(find.text('24-Hour Set (4)').first);
+    expect(label.style?.color, Colors.white);
+    // An unselected mode chip keeps the pale surface + dark label.
+    final plain = tester.widget<ChoiceChip>(find.ancestor(
+      of: find.text('Single 9:16').first,
+      matching: find.byType(ChoiceChip),
+    ));
+    expect(plain.selected, isFalse);
+    expect(plain.backgroundColor, const Color(0xFFEDEAFF));
+    final plainLabel =
+        tester.widget<Text>(find.text('Single 9:16').first);
+    expect(plainLabel.style?.color, const Color(0xFF17171F));
+  });
 }

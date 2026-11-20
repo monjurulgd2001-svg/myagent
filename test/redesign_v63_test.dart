@@ -25,7 +25,7 @@ void main() {
     final subtitleTop =
         tester.getTopLeft(find.text('Wallpaper Set Designer')).dy;
     expect(subtitleTop, greaterThan(titleTop));
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }

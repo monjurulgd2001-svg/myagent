@@ -23,6 +23,17 @@ let basket = { srcs: [], v: 0, pages: 0 };
 // for a driver that never got the job. Queue it instead and
 // deliver it to the first Gemini tab that connects.
 let pendingVideo = null;
+// v98: same queue for page-transport fetches (backendFetch): the
+// headless Gemini tab may still be loading when the first backend
+// job arrives. Jobs are delivered to ONE tab only — a setup/task
+// POST must never run twice.
+let pendingBackendFetch = [];
+function backendFetchTab() {
+  for (const t of tabs) {
+    if (isGeminiTab(t)) return t;
+  }
+  return null;
+}
 function isGeminiTab(p) {
   try {
     const u = p.sender && p.sender.tab && p.sender.tab.url;
@@ -85,6 +96,19 @@ function fromApp(msg) {
         toTabs({ type: "video", prompt: msg.prompt, model: msg.model, jobId: msg.jobId });
       }
       break;
+    case "backendFetch":
+      // v98: one backend HTTP exchange, run by the Gemini page
+      // itself (content.js fetch). Sent to ONE Gemini tab only.
+      // Queued when no tab is connected yet (headless tab still
+      // loading); the app's own timeout bounds the wait.
+      const tab = backendFetchTab();
+      const job = { type: "backendFetch", id: msg.id, method: msg.method, url: msg.url, headers: msg.headers || {}, body: msg.body || "" };
+      if (tab) {
+        try { tab.postMessage(job); } catch (e) { pendingBackendFetch.push(job); }
+      } else {
+        pendingBackendFetch.push(job);
+      }
+      break;
   }
 }
 
@@ -97,8 +121,16 @@ browser.runtime.onConnect.addListener((p) => {
     try { p.postMessage({ type: "video", prompt: pendingVideo.prompt, model: pendingVideo.model, jobId: pendingVideo.jobId }); } catch (e) {}
     pendingVideo = null;
   }
+  // v98: deliver queued page-transport fetches to this Gemini tab.
+  if (pendingBackendFetch.length > 0 && isGeminiTab(p)) {
+    const queued = pendingBackendFetch;
+    pendingBackendFetch = [];
+    for (const job of queued) {
+      try { p.postMessage(job); } catch (e) {}
+    }
+  }
   p.onMessage.addListener((m) => {
-    if (m && m.type === "q" && port) port.postMessage(m);
+    if (m && (m.type === "q" || m.type === "backendFetch") && port) port.postMessage(m);
   });
   p.onDisconnect.addListener(() => tabs.delete(p));
 });

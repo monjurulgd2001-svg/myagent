@@ -292,6 +292,52 @@ object GeckoBridge {
         post(JSONObject(json).put("cmd", "video"))
     }
 
+    // ------------------------------------------------- v98: page transport
+    /**
+     * Headless Gemini tab for the v98 page transport: the same
+     * invisible-session pattern as [refresh] (no view, no Activity),
+     * but kept alive while the app runs so the content script stays
+     * connected and the backend's page fetches are instant after the
+     * first load. The page's own fetch is what makes the request the
+     * browser's own (its cookies, Origin, sec-fetch, HTTP/2, TLS).
+     */
+    private var backendSession: GeckoSession? = null
+
+    fun ensureBackendSession(context: Context) {
+        val s = backendSession
+        if (s != null && s.isOpen) return
+        val session = GeckoSession(
+            GeckoSessionSettings.Builder()
+                .usePrivateMode(false)
+                .useTrackingProtection(false)
+                .build()
+        )
+        session.open(runtime(context))
+        session.setActive(true)
+        session.loadUri(GEMINI_URL)
+        backendSession = session
+    }
+
+    /** One backend exchange through the page: opens the headless
+     * Gemini tab if needed, then sends the job to the extension
+     * (background.js queues it until a Gemini tab connects) and
+     * waits for the content script's reply. 120s: the page fetch
+     * itself is fast, but on a slow network the tab may still be
+     * loading when the first job arrives. Null = no answer in time
+     * (Dart falls back to plain HTTP). */
+    fun backendFetch(context: Context, json: String, done: (String?) -> Unit) {
+        ensureBackendSession(context)
+        val o = try {
+            JSONObject(json)
+        } catch (_: Exception) {
+            done(null)
+            return
+        }
+        request(context, o.put("cmd", "backendFetch"), 120000) { reply ->
+            done(reply?.toString())
+        }
+    }
+
     /** Screenshot of an area of the visible page (shares of the
      * viewport: {"x","y","w","h"} 0..1). Answers base64 PNG or null. */
     fun browserCapture(json: String, done: (String?) -> Unit) {

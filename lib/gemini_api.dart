@@ -24,7 +24,6 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'models.dart';
 import 'session_store.dart';
@@ -333,8 +332,6 @@ class GeminiApi {
     // v92 — Task backend: the signaler API key (one of the AIza keys
     // in the page) and the X-Server-Token (page key "PI9WOb") are
     // read from the same HTML, exactly like SNlM0e — never hardcoded.
-    // v94 — the page HTML's keys are Firebase keys; the real
-    // signaler key lives in the UI JS bundle (see extractBundleUrl).
     final serverToken =
         RegExp(r'"PI9WOb":"([^"]+)"').firstMatch(html)?.group(1) ?? '';
     return GeminiSession(
@@ -347,55 +344,7 @@ class GeminiApi {
       fetchedAtMs: DateTime.now().millisecondsSinceEpoch,
       apiKeys: extractApiKeys(html),
       serverToken: serverToken,
-      bundleUrl: extractBundleUrl(html) ?? '',
     );
-  }
-
-  /// v94 — the keys for chooseServer, bundle-first. The page HTML's
-  /// AIza keys are Firebase/web-client keys and all fail chooseServer
-  /// with 403; the real signaler key lives in the Gemini web UI's
-  /// JS bundle (session.bundleUrl, from the page's preload link).
-  /// The bundle (~6 MB) is fetched ONCE per UI version and cached
-  /// (in-memory + SharedPreferences, keyed by its URL); a failed
-  /// fetch falls back to the document keys (v92 behaviour) so a
-  /// slow network never blocks the video — the backend then fails
-  /// with the exact step and the browser driver takes over.
-  static final Map<String, List<String>> _bundleKeysCache = {};
-  static const _bundleUrlPrefsKey = 'taskBackendBundleUrl';
-  static const _bundleKeysPrefsKey = 'taskBackendBundleKeys';
-
-  Future<List<String>> ensureBundleApiKeys(GeminiSession session) async {
-    final url = session.bundleUrl;
-    if (url.isEmpty) return session.apiKeys;
-    final cached = _bundleKeysCache[url];
-    if (cached != null) {
-      return mergeApiKeys(bundleKeys: cached, docKeys: session.apiKeys);
-    }
-    final prefs = await SharedPreferences.getInstance();
-    if (prefs.getString(_bundleUrlPrefsKey) == url) {
-      final stored = prefs.getStringList(_bundleKeysPrefsKey);
-      if (stored != null && stored.isNotEmpty) {
-        _bundleKeysCache[url] = stored;
-        return mergeApiKeys(bundleKeys: stored, docKeys: session.apiKeys);
-      }
-    }
-    try {
-      final res = await _client
-          .get(Uri.parse(url), headers: {'User-Agent': chromeUserAgent})
-          .timeout(const Duration(seconds: 180));
-      if (res.statusCode == 200) {
-        final keys = extractApiKeys(res.body);
-        if (keys.isNotEmpty) {
-          _bundleKeysCache[url] = keys;
-          await prefs.setString(_bundleUrlPrefsKey, url);
-          await prefs.setStringList(_bundleKeysPrefsKey, keys);
-          return mergeApiKeys(bundleKeys: keys, docKeys: session.apiKeys);
-        }
-      }
-    } catch (_) {
-      // Slow network / bundle moved: fall through to document keys.
-    }
-    return session.apiKeys;
   }
 
   /// Probes /u/0../u/5 in parallel and returns every distinct signed-in

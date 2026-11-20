@@ -19,7 +19,7 @@ void main() {
     // phone since v83, when the hero card became a slim app bar).
     expect(find.image(const AssetImage('assets/logo.png')), findsOneWidget);
     // Chip tracks the current build (v62 compacted the header).
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

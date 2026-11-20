@@ -42,7 +42,7 @@ void main() {
     expect(find.text('0 sets'), findsOneWidget);
     expect(find.text('Wallpaper Set Designer'), findsOneWidget);
     expect(find.text('Not connected'), findsOneWidget);
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
 
     // Subtitle still sits directly under the title text (v63).
     final titleLeft = tester.getTopLeft(find.text('Zedge Studio')).dx;
@@ -61,7 +61,7 @@ void main() {
     // = 65px measured on a phone).
     expect(tester.getSize(find.byKey(const ValueKey('appBar'))).height,
         lessThanOrEqualTo(72));
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
     expect(find.text('Wallpaper Set Designer'), findsOneWidget);
     expect(find.text('Not connected'), findsOneWidget);
     expect(find.byType(NavigationBar), findsOneWidget);

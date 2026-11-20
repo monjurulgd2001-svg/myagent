@@ -1200,7 +1200,7 @@ void main() {
       expect(engine.videos.first.height, 2880);
     });
 
-    test('backend failure: never opens browser in Task mode, reports error',
+    test('backend failure: falls back to the browser driver once',
         () async {
       final opened = <String>[];
       final jobs = <Map<String, String>>[];
@@ -1220,9 +1220,10 @@ void main() {
               signedIn: true),
           isTrue);
       await Future.delayed(const Duration(milliseconds: 300));
-      expect(opened, isEmpty);
-      expect(jobs, isEmpty);
-      expect(engine.phase, AnimationPhase.error);
+      expect(opened, ['https://gemini.google.com/app']);
+      expect(jobs.length, 1);
+      expect(jobs.first['model'], 'neon');
+      // v94 — the fallback line now carries the failure detail.
       expect(engine.status,
           contains('Backend hoyni (channel — Conversation id asheni.)'));
     });

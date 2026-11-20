@@ -22,7 +22,7 @@ void main() {
     final title =
         tester.widget<Text>(find.text('Zedge Studio'));
     expect(title.style!.fontSize, 16);
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
     expect(find.text('Wallpaper Set Designer'), findsOneWidget);
     // No overflow / layout error on the narrow screen.
     expect(tester.takeException(), isNull);

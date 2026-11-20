@@ -276,14 +276,22 @@ ThemeData buildStudioTheme({bool light = false}) {
         ),
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
-          fillColor: scheme.surfaceContainerHigh,
+          // v99 — the fill was a pale lavender wash
+          // (surfaceContainerHigh) with a near-invisible border, so
+          // the Prompt field read as one big faint slab in light
+          // mode. Fields now take the surface colour with a visible
+          // outline, and the label/hint colours are explicit.
+          fillColor: scheme.surface,
+          labelStyle: TextStyle(color: scheme.onSurfaceVariant),
+          floatingLabelStyle: TextStyle(color: scheme.primary),
+          hintStyle: TextStyle(color: scheme.onSurfaceVariant),
           border: OutlineInputBorder(
             borderRadius: BorderRadius.circular(14),
-            borderSide: BorderSide(color: scheme.outlineVariant),
+            borderSide: BorderSide(color: scheme.outline),
           ),
           enabledBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(14),
-            borderSide: BorderSide(color: scheme.outlineVariant),
+            borderSide: BorderSide(color: scheme.outline),
           ),
           focusedBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(14),
@@ -312,8 +320,13 @@ ThemeData buildStudioTheme({bool light = false}) {
           side: BorderSide(color: scheme.outlineVariant),
           shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(999)),
-          labelStyle:
-              const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
+          // v99 — the label colour was left to theme defaults, so
+          // chip text could render in a washed-out tint in light
+          // mode. It is now explicit on both states.
+          labelStyle: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurface),
           secondaryLabelStyle: TextStyle(
               fontSize: 12.5,
               fontWeight: FontWeight.w700,
@@ -1931,7 +1944,6 @@ class _HomeScreenState extends State<HomeScreen> {
     // generated sets below, in a single scroll view. The Showcase
     // tab is gone; its panel lives inline under the designer.
     return SingleChildScrollView(
-      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       controller: _studioScrollCtrl,
       padding: const EdgeInsets.all(12),
       child: Column(
@@ -2027,7 +2039,7 @@ class _HomeScreenState extends State<HomeScreen> {
             icon: const Icon(Icons.cloud_upload_outlined),
           ),
           const SizedBox(width: 8),
-          Text('Version 2.5.31',
+          Text('Version 2.5.34',
               style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.w600,
@@ -2786,14 +2798,30 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _modeChip(String value, String label, IconData icon) {
     final selected = _mode == value;
+    final scheme = Theme.of(context).colorScheme;
     return ChoiceChip(
       avatar: Icon(icon,
-          size: 17, color: Theme.of(context).colorScheme.primary),
-      label: Text(label, style: const TextStyle(fontSize: 13)),
+          size: 17,
+          color: selected ? scheme.onPrimary : scheme.primary),
+      label: Text(label,
+          style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: selected ? scheme.onPrimary : scheme.onSurface)),
       labelPadding: const EdgeInsets.only(left: 2, right: 4),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(14)),
+      // v99 — the picked mode was invisible in light mode: the
+      // theme's pale containers (selected #E4DEFF vs plain #EDEAFF)
+      // were nearly identical, and the label colour was left to
+      // theme defaults. Selected is now solid primary with an
+      // onPrimary label; unselected keeps the pale surface with a
+      // visible outline and a dark label.
+      selectedColor: scheme.primary,
+      backgroundColor: scheme.surfaceContainer,
+      side: BorderSide(
+          color: selected ? Colors.transparent : scheme.outline),
       selected: selected,
       onSelected: (_) => setState(() {
         _mode = value;
@@ -3212,11 +3240,16 @@ class _HomeScreenState extends State<HomeScreen> {
                     style: TextStyle(
                         fontSize: 17, fontWeight: FontWeight.w800)),
                 const SizedBox(height: 6),
-                const Text(
+                Text(
                     'Sign in with Gemini, write a prompt and Generate.',
                     textAlign: TextAlign.center,
-                    style:
-                        TextStyle(fontSize: 13, color: Colors.grey)),
+                    // v99 — was hardcoded grey, faint on the light
+                    // empty-state card.
+                    style: TextStyle(
+                        fontSize: 13,
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurfaceVariant)),
                 const SizedBox(height: 18),
                 FilledButton.icon(
                   onPressed: _scrollStudioToTop,
@@ -3359,20 +3392,16 @@ class _SetCardState extends State<SetCard> {
   /// One hashtag chip, shared by the collapsed (one scrollable
   /// row) and expanded (wrapped) tag layouts.
   Widget _tagChip(String tag) {
-    final cs = Theme.of(context).colorScheme;
-    final dark = Theme.of(context).brightness == Brightness.dark;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: dark ? const Color(0xFF12121B) : cs.surfaceContainerHighest,
-        border: Border.all(
-            color: dark ? Colors.white12 : cs.outlineVariant),
+        color: const Color(0xFF12121B),
+        border: Border.all(color: Colors.white12),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Text('#$tag',
-          style: TextStyle(
-              fontSize: 13,
-              color: dark ? const Color(0xFFC9C9D2) : cs.onSurfaceVariant)),
+          style:
+              const TextStyle(fontSize: 13, color: Color(0xFFC9C9D2))),
     );
   }
 

@@ -128,7 +128,6 @@ class _AnimationSectionState extends State<AnimationSection> {
       );
     }
     return SingleChildScrollView(
-      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       controller: _scrollCtrl,
       padding: const EdgeInsets.all(12),
       child: Column(
@@ -271,7 +270,7 @@ class _AnimationSectionState extends State<AnimationSection> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Icon(Icons.warning_amber_rounded,
-                      size: 16, color: (Theme.of(context).brightness == Brightness.dark ? const Color(0xFFFFB020) : const Color(0xFFB45309))),
+                      size: 16, color: Color(0xFFFFB020)),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
@@ -279,7 +278,7 @@ class _AnimationSectionState extends State<AnimationSection> {
                       'brand/character thakle Zedge account-e strike '
                       'khete pare. Onno word diye lekho.',
                       style: const TextStyle(
-                          fontSize: 12, color: (Theme.of(context).brightness == Brightness.dark ? const Color(0xFFFFB020) : const Color(0xFFB45309))),
+                          fontSize: 12, color: Color(0xFFFFB020)),
                     ),
                   ),
                 ],
@@ -516,7 +515,7 @@ class _AnimationSectionState extends State<AnimationSection> {
                         style: TextStyle(
                             fontSize: 12,
                             color: engine.phase == AnimationPhase.error
-                                ? (Theme.of(context).brightness == Brightness.dark ? const Color(0xFFF87171) : const Color(0xFFDC2626))
+                                ? const Color(0xFFF87171)
                                 : _cs.onSurface.withValues(alpha: 0.7))),
                   ),
                 ],

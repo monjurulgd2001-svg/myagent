@@ -31,12 +31,8 @@ class GeminiSession {
   /// HTML (the signaler key is one of them; the client tries each
   /// for chooseServer) and the X-Server-Token (page key "PI9WOb").
   /// Extracted at session fetch, never hardcoded.
-  /// v94 — the page HTML's keys are Firebase keys (they all 403 on
-  /// chooseServer); the real key lives in the UI JS bundle, whose
-  /// URL is saved here so the backend can fetch it once per version.
   final List<String> apiKeys;
   final String serverToken;
-  final String bundleUrl;
   const GeminiSession({
     required this.authUser,
     required this.email,
@@ -47,7 +43,6 @@ class GeminiSession {
     required this.fetchedAtMs,
     this.apiKeys = const [],
     this.serverToken = '',
-    this.bundleUrl = '',
   });
   bool get isFresh =>
       DateTime.now().millisecondsSinceEpoch - fetchedAtMs < 15 * 60 * 1000;

@@ -39,7 +39,7 @@ void main() {
     expect(find.image(const AssetImage('assets/logo.png')), findsOneWidget);
     expect(find.text('Zedge Studio'), findsOneWidget);
     expect(find.text('Wallpaper Set Designer'), findsOneWidget);
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
     // v83: no Gemini Login icon in the app bar — Login is a nav
     // destination, and the third icon squeezed the title.
     expect(find.byTooltip('Gemini Login'), findsNothing);
@@ -82,7 +82,7 @@ void main() {
     expect(_heroCard(), findsNothing);
     expect(tester.getSize(find.byKey(const ValueKey('appBar'))).height,
         lessThanOrEqualTo(64));
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
     // Showcase is side by side on wide, so its chips are visible.
     expect(find.text('0 sets'), findsOneWidget);
     expect(find.text('Not connected'), findsOneWidget);

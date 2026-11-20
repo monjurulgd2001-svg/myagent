@@ -62,41 +62,26 @@ jobs:
       - name: Analyze (warnings only, build continues)
         run: flutter analyze || true
 
-      - name: Configure Gradle Maven mirrors for included builds
-        run: |
-          mkdir -p ~/.gradle/init.d
-          cat << 'EOF' > ~/.gradle/init.d/mirrors.gradle
-          gradle.beforeProject { proj ->
-              def addMirror = { repos ->
-                  def m = repos.maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
-                  repos.remove(m)
-                  repos.add(0, m)
-              }
-              addMirror(proj.buildscript.repositories)
-              addMirror(proj.repositories)
-          }
-          EOF
-
       - name: Build release APK
         # arm64 only: the built-in GeckoView engine is bundled for
         # arm64-v8a (every Android 8+ phone from the last years).
         run: flutter build apk --release --target-platform android-arm64
 
       - name: Rename APK
-        run: cp build/app/outputs/flutter-apk/app-release.apk ZedgeStudio-2.5.31-release.apk
+        run: cp build/app/outputs/flutter-apk/app-release.apk ZedgeStudio-2.5.34-release.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: gemini-hd-studio-android-apk
-          path: ZedgeStudio-2.5.31-release.apk
+          path: ZedgeStudio-2.5.34-release.apk
           retention-days: 90
 
       - name: Publish APK to Release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ZedgeStudio-2.5.31-release.apk
+          files: ZedgeStudio-2.5.34-release.apk
 
   build-windows:
     name: Windows App + Setup .exe
@@ -106,8 +91,8 @@ jobs:
     # (source app-o tai use kore). windows-2022-te VS 2022 ache.
     runs-on: windows-2022
     steps:
-      - name: Workflow version (v96)
-        run: echo "WORKFLOW FILE VERSION = v96 (Version 2.5.31 label, Compact metadata card + Aro dekho expand)"
+      - name: Workflow version (v99)
+        run: echo "WORKFLOW FILE VERSION = v99 (Version 2.5.34 label, light-theme contrast - solid-primary selected mode chip, white fields)"
 
       - name: Checkout
         uses: actions/checkout@v4

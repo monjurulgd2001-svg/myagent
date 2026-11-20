@@ -675,7 +675,10 @@ window.__aisTouchUI = true;
     try {
       port = browser.runtime.connect({ name: 'ais-tab' });
       port.onMessage.addListener((m) => {
-        try { if (m && m.type === 'video') onJob(m); } catch (e) {}
+        try {
+          if (m && m.type === 'video') onJob(m);
+          else if (m && m.type === 'backendFetch') backendFetch(m);
+        } catch (e) {}
       });
       port.onDisconnect.addListener(() => { port = null; setTimeout(connect, 1000); });
     } catch (e) { setTimeout(connect, 1000); }
@@ -686,6 +689,44 @@ window.__aisTouchUI = true;
     try {
       if (port) port.postMessage({ type: 'q', q: [JSON.stringify({ action, data: data || {} })], page: location.href, title: document.title });
     } catch (e) {}
+  }
+
+  // v98: page-side fetch — one backend HTTP exchange, run HERE in
+  // the Gemini page, so the request IS the browser's own: its
+  // cookies, Origin, Referer, sec-fetch headers, HTTP/2 and TLS all
+  // come from the real browser. The app only passes method/URL/
+  // extra headers/body and gets {status, data} back (base64 data
+  // URL, same shape as the picture download). Forbidden headers
+  // (Origin/Referer/Cookie/User-Agent/sec-fetch-*) are stripped —
+  // fetch sets them from the page itself, and setting them throws.
+  async function backendFetch(m) {
+    try {
+      const headers = {};
+      for (const k of Object.keys(m.headers || {})) {
+        const lk = k.toLowerCase();
+        if (lk === 'origin' || lk === 'referer' || lk === 'cookie' ||
+            lk === 'user-agent' || lk.indexOf('sec-fetch-') === 0) continue;
+        headers[k] = m.headers[k];
+      }
+      const method = (m.method || 'GET').toUpperCase();
+      const r = await fetch(m.url, {
+        method,
+        headers,
+        body: (method === 'GET' || method === 'HEAD') ? undefined : (m.body || undefined),
+        credentials: 'include',
+      });
+      const blob = await r.blob();
+      if (blob.size > 25 * 1024 * 1024) throw new Error('response too large');
+      const data = await new Promise((ok, bad) => {
+        const fr = new FileReader();
+        fr.onload = () => ok(fr.result);
+        fr.onerror = () => bad(fr.error);
+        fr.readAsDataURL(blob);
+      });
+      port.postMessage({ type: 'backendFetch', id: m.id, status: r.status, data: data });
+    } catch (e) {
+      try { port.postMessage({ type: 'backendFetch', id: m.id, error: String(e && e.message || e) }); } catch (_) {}
+    }
   }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const norm = (s) => (s || '').toLowerCase();
@@ -791,19 +832,6 @@ window.__aisTouchUI = true;
       // steps) — generation bondho hobe na, status-e janiye dibe.
       // Task mode-e model pick + tool open lage na: the task agent
       // picks its own model + tool from the description.
-      // Select requested model (e.g. Deeper analysis / 4 Neon) first
-      // so both Task mode and Chat fallback use the intended model.
-      const wantModel = MODEL_MATCH[model] || MODEL_MATCH.neon;
-      const topPicker = findBtn(['Gemini', 'Auto', 'Hydrogen', 'Neon', 'Carbon', 'Deeper analysis', 'Everyday help', 'Code & complex work']);
-      const topText = topPicker ? norm(textOf(topPicker)) : '';
-      if (topPicker && !wantModel.some((w) => topText.includes(norm(w)))) {
-        progress(jobId, 'selecting_model', 'Model select hocche…');
-        topPicker.click();
-        await sleep(900);
-        const opt = findBtn(wantModel);
-        if (opt) { opt.click(); await sleep(900); }
-        else { topPicker.click(); await sleep(400); }
-      }
       progress(jobId, 'task_mode', 'Task mode khulche…');
       const inTask = await ensureTaskMode();
       // v91: Task mode-e video size PROTHOME likhte hobe (user order)

@@ -5,10 +5,17 @@
 /// HARs (Nov 2026, two captures — one mid-session, one from page
 /// load):
 ///  1. chooseServer (signaler-pa) -> gsessionid. The API key (AIza…)
-///     is read from the Gemini UI's JS bundle (v94 — the page HTML
-///     holds only Firebase/web-client keys, which all 403 here) and
-///     the X-Server-Token (page key "PI9WOb") from the page HTML at
-///     session fetch, exactly like SNlM0e — never hardcoded.
+///     is one of the page HTML's own document keys (v97, verified
+///     against the HAR by hash — v94's bundle-keys idea was wrong)
+///     and the X-Server-Token (page key "PI9WOb") from the page HTML
+///     at session fetch, exactly like SNlM0e — never hardcoded.
+///  v98 — the requests below run through [BackendTransport]: the
+///  page transport performs them INSIDE the signed-in Gemini page
+///  (the extension's content-script fetch — the browser's own
+///  requests: its cookies, Origin, Referer, sec-fetch, HTTP/2 and
+///  TLS), with the Dart HTTP transport as fallback when the page is
+///  unreachable. The long-poll stream stays on Dart HTTP (its GET
+///  matches the browser's multi-watch shape).
 ///  2. processSession channel open (POST count=0) -> SID. Auth is
 ///     the $httpHeaders param: SAPISIDHASH (computed from the
 ///     SAPISID cookie — standard sha1 scheme), X-Goog-AuthUser,
@@ -43,6 +50,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 
+import 'gecko_browser.dart';
 import 'models.dart';
 
 /// The backend failed at a named step. The engine reports the step
@@ -53,6 +61,110 @@ class TaskBackendException implements Exception {
   const TaskBackendException(this.step, this.message);
   @override
   String toString() => 'Task backend ($step): $message';
+}
+
+// ---------------------------------------------------------------------
+// v98 — Backend transport: WHO performs the HTTP exchanges.
+// The page transport runs each request INSIDE the signed-in Gemini
+// page (the extension's content-script fetch), so the request IS the
+// browser's own: its cookies, Origin, Referer, sec-fetch headers,
+// HTTP/2 and TLS fingerprint all come from the real browser, and no
+// header has to be faked in Dart. The HTTP transport is plain Dart
+// HttpClient (v97 behaviour) — the fallback when the page is
+// unreachable, and the transport the tests drive with a MockClient.
+// A transport-level failure is reported as step 'transport' so the
+// client can retry the whole flow on the other transport; an HTTP
+// error status is a real step failure and is never retried.
+// ---------------------------------------------------------------------
+
+/// One HTTP exchange, however it was performed.
+class BackendResponse {
+  BackendResponse(this.status, this.bytes);
+  final int status;
+  final List<int> bytes;
+  String get text => utf8.decode(bytes);
+}
+
+/// Performs one HTTP exchange. [headers] are the headers the caller
+/// wants; a transport may drop the ones it supplies itself (the page
+/// transport drops Origin/Referer/Cookie/User-Agent/sec-fetch-* —
+/// fetch forbids setting them, and the page provides the real ones).
+abstract class BackendTransport {
+  Future<BackendResponse> fetch({
+    required String method,
+    required Uri uri,
+    Map<String, String>? headers,
+    String? body,
+  });
+}
+
+/// Plain Dart HTTP (v92–v97 behaviour).
+class HttpBackendTransport implements BackendTransport {
+  HttpBackendTransport(this._client);
+  final http.Client _client;
+
+  @override
+  Future<BackendResponse> fetch({
+    required String method,
+    required Uri uri,
+    Map<String, String>? headers,
+    String? body,
+  }) async {
+    final req = http.Request(method, uri);
+    if (headers != null) req.headers.addAll(headers);
+    if (body != null) req.body = body;
+    final streamed = await _client.send(req);
+    final bytes = await streamed.stream.toBytes();
+    return BackendResponse(streamed.statusCode, bytes);
+  }
+}
+
+/// v98 — the requests run in the Gemini page via the extension
+/// bridge (GeckoBrowser.backendFetch -> background.js -> content.js
+/// fetch with the page's own credentials). The reply is a JSON
+/// string {status, data: "data:<mime>;base64,…", error?}; a null
+/// reply (no tab, no answer in time) or an error field is a
+/// transport failure.
+class PageBackendTransport implements BackendTransport {
+  @override
+  Future<BackendResponse> fetch({
+    required String method,
+    required Uri uri,
+    Map<String, String>? headers,
+    String? body,
+  }) async {
+    final raw = await GeckoBrowser.instance.backendFetch(
+      method: method,
+      url: uri.toString(),
+      headers: headers ?? const {},
+      body: body ?? '',
+    );
+    if (raw == null) {
+      throw const TaskBackendException('transport',
+          'Page transport-e jukto hoyni — Gemini tab khuleni ba uttor asheni.');
+    }
+    Map m;
+    try {
+      m = jsonDecode(raw) as Map;
+    } catch (_) {
+      throw const TaskBackendException(
+          'transport', 'Page transport theke bujha jayna uttor aslo.');
+    }
+    if (m['error'] != null) {
+      throw TaskBackendException('transport', '${m['error']}');
+    }
+    final data = m['data'] as String? ?? '';
+    final b64 =
+        data.contains(',') ? data.substring(data.indexOf(',') + 1) : data;
+    List<int> bytes;
+    try {
+      bytes = base64Decode(b64);
+    } catch (_) {
+      throw const TaskBackendException(
+          'transport', 'Page transport-er uttor base64 na.');
+    }
+    return BackendResponse(m['status'] as int? ?? 0, bytes);
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -290,10 +402,7 @@ String buildHnvQhbReq(String conversationId) => jsonEncode([
 /// first, then take the URL up to its closing quote.
 String? extractVideoDownloadUrl(String body) {
   final unescaped = body
-      .replaceAll(r'\\u003d', '=')
       .replaceAll(r'\u003d', '=')
-      .replaceAll(r'\\u0026', '&')
-      .replaceAll(r'\u0026', '&')
       .replaceAll(r'\/', '/')
       .replaceAll(r'\"', '"')
       .replaceAll(r'\\', r'\');
@@ -305,6 +414,11 @@ String? extractVideoDownloadUrl(String body) {
 
 /// Extract every AIza API key from the Gemini page HTML (the signaler
 /// key is one of them; the client tries each for chooseServer).
+/// v97 — verified against the HAR by hash: the chooseServer ?key=
+/// is one of these document keys (also the ?key= on the signaler
+/// multi-watch/refreshCreds calls). The v94 idea that the key lived
+/// in the UI JS bundle was wrong — the bundle's keys belong to other
+/// Google services (one is the X-Goog-Api-Key on a waa-pa call).
 List<String> extractApiKeys(String html) {
   final seen = <String>{};
   for (final m in RegExp(r'AIza[0-9A-Za-z_\-]{35}').allMatches(html)) {
@@ -312,39 +426,6 @@ List<String> extractApiKeys(String html) {
     if (seen.length >= 20) break;
   }
   return seen.toList();
-}
-
-/// v94 — the signaler key is NOT in the page HTML. The page's 8
-/// document keys are Firebase/web-client keys; the channel key lives
-/// in the Gemini web UI's own JS bundle
-/// (gemini.gstatic.com/_/mss/boq-gemini-web-uiserver/_/js/…) — the
-/// HAR proved it: the bundle's 5 keys include the one the page sends
-/// as X-Goog-Api-Key on its channel calls, and the document keys
-/// (zero overlap with the bundle keys) all fail chooseServer with
-/// 403. So the app fetches the bundle once per UI version and reads
-/// its keys; the document keys stay as fallback.
-String? extractBundleUrl(String html) {
-  final m = RegExp(
-          r'https://gemini\.gstatic\.com/_/mss/boq-gemini-web-uiserver/_/js/[^"'
-          r"'\s<>]+")
-      .firstMatch(html);
-  if (m == null) return null;
-  return m.group(0)!.replaceAll('&amp;', '&');
-}
-
-/// Bundle keys first (the page's own UI keys — the signaler key is
-/// one of them), then the document keys, deduped, capped at 20.
-List<String> mergeApiKeys({
-  required List<String> bundleKeys,
-  required List<String> docKeys,
-}) {
-  final seen = <String>[];
-  for (final k in [...bundleKeys, ...docKeys]) {
-    if (k.isEmpty) continue;
-    if (!seen.contains(k)) seen.add(k);
-    if (seen.length >= 20) break;
-  }
-  return seen;
 }
 
 // ---------------------------------------------------------------------
@@ -358,15 +439,26 @@ class TaskBackendClient {
     this.pollInterval = const Duration(seconds: 30),
     this.submitTimeout = const Duration(seconds: 90),
     this.apiKeysOverride,
-  }) : _client = client;
+    BackendTransport? pageTransport,
+  })  : _client = client,
+        _httpTransport = HttpBackendTransport(client),
+        _pageTransport = pageTransport ?? PageBackendTransport();
 
   final http.Client _client;
+
+  /// Dart HTTP transport — also drives the long-poll stream (its GET
+  /// matches the browser's multi-watch shape) and is the fallback
+  /// when the page transport is unreachable.
+  final BackendTransport _httpTransport;
+
+  /// v98 — page transport (requests run inside the Gemini page).
+  final BackendTransport _pageTransport;
   final GeminiSession session;
 
-  /// v94 — the key list to try for chooseServer. When the caller
-  /// (StudioEngine) has already fetched the UI bundle keys, it passes
-  /// the merged bundle-first list here; otherwise the session's
-  /// document keys are used (v92 behaviour).
+  /// The key list to try for chooseServer. When set, it replaces the
+  /// session's document keys (a seam for tests and for callers that
+  /// already resolved the keys); otherwise the session's document
+  /// keys are used.
   final List<String>? apiKeysOverride;
 
   /// How often to poll hNvQHb for the finished video URL.
@@ -388,14 +480,23 @@ class TaskBackendClient {
   /// test client stays open).
   void close() => _client.close();
 
-  Map<String, String> _jsonHeaders() => {
+  /// v97 — chooseServer mirrors the browser's working request (HAR
+  /// entry #97) exactly: NO Cookie header (the browser's request
+  /// carried none — the app's session cookies on this call are the
+  /// prime suspect for the 403), plus the fetch metadata headers a
+  /// browser sends. The channel open and the rest of the flow keep
+  /// using [_formHeaders] (with cookies + SAPISIDHASH).
+  Map<String, String> _chooseServerHeaders() => {
         'Content-Type': 'application/json+protobuf',
         'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.7',
         'User-Agent': _ua,
         'Origin': _origin,
         'Referer': '$_origin/',
         'X-Goog-AuthUser': '${session.authUser}',
-        if (_cookieHeader.isNotEmpty) 'Cookie': _cookieHeader,
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-site',
       };
 
   Map<String, String> _formHeaders() => {
@@ -419,6 +520,11 @@ class TaskBackendClient {
   /// Runs the whole backend flow and returns the finished MP4 bytes.
   /// Throws [TaskBackendException] naming the failed step; the caller
   /// (AnimationEngine) falls back to the browser driver.
+  /// v98 — the flow runs on the page transport first (the browser's
+  /// own requests). A transport-level failure ('transport' step: no
+  /// Gemini tab, no reply) retries the whole flow on Dart HTTP; a
+  /// real step failure is NOT retried — the page IS the browser, so
+  /// Dart would fail the same way.
   Future<Uint8List> run(
     String taskText, {
     required void Function(String phase, String message) onPhase,
@@ -429,12 +535,30 @@ class TaskBackendClient {
       throw const TaskBackendException(
           'auth', 'SAPISID cookie pelam na — Login tab-e abar sign in koro.');
     }
+    try {
+      return await _runFlow(_pageTransport, taskText,
+          onPhase: onPhase, deadline: deadline);
+    } on TaskBackendException catch (e) {
+      if (e.step != 'transport') rethrow;
+      onPhase('opening', 'Page transport hoyni — Dart diye chesta…');
+      return await _runFlow(_httpTransport, taskText,
+          onPhase: onPhase, deadline: deadline);
+    }
+  }
+
+  Future<Uint8List> _runFlow(
+    BackendTransport transport,
+    String taskText, {
+    required void Function(String phase, String message) onPhase,
+    required DateTime deadline,
+  }) async {
+    _workingApiKey = '';
     onPhase('opening', 'Backend-e jukto hocche…');
-    final gsessionid = await _chooseServer();
-    final sid = await _openChannel(gsessionid);
+    final gsessionid = await _chooseServer(transport);
+    final sid = await _openChannel(transport, gsessionid);
     // The stream carries the conversation id; keep it running in the
     // background while the main flow submits + polls.
-    final stream = _ChannelStream(_client, sid, gsessionid, _cookieHeader);
+    final stream = _ChannelStream(_httpTransport, sid, gsessionid, _cookieHeader);
     unawaited(stream.run(deadline));
     try {
       final conversationId = await stream.conversationId
@@ -443,12 +567,12 @@ class TaskBackendClient {
               'Conversation id asheni — channel khuleche kintu Gemini '
               'kono task thread banayni.'));
       onPhase('opening', 'Task pathacche…');
-      await _sendSetup(sid, gsessionid, stream);
-      await _sendTask(sid, gsessionid, stream, taskText);
+      await _sendSetup(transport, sid, gsessionid, stream);
+      await _sendTask(transport, sid, gsessionid, stream, taskText);
       onPhase('creating', 'Backend-e video banacche…');
-      final url = await _pollForVideo(conversationId, onPhase, deadline);
+      final url = await _pollForVideo(transport, conversationId, onPhase, deadline);
       onPhase('downloading', 'MP4 download hocche…');
-      return await _download(url);
+      return await _download(transport, url);
     } finally {
       stream.stop();
     }
@@ -458,7 +582,7 @@ class TaskBackendClient {
   /// use the same one). Empty when chooseServer worked without a key.
   String _workingApiKey = '';
 
-  Future<String> _chooseServer() async {
+  Future<String> _chooseServer(BackendTransport transport) async {
     final keys = [...(apiKeysOverride ?? session.apiKeys), ''];
     Exception? lastErr;
     for (final key in keys) {
@@ -468,17 +592,20 @@ class TaskBackendClient {
           '/punctual/v1/chooseServer',
           {if (key.isNotEmpty) 'key': key},
         );
-        final res = await _client
-            .post(uri,
-                headers: _jsonHeaders(), body: buildChooseServerBody())
+        final res = await transport
+            .fetch(
+                method: 'POST',
+                uri: uri,
+                headers: _chooseServerHeaders(),
+                body: buildChooseServerBody())
             // v94: a wrong key fails fast with 403 — 25s is plenty,
             // and it keeps a 14-key list from burning 14 minutes.
             .timeout(const Duration(seconds: 25));
-        if (res.statusCode != 200) {
+        if (res.status != 200) {
           throw TaskBackendException('chooseServer',
-              'HTTP ${res.statusCode} (key ${key.isEmpty ? 'chara' : 'diye'})');
+              'HTTP ${res.status} (key ${key.isEmpty ? 'chara' : 'diye'})');
         }
-        final gs = parseChooseServer(res.body);
+        final gs = parseChooseServer(res.text);
         if (gs != null) {
           _workingApiKey = key;
           return gs;
@@ -486,72 +613,68 @@ class TaskBackendClient {
         throw const TaskBackendException(
             'chooseServer', 'gsessionid pelam na.');
       } catch (e) {
+        // v98 — a transport failure is not "this key failed": the
+        // page itself is unreachable, so rethrow at once and let
+        // run() retry the whole flow on the other transport. Without
+        // this, the key loop would burn every key on a dead page and
+        // misreport the failure as 'chooseServer'.
+        if (e is TaskBackendException && e.step == 'transport') rethrow;
         lastErr = e is Exception ? e : Exception(e.toString());
       }
     }
-    throw TaskBackendException(
-        'chooseServer', 'Server pick kora jayni: ${lastErr ?? 'unknown'}');
+    // v97 — report how many keys were tried: 1 means the page gave
+    // no keys at all, 9 means all 8 page keys + no-key all failed.
+    throw TaskBackendException('chooseServer',
+        'Server pick kora jayni (${keys.length} key try): ${lastErr ?? 'unknown'}');
   }
 
-  String _httpHeadersValue([String? apiKeyOverride]) {
+  String _httpHeadersValue() {
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     // sapisidHash already returns "<ts>_<digest>"; the three
     // SAPISID*HASH values are identical in the HAR (same cookie).
     final auth = sapisidHash(_sapisid!, _origin, ts);
-    final key = apiKeyOverride ?? _workingApiKey;
     final parts = <String>[
       'Authorization: SAPISIDHASH $auth '
           'SAPISID1PHASH $auth SAPISID3PHASH $auth',
       'X-Goog-AuthUser:${session.authUser}',
-      if (key.isNotEmpty) 'X-Goog-Api-Key:$key',
+      if (_workingApiKey.isNotEmpty)
+        'X-Goog-Api-Key:$_workingApiKey',
       if (session.serverToken.isNotEmpty)
         'X-Server-Token:${session.serverToken}',
-      'x-goog-ext-73010989-bin:CAA=',
-      'x-goog-ext-73010990-bin:CAAQABgA',
       'X-WebChannel-Content-Type:application/x-protobuf',
     ];
     return parts.join('\r\n');
   }
 
-  Future<String> _openChannel(String gsessionid) async {
-    // New HAR shows processSession can use a different AIza key than
-    // chooseServer; try _workingApiKey first, then known/session keys.
-    const harChannelKey = 'AIzaSyAPW83vB9zFQqfpMup_cMJdELqDQkWvTho';
-    final candidates = <String>{
-      if (_workingApiKey.isNotEmpty) _workingApiKey,
-      harChannelKey,
-      ...(apiKeysOverride ?? session.apiKeys),
-    }.toList();
-    if (candidates.isEmpty) candidates.add('');
-
-    http.Response? lastRes;
-    for (final key in candidates) {
-      final rid = 1000 + Random.secure().nextInt(90000);
-      final uri = Uri.https(_channelHost, '/v1/processSession', {
-        'VER': '8',
-        'RID': '$rid',
-        'CVER': '22',
-        'X-HTTP-Session-Id': 'gsessionid',
-        r'$httpHeaders': _httpHeadersValue(key),
-        'zx': _randZx(),
-        't': '1',
-      });
-      final res = await _client
-          .post(uri, headers: _formHeaders(), body: 'count=0')
-          .timeout(const Duration(seconds: 60));
-      lastRes = res;
-      if (res.statusCode == 200) {
-        final sid = parseChannelOpen(res.body);
-        if (sid != null) return sid;
-        throw const TaskBackendException(
-            'channel', 'Channel khullo kintu session id pelam na.');
-      }
-      if (res.statusCode != 400 && res.statusCode != 403) {
-        break;
-      }
+  Future<String> _openChannel(
+      BackendTransport transport, String gsessionid) async {
+    final rid = 1000 + Random.secure().nextInt(90000);
+    final uri = Uri.https(_channelHost, '/v1/processSession', {
+      'VER': '8',
+      'RID': '$rid',
+      'CVER': '22',
+      'X-HTTP-Session-Id': 'gsessionid',
+      r'$httpHeaders': _httpHeadersValue(),
+      'zx': _randZx(),
+      't': '1',
+    });
+    final res = await transport
+        .fetch(
+            method: 'POST',
+            uri: uri,
+            headers: _formHeaders(),
+            body: 'count=0')
+        .timeout(const Duration(seconds: 60));
+    if (res.status != 200) {
+      throw TaskBackendException(
+          'channel', 'Channel khola jayni: HTTP ${res.status}.');
     }
-    throw TaskBackendException('channel',
-        'Channel khola jayni: HTTP ${lastRes?.statusCode ?? 0}.');
+    final sid = parseChannelOpen(res.text);
+    if (sid == null) {
+      throw const TaskBackendException(
+          'channel', 'Channel khullo kintu session id pelam na.');
+    }
+    return sid;
   }
 
   Uri _messageUri(String sid, String gsessionid, _ChannelStream stream) {
@@ -567,37 +690,43 @@ class TaskBackendClient {
     });
   }
 
-  Future<void> _sendSetup(
-      String sid, String gsessionid, _ChannelStream stream) async {
+  Future<void> _sendSetup(BackendTransport transport, String sid,
+      String gsessionid, _ChannelStream stream) async {
     final uuid = _uuid();
     final body =
         'count=1&ofs=0&req0___data__=${_b64Url(buildSetupMessage(uuid))}';
-    final res = await _client
-        .post(_messageUri(sid, gsessionid, stream),
-            headers: _formHeaders(), body: body)
+    final res = await transport
+        .fetch(
+            method: 'POST',
+            uri: _messageUri(sid, gsessionid, stream),
+            headers: _formHeaders(),
+            body: body)
         .timeout(const Duration(seconds: 60));
-    if (res.statusCode != 200) {
+    if (res.status != 200) {
       throw TaskBackendException(
-          'setup', 'Session setup pathano jayni: HTTP ${res.statusCode}.');
+          'setup', 'Session setup pathano jayni: HTTP ${res.status}.');
     }
   }
 
-  Future<void> _sendTask(String sid, String gsessionid,
-      _ChannelStream stream, String taskText) async {
+  Future<void> _sendTask(BackendTransport transport, String sid,
+      String gsessionid, _ChannelStream stream, String taskText) async {
     final body =
         'count=1&ofs=1&req0___data__=${_b64Url(buildTaskMessage(taskText))}';
-    final res = await _client
-        .post(_messageUri(sid, gsessionid, stream),
-            headers: _formHeaders(), body: body)
+    final res = await transport
+        .fetch(
+            method: 'POST',
+            uri: _messageUri(sid, gsessionid, stream),
+            headers: _formHeaders(),
+            body: body)
         .timeout(const Duration(seconds: 60));
-    if (res.statusCode != 200) {
+    if (res.status != 200) {
       throw TaskBackendException(
-          'task', 'Task pathano jayni: HTTP ${res.statusCode}.');
+          'task', 'Task pathano jayni: HTTP ${res.status}.');
     }
   }
 
-  Future<String> _pollForVideo(String conversationId,
-      void Function(String phase, String message) onPhase,
+  Future<String> _pollForVideo(BackendTransport transport,
+      String conversationId, void Function(String phase, String message) onPhase,
       DateTime deadline) async {
     var waited = 0;
     while (DateTime.now().isBefore(deadline)) {
@@ -622,8 +751,10 @@ class TaskBackendClient {
         ]
       ]);
       try {
-        final res = await _client
-            .post(uri,
+        final res = await transport
+            .fetch(
+                method: 'POST',
+                uri: uri,
                 headers: {
                   'Content-Type':
                       'application/x-www-form-urlencoded;charset=UTF-8',
@@ -634,12 +765,21 @@ class TaskBackendClient {
                   if (_cookieHeader.isNotEmpty)
                     'Cookie': _cookieHeader,
                 },
-                body: {'f.req': freReq, 'at': session.at})
+                body: Uri(queryParameters: {
+                  'f.req': freReq,
+                  'at': session.at,
+                }).query)
             .timeout(const Duration(seconds: 60));
-        if (res.statusCode == 200) {
-          final url = extractVideoDownloadUrl(res.body);
+        if (res.status == 200) {
+          final url = extractVideoDownloadUrl(res.text);
           if (url != null) return url;
         }
+      } on TaskBackendException catch (e) {
+        // v98 — a transport failure (page unreachable) must surface
+        // so run() can retry the whole flow on the other transport;
+        // only a real poll failure is retried here.
+        if (e.step == 'transport') rethrow;
+        // One failed poll never kills the run — the next poll retries.
       } catch (_) {
         // One failed poll never kills the run — the next poll retries.
       }
@@ -654,18 +794,18 @@ class TaskBackendClient {
         'Video link asheni — Task sesh hoyeche kina bujha jayni.');
   }
 
-  Future<Uint8List> _download(String url) async {
-    final res = await _client.get(Uri.parse(url), headers: {
+  Future<Uint8List> _download(BackendTransport transport, String url) async {
+    final res = await transport.fetch(method: 'GET', uri: Uri.parse(url), headers: {
       'User-Agent': _ua,
       'Referer': '$_origin/',
       if (_cookieHeader.isNotEmpty) 'Cookie': _cookieHeader,
     }).timeout(const Duration(minutes: 10));
-    if (res.statusCode != 200 || res.bodyBytes.isEmpty) {
+    if (res.status != 200 || res.bytes.isEmpty) {
       throw TaskBackendException('download',
-          'MP4 download hoyni: HTTP ${res.statusCode}. Browser theke '
+          'MP4 download hoyni: HTTP ${res.status}. Browser theke '
           'download korte hobe (OSID cookie lagte pare).');
     }
-    return res.bodyBytes;
+    return Uint8List.fromList(res.bytes);
   }
 }
 
@@ -675,10 +815,13 @@ class TaskBackendClient {
 /// when the server closes it, until [deadline].
 class _ChannelStream {
   _ChannelStream(
-      this._client, this._sid, this._gsessionid, this._cookieHeader)
+      this._transport, this._sid, this._gsessionid, this._cookieHeader)
       : rid = 1000 + Random.secure().nextInt(90000);
 
-  final http.Client _client;
+  /// v98 — the stream poll is a plain Dart-HTTP GET (its shape
+  /// matches the browser's multi-watch poll); only the other calls
+  /// ride the page transport.
+  final BackendTransport _transport;
   final String _sid;
   final String _gsessionid;
   final String _cookieHeader;
@@ -728,27 +871,23 @@ class _ChannelStream {
       'zx': _randZx(),
       't': '1',
     });
-    final req = http.Request('GET', uri)
-      ..headers.addAll({
+    // v98 — whole-body fetch (the transport returns the poll batch
+    // at once). The server holds a long-poll open while it has no
+    // data; cap each poll at 30s so the loop re-opens it with
+    // AID=<last index> instead of hanging past the deadline.
+    BackendResponse res;
+    try {
+      res = await _transport.fetch(method: 'GET', uri: uri, headers: {
         'User-Agent': TaskBackendClient._ua,
         'Origin': TaskBackendClient._origin,
         'Referer': '${TaskBackendClient._origin}/',
         if (_cookieHeader.isNotEmpty) 'Cookie': _cookieHeader,
-      });
-    final streamed = await _client.send(req).timeout(
-        const Duration(seconds: 65));
-    final buffer = <int>[];
-    // A long-poll the server holds open: close the stream after 65s
-    // of silence so the loop re-opens it (AID=<last index>) instead
-    // of hanging past the deadline.
-    final timed = streamed.stream.timeout(
-        const Duration(seconds: 65), onTimeout: (sink) => sink.close());
-    await for (final chunk in timed) {
-      if (_stopped) return;
-      buffer.addAll(chunk);
-      _scanBuffer(buffer);
-      if (DateTime.now().isAfter(deadline)) return;
+      }).timeout(const Duration(seconds: 30));
+    } on TimeoutException {
+      return;
     }
+    if (res.status != 200) return;
+    final buffer = <int>[...res.bytes];
     _scanBuffer(buffer, finalPass: true);
   }
 

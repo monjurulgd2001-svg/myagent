@@ -119,7 +119,6 @@ class _PanelSettingsScreenState extends State<PanelSettingsScreen> {
       defaultTarget: _defaultTarget,
     );
     await widget.engine.saveDistConfig(cfg);
-    if (!mounted) return;
     setState(() => _testStatus =
         'Saved ${accounts.length} account(s) and the R2 Worker configuration.');
     if (mounted) {

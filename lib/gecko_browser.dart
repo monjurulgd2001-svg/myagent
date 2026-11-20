@@ -197,13 +197,40 @@ class GeckoBrowser {
   /// driver answers through the requests stream, not this call.
   Future<void> startVideo(
       String prompt, String modelId, String jobId) async {
-    await _ch.invokeMethod(
-        'browserVideo',
-        jsonEncode({
-          'prompt': prompt,
-          'model': modelId,
-          'jobId': jobId,
-        }));
+    try {
+      await _ch.invokeMethod(
+          'browserVideo',
+          jsonEncode({
+            'prompt': prompt,
+            'model': modelId,
+            'jobId': jobId,
+          }));
+    } catch (_) {}
+  }
+
+  /// v98 — runs one HTTP exchange INSIDE the signed-in Gemini page
+  /// (the extension's content-script fetch). Returns the reply JSON
+  /// string {status, data: "data:<mime>;base64,…", error?}, or null
+  /// when the bridge could not answer (no tab, timeout, no plugin).
+  /// The task backend's [PageBackendTransport] is the only caller.
+  Future<String?> backendFetch({
+    required String method,
+    required String url,
+    Map<String, String> headers = const {},
+    String body = '',
+  }) async {
+    try {
+      return await _ch.invokeMethod<String>(
+          'backendFetch',
+          jsonEncode({
+            'method': method,
+            'url': url,
+            'headers': headers,
+            'body': body,
+          }));
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Downloads a picture through the engine (hot-link / CORS

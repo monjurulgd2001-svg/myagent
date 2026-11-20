@@ -23,7 +23,7 @@ void main() {
     // v83: stat chips live in the Showcase header now (side by
     // side on wide, so they are visible on the Studio tab too).
     expect(find.text('0 sets'), findsOneWidget);
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
   });
 
   testWidgets('v67 phone layout unchanged: pill nav, no rail',
@@ -41,6 +41,6 @@ void main() {
 
     expect(find.byType(NavigationBar), findsOneWidget);
     expect(find.byType(NavigationRail), findsNothing);
-    expect(find.text('Version 2.5.31'), findsOneWidget);
+    expect(find.text('Version 2.5.34'), findsOneWidget);
   });
 }
