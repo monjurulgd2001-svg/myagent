@@ -1,0 +1,4004 @@
+// Gemini HD Studio — Flutter port of the v2.5.3 Chrome extension.
+// Wallpaper Set Designer, AI Metadata & Panel Uploader for Android
+// (Kotlin) and Windows, built from one codebase.
+import 'dart:async';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'animation_engine.dart';
+import 'animation_models.dart';
+import 'animation_screen.dart';
+import 'foreground_keep_alive.dart';
+import 'gecko_browser.dart';
+import 'dart:convert';
+import 'generation_queue.dart';
+import 'gemini_api.dart';
+import 'image_search.dart';
+import 'login_screen.dart';
+import 'models.dart';
+import 'originality.dart';
+import 'panel_settings.dart';
+import 'session_store.dart';
+import 'studio_constants.dart';
+import 'studio_engine.dart';
+import 'voice_prompt.dart';
+
+/// v93 — dark / light theme choice (persisted; dark is the
+/// default — the look the app has had since v49). The toggle in
+/// the app bar flips this; the MaterialApp below listens to it.
+const String kThemeModeKey = 'themeMode';
+final ValueNotifier<ThemeMode> themeModeNotifier =
+    ValueNotifier<ThemeMode>(ThemeMode.dark);
+
+Future<void> toggleTheme() async {
+  final next = themeModeNotifier.value == ThemeMode.dark
+      ? ThemeMode.light
+      : ThemeMode.dark;
+  themeModeNotifier.value = next;
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(
+      kThemeModeKey, next == ThemeMode.light ? 'light' : 'dark');
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final prefs = await SharedPreferences.getInstance();
+  themeModeNotifier.value = prefs.getString(kThemeModeKey) == 'light'
+      ? ThemeMode.light
+      : ThemeMode.dark;
+  runApp(const GeminiHdStudioApp());
+}
+
+/// Dashboard colour palette (v49, from the user's reference
+/// screenshot): near-black backgrounds, dark neutral cards and a
+/// soft lavender primary (#A89CFE, sampled from the reference's
+/// Generate button). Every screen in the app (Studio, Login,
+/// Search, Settings) draws from this scheme, so the whole app
+/// stays cohesive.
+/// v95 — the dark background is now neutral black 90% (no more
+/// blue tint): scaffold #0A0A0A, cards #1A1A1A.
+const ColorScheme kDashboardScheme = ColorScheme(
+  brightness: Brightness.dark,
+  primary: Color(0xFFA89CFE),
+  onPrimary: Color(0xFF211D38),
+  primaryContainer: Color(0xFF37335F),
+  onPrimaryContainer: Color(0xFFE4DEFF),
+  secondary: Color(0xFFC9C2FF),
+  onSecondary: Color(0xFF211D38),
+  secondaryContainer: Color(0xFF292640),
+  onSecondaryContainer: Color(0xFFD9D2FF),
+  tertiary: Color(0xFFFF7AC6),
+  onTertiary: Color(0xFF2B0A1E),
+  error: Color(0xFFFF6B6B),
+  onError: Colors.white,
+  surface: Color(0xFF1A1A1A),
+  onSurface: Color(0xFFF2F4FF),
+  surfaceContainerLowest: Color(0xFF0A0A0A),
+  surfaceContainerLow: Color(0xFF141414),
+  surfaceContainer: Color(0xFF1A1A1A),
+  // v95: neutral greys now (was 0xFF1B1B23) — the field fill the
+  // Animation screen used follows the same role.
+  surfaceContainerHigh: Color(0xFF212121),
+  surfaceContainerHighest: Color(0xFF2B2B2B),
+  onSurfaceVariant: Color(0xFFB6B3C9),
+  outline: Color(0xFF3A3A3A),
+  outlineVariant: Color(0xFF262626),
+  inverseSurface: Color(0xFFE8EBFF),
+  onInverseSurface: Color(0xFF12172E),
+  inversePrimary: Color(0xFF6E5FE0),
+);
+
+/// v93 — the light twin of [kDashboardScheme]: same lavender
+/// family, but light surfaces with a deeper violet primary so
+/// buttons and accents still read on white. Every screen draws
+/// its colours from the scheme (never hardcoded), so the toggle
+/// repaints the whole app.
+const ColorScheme kDashboardLightScheme = ColorScheme(
+  brightness: Brightness.light,
+  primary: Color(0xFF6C5CE7),
+  onPrimary: Colors.white,
+  primaryContainer: Color(0xFFE4DEFF),
+  onPrimaryContainer: Color(0xFF2E2566),
+  secondary: Color(0xFF7C6CF0),
+  onSecondary: Colors.white,
+  secondaryContainer: Color(0xFFEDEAFF),
+  onSecondaryContainer: Color(0xFF3A2E7A),
+  tertiary: Color(0xFFC2438B),
+  onTertiary: Colors.white,
+  error: Color(0xFFD32F2F),
+  onError: Colors.white,
+  surface: Color(0xFFFFFFFF),
+  onSurface: Color(0xFF17171F),
+  surfaceContainerLowest: Color(0xFFF5F3FF),
+  surfaceContainerLow: Color(0xFFF0EDFF),
+  surfaceContainer: Color(0xFFEDEAFF),
+  surfaceContainerHigh: Color(0xFFE6E0FF),
+  surfaceContainerHighest: Color(0xFFDDD6FE),
+  onSurfaceVariant: Color(0xFF5A5870),
+  outline: Color(0xFFB9B3D9),
+  outlineVariant: Color(0xFFE0DAF5),
+  inverseSurface: Color(0xFF1B1B23),
+  onInverseSurface: Color(0xFFF2F4FF),
+  inversePrimary: Color(0xFFA89CFE),
+);
+
+const LinearGradient kAccentGradient = LinearGradient(
+  colors: [Color(0xFFC4B9FF), Color(0xFFA89CFE)],
+  begin: Alignment.centerLeft,
+  end: Alignment.centerRight,
+);
+
+/// Batch prompt parsing, shared by the designer prompt field, the
+/// batch queue panel and the generator itself: in batch mode every
+/// non-empty line is one set job, run in order.
+List<String> parseBatchPrompts(String text) => text
+    .split('\n')
+    .map((e) => e.trim())
+    .where((e) => e.isNotEmpty)
+    .toList();
+
+/// Gentle fade + slide used for every route change, so moving between
+/// the dashboard, login, search and settings feels smooth.
+class FadeSlideTransitionsBuilder extends PageTransitionsBuilder {
+  const FadeSlideTransitionsBuilder();
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    final curved =
+        CurvedAnimation(parent: animation, curve: Curves.easeOutCubic);
+    return FadeTransition(
+      opacity: curved,
+      child: SlideTransition(
+        position: Tween<Offset>(
+                begin: const Offset(0.04, 0), end: Offset.zero)
+            .animate(curved),
+        child: child,
+      ),
+    );
+  }
+}
+
+/// Aurora backdrop (v34 redesign): deep-space base with soft
+/// violet / cyan / pink glows behind the dashboard, so the whole
+/// home screen reads as one designed surface. Pushed screens keep
+/// the solid base colour from the theme.
+class AuroraBackdrop extends StatelessWidget {
+  const AuroraBackdrop({super.key});
+
+  /// v93 — the base follows the theme now (deep-space in dark,
+  /// pale lavender in light); the violet glows stay, softer in
+  /// light so they tint instead of glaring.
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        ColoredBox(
+            color: dark ? const Color(0xFF0A0A0A) : const Color(0xFFF7F5FF)),
+        Positioned(
+          top: -130,
+          left: -90,
+          child: _Glow(
+              color: const Color(0xFFA89CFE),
+              size: 320,
+              alpha: dark ? 0.13 : 0.10),
+        ),
+        Positioned(
+          top: 190,
+          right: -120,
+          child: _Glow(
+              color: const Color(0xFF8F7BFF),
+              size: 240,
+              alpha: dark ? 0.07 : 0.06),
+        ),
+        Positioned(
+          bottom: -150,
+          right: -70,
+          child: _Glow(
+              color: const Color(0xFFA89CFE),
+              size: 340,
+              alpha: dark ? 0.08 : 0.07),
+        ),
+      ],
+    );
+  }
+}
+
+class _Glow extends StatelessWidget {
+  const _Glow({required this.color, required this.size, required this.alpha});
+  final Color color;
+  final double size;
+  final double alpha;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: RadialGradient(colors: [
+            color.withValues(alpha: alpha),
+            color.withValues(alpha: 0),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+/// The app-wide theme (v34 Aurora Glass redesign), shared by
+/// the app shell and design previews. v93: [light] builds the
+/// light twin — same structure, the light scheme. The dark
+/// branch keeps the v49 values (a few roles now come from the
+/// scheme instead of literals, same numbers).
+ThemeData buildStudioTheme({bool light = false}) {
+  final scheme = light ? kDashboardLightScheme : kDashboardScheme;
+  return ThemeData(
+        colorScheme: scheme,
+        scaffoldBackgroundColor:
+            light ? const Color(0xFFF7F5FF) : const Color(0xFF0A0A0A),
+        useMaterial3: true,
+        appBarTheme: AppBarTheme(
+          backgroundColor: scheme.surfaceContainerLow,
+          elevation: 0,
+          titleTextStyle: TextStyle(
+              fontSize: 19,
+              fontWeight: FontWeight.w700,
+              color: scheme.onSurface),
+        ),
+        // CardThemeData (was CardTheme): Flutter 3.32+ split the
+        // theme widget from its data class; ThemeData.cardTheme
+        // takes the data class on the 3.35 toolchain.
+        cardTheme: CardThemeData(
+          color: scheme.surface,
+          elevation: 0,
+          shadowColor: Colors.black54,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: BorderSide(color: scheme.outlineVariant),
+          ),
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          // v99 — the fill was a pale lavender wash
+          // (surfaceContainerHigh) with a near-invisible border, so
+          // the Prompt field read as one big faint slab in light
+          // mode. Fields now take the surface colour with a visible
+          // outline, and the label/hint colours are explicit.
+          fillColor: scheme.surface,
+          labelStyle: TextStyle(color: scheme.onSurfaceVariant),
+          floatingLabelStyle: TextStyle(color: scheme.primary),
+          hintStyle: TextStyle(color: scheme.onSurfaceVariant),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide(color: scheme.outline),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide(color: scheme.outline),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide(color: scheme.primary, width: 1.6),
+          ),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            textStyle:
+                const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14)),
+          ),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            side: BorderSide(color: scheme.outline),
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14)),
+          ),
+        ),
+        chipTheme: ChipThemeData(
+          backgroundColor: scheme.surfaceContainer,
+          selectedColor: scheme.primaryContainer,
+          side: BorderSide(color: scheme.outlineVariant),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(999)),
+          // v99 — the label colour was left to theme defaults, so
+          // chip text could render in a washed-out tint in light
+          // mode. It is now explicit on both states.
+          labelStyle: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurface),
+          secondaryLabelStyle: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w700,
+              color: scheme.onSurface),
+        ),
+        expansionTileTheme: ExpansionTileThemeData(
+          shape: const Border(),
+          collapsedShape: const Border(),
+          iconColor: scheme.primary,
+          textColor: scheme.onSurface,
+        ),
+        navigationBarTheme: NavigationBarThemeData(
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          indicatorColor: scheme.primaryContainer,
+          labelTextStyle: WidgetStateProperty.all(
+              const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
+        ),
+        navigationRailTheme: NavigationRailThemeData(
+          backgroundColor: scheme.surfaceContainerLow,
+          indicatorColor: scheme.primaryContainer,
+          selectedLabelTextStyle: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              color: scheme.onSurface),
+          unselectedLabelTextStyle:
+              TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+        ),
+        pageTransitionsTheme: const PageTransitionsTheme(
+          builders: {
+            TargetPlatform.android: FadeSlideTransitionsBuilder(),
+            TargetPlatform.windows: FadeSlideTransitionsBuilder(),
+            TargetPlatform.linux: FadeSlideTransitionsBuilder(),
+            TargetPlatform.macOS: FadeSlideTransitionsBuilder(),
+          },
+        ),
+      );
+}
+
+class GeminiHdStudioApp extends StatelessWidget {
+  const GeminiHdStudioApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    // v93 — the theme toggle above flips this notifier; the
+    // whole app (dark + light ThemeData) rebuilds from it.
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeModeNotifier,
+      builder: (_, mode, __) => MaterialApp(
+        title: 'Zedge Studio',
+        debugShowCheckedModeBanner: false,
+        theme: buildStudioTheme(light: true),
+        darkTheme: buildStudioTheme(),
+        themeMode: mode,
+        home: const HomeScreen(),
+      ),
+    );
+  }
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  late final StudioEngine _engine;
+  final List<String> _log = [];
+  bool _busy = false;
+  String _statusText = 'Ready';
+  int _activeStep = 0;
+
+  List<GeminiAccount> _accounts = [];
+  String _accountMode = 'auto';
+  String _sessionLabel = 'Not connected';
+  List<SetEntry> _history = [];
+
+  /// Dashboard tab: 0 = Studio (designer workbench + generated
+  /// sets below it, v85), 1 = Animation (charging animations with
+  /// Gemini, v86). Nav destinations 2-3 (Search / Login) open
+  /// their screens as routes on top instead of switching the tab.
+  /// (There is no separate Prompt destination — image-to-prompt
+  /// lives inside Image Search.)
+  int _tab = 0;
+
+  // Charging Animation section (v86): videos made with Gemini
+  // (Neon default, Task mode) in the app's Gecko browser session.
+  // The engine owns the video list, the generation phase and the
+  // Task choice; its driver reports come in on the Gecko
+  // browserRequests stream (shared with the picture overlay).
+  late final AnimationEngine _animEngine;
+  StreamSubscription<GeckoBrowserRequest>? _animBrowserSub;
+
+  /// v87 — remembered panel target for animation uploads (spread
+  /// or a named account), separate from the image sets' target.
+  String _animUploadTarget = 'spread';
+
+  /// Phone Studio scroll view (v85): the designer card sits on
+  /// top and the generated-sets gallery below it in one scroll.
+  final ScrollController _studioScrollCtrl = ScrollController();
+
+  /// Key on the inline gallery section — the auto-scroll after a
+  /// generation finishes targets it (v85).
+  final GlobalKey _resultsKey = GlobalKey();
+
+  String _mode = 'set_24h';
+  final TextEditingController _promptCtrl = TextEditingController();
+  final TextEditingController _negativeCtrl =
+      TextEditingController(text: kDefaultNegativePrompt);
+  final TextEditingController _subfolderCtrl =
+      TextEditingController(text: 'Gemini_HD');
+  bool _batchMode = false;
+
+  /// Per-job batch states ('waiting' | 'running' | 'done' | 'failed'),
+  /// index-aligned with parseBatchPrompts(_promptCtrl.text).
+  List<String> _batchStatuses = const [];
+
+  /// Set by the batch queue's Stop button: the running set finishes,
+  /// the rest of the queue is skipped.
+  bool _batchStop = false;
+
+  // Overnight queue (v47): persisted items + runner state. The
+  // queue survives the app closing; the runner works through the
+  // pending items one by one under the foreground keep-alive.
+  final List<QueueItem> _queue = [];
+  bool _queueRunning = false;
+  bool _queueStop = false;
+  String _queueLiveStatus = '';
+  final ValueNotifier<int> _queueTick = ValueNotifier<int>(0);
+  Map<String, dynamic>? _queueSummary;
+
+  // Background generation readiness (v72): generation start
+  // offers the fix dialog while the phone is not exempt. The
+  // in-app switch itself lives in BackgroundModeCard (Login
+  // screen, since v84) and drives ForegroundKeepAlive.enabled.
+  bool _bgDialogShownThisSession = false;
+
+  // AI prompt polish (v48).
+  bool _polishing = false;
+
+  // Voice prompt (v51): speak the idea instead of typing it.
+  // The mic only shows on Android — speech_to_text has no
+  // Windows implementation, so the recogniser is never touched
+  // on Windows. _lastVoiceChunk drops a final result the
+  // recogniser fires twice for the same words.
+  final _voice = VoicePromptController();
+  bool _listening = false;
+  String _lastVoiceChunk = '';
+  bool get _voiceSupported =>
+      defaultTargetPlatform == TargetPlatform.android;
+  String _storyArc = 'auto';
+  String _variation = 'clear';
+  String _displayTarget = 'any';
+  String _colorBoost = 'off';
+  bool _upscale = true;
+  bool _autoMetadata = true;
+  bool _foldableCompanion = false;
+  bool _useHubFolders = true;
+  bool _useExactNames = true;
+  bool _aiDirector = false;
+  bool _forcePrefix = true;
+  int _portraitW = kPortraitWidth;
+  int _portraitH = kPortraitHeight;
+  int _landscapeW = kLandscapeWidth;
+  int _landscapeH = kLandscapeHeight;
+  ({Uint8List bytes, String name, String mime})? _reference;
+  final Map<int, TextEditingController> _stageCtrls = {};
+
+  /// Fires _silentRenew every 15 minutes while the app is open.
+  Timer? _sessionKeepAlive;
+
+  @override
+  void initState() {
+    super.initState();
+    _engine = StudioEngine(onStatus: _onStatus);
+    _animEngine = AnimationEngine(
+      onChanged: () {
+        if (mounted) setState(() {});
+      },
+      // v87: the video metadata + panel upload run on the same
+      // StudioEngine paths the image sets use (Gemini session,
+      // R2 + Firebase).
+      metadataGenerator: (video) => _engine.generateVideoMetadata(video),
+      panelUploader: (video, {targetAccount = 'spread'}) =>
+          _engine.uploadVideoToPanel(video, targetAccount: targetAccount),
+      // v88: the video Prompt Polish runs on the same StudioEngine
+      // Gemini session as the image Prompt Polish.
+      promptPolisher: (prompt) => _engine.polishVideoPrompt(prompt),
+      // v92: the Task-mode video BACKEND (no browser) runs on the
+      // same StudioEngine Gemini session. v106 — a backend failure
+      // ends the job; the browser never opens for animation.
+      taskBackendRunner: (taskText,
+              {required onPhase, required deadline}) =>
+          _engine.runTaskVideoBackend(taskText,
+              onPhase: onPhase, deadline: deadline),
+    );
+    _animEngine.load();
+    _animBrowserSub =
+        GeckoBrowser.instance.requests.listen((req) {
+      _animEngine.handleRequest(req);
+    });
+    _bootstrap();
+    // Keep the saved Gemini login alive: every 15 minutes the session
+    // is silently re-fetched, which absorbs Google's rotated cookies
+    // (__Secure-1PSIDTS) into the saved jar — the login stays saved
+    // and renews itself while the app is open.
+    _sessionKeepAlive =
+        Timer.periodic(const Duration(minutes: 15), (_) => _silentRenew());
+  }
+
+  @override
+  void dispose() {
+    _animBrowserSub?.cancel();
+    _animEngine.dispose();
+    _voice.cancel();
+    _studioScrollCtrl.dispose();
+    _sessionKeepAlive?.cancel();
+    _promptCtrl.dispose();
+    _negativeCtrl.dispose();
+    _subfolderCtrl.dispose();
+    for (final c in _stageCtrls.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _bootstrap() async {
+    await _engine.loadCloudinaryConfig();
+    _accountMode = await SessionStore.loadAccountMode();
+    _accounts = await SessionStore.loadDiscoveredAccounts();
+    _history = await _engine.loadHistory();
+    await _loadQueue();
+    final info = await SessionStore.loadActiveInfo();
+    if (info != null && info['email'] != null) {
+      _sessionLabel = 'u/${info['authUser']} - ${info['email']}';
+    }
+    // Background readiness (v72): arm the keep-alive gate from
+    // the persisted switch (default ON). The switch itself lives
+    // in BackgroundModeCard (Login screen, since v84) and drives
+    // ForegroundKeepAlive.enabled directly when toggled.
+    final prefs = await SharedPreferences.getInstance();
+    ForegroundKeepAlive.enabled =
+        prefs.getBool('bgModeEnabled') ?? true;
+    if (mounted) setState(() {});
+    // If a login was saved earlier, renew it right away (fresh session
+    // token + rotated cookies) so the app opens already signed in.
+    await _silentRenew();
+  }
+
+  /// Silent session renewal: re-fetches the Gemini session — which
+  /// absorbs rotated cookies into the saved jar — without bothering
+  /// the user. Runs once at startup when a saved login exists, then
+  /// every 15 minutes while the app is open.
+  Future<void> _silentRenew() async {
+    if (_busy) return;
+    // "Renew cookies from the app" setting (Gemini Login screen):
+    // OFF means the app never refreshes sessions in the background.
+    if (!await SessionStore.loadAutoRenew()) return;
+    try {
+      final cookies = await SessionStore.loadCookiesByUser();
+      if (cookies.isEmpty) return;
+      final api = GeminiApi();
+      // Renew EVERY saved account (scan probes u/0..u/5 and absorbs
+      // each jar's rotated cookies), so accounts used only for
+      // quota auto-switch stay alive too, not just the active one.
+      final found = await api.scanAccounts();
+      if (found.isNotEmpty && mounted) {
+        setState(() => _accounts = found);
+      }
+      final explicit =
+          _accountMode == 'auto' ? null : int.tryParse(_accountMode);
+      final s = await api.getSession(
+          forceRefresh: true, explicitAuthUser: explicit);
+      if (mounted) {
+        setState(() => _sessionLabel = 'u/${s.authUser} - ${s.email}');
+      }
+    } catch (_) {
+      // Stay quiet: a failed silent renewal only means the user may
+      // need to sign in again from the Gemini Login tab.
+    }
+  }
+
+  void _onStatus(StatusEvent e) {
+    if (!mounted) return;
+    setState(() {
+      _statusText = e.message;
+      if (e.step > 0) _activeStep = e.step - 1;
+      _log.insert(0, e.message);
+      if (_log.length > 80) _log.removeLast();
+    });
+    if (_queueRunning) {
+      _queueLiveStatus = e.message;
+      _queueTick.value++;
+    }
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _verifySession() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final api = GeminiApi(onStatus: _onStatus);
+      final explicit =
+          _accountMode == 'auto' ? null : int.tryParse(_accountMode);
+      final s =
+          await api.getSession(forceRefresh: true, explicitAuthUser: explicit);
+      setState(() => _sessionLabel = 'u/${s.authUser} - ${s.email}');
+      _snack('Gemini session active on u/${s.authUser} (${s.email})');
+    } catch (e) {
+      _snack('Session check failed: $e');
+      _onStatus(StatusEvent('error', 1, 'Session check failed: $e'));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _scanAccounts() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    _onStatus(const StatusEvent('authenticating', 1,
+        'Scanning saved logins for signed-in Gmail / Gemini accounts (u/0 to u/5)...'));
+    try {
+      final api = GeminiApi(onStatus: _onStatus);
+      final found = await api.scanAccounts();
+      setState(() => _accounts = found);
+      if (found.isEmpty) {
+        _snack(
+            'No signed-in Gemini accounts detected. Use Gemini Login first.');
+      } else {
+        _snack(
+            'Detected ${found.length} signed-in Gmail account(s): ${found.map((a) => 'u/${a.authUser} (${a.email})').join(', ')}');
+      }
+    } catch (e) {
+      _snack('Scan failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _switchAccount(String mode) async {
+    setState(() => _accountMode = mode);
+    await SessionStore.saveAccountMode(mode);
+    if (mode == 'auto') {
+      _snack('Smart Auto-Switch enabled: will switch Gmail accounts on limit.');
+      return;
+    }
+    await _verifySession();
+  }
+
+  Future<void> _openLogin({int authUser = 0}) async {
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => LoginScreen(initialAuthUser: authUser),
+    ));
+    await _bootstrap();
+    try {
+      final api = GeminiApi();
+      final found = await api.scanAccounts();
+      if (mounted) setState(() => _accounts = found);
+    } catch (_) {}
+  }
+
+  Future<void> _pickReference() async {
+    final res = await FilePicker.platform
+        .pickFiles(type: FileType.image, withData: true);
+    if (res == null || res.files.isEmpty) return;
+    final f = res.files.first;
+    if (f.bytes == null) return;
+    final lower = f.name.toLowerCase();
+    final mime = lower.endsWith('.png')
+        ? 'image/png'
+        : lower.endsWith('.webp')
+            ? 'image/webp'
+            : 'image/jpeg';
+    setState(() => _reference = (bytes: f.bytes!, name: f.name, mime: mime));
+  }
+
+  /// Image Search screen (sources open in the external browser;
+  /// image links come back through its collection panel). The
+  /// returned pick is applied by action: reference -> anchor image,
+  /// prompt -> the prompt generated inside the search screen fills
+  /// the designer field, save -> a copy under app documents
+  /// /GeminiHDStudio/Search/.
+  Future<void> _openImageSearch({bool promptMode = false}) async {
+    final pick = await Navigator.of(context).push<ImageSearchPick>(
+        MaterialPageRoute(
+            builder: (_) => ImageSearchScreen(promptMode: promptMode)));
+    if (pick == null || !mounted) return;
+    switch (pick.action) {
+      case 'reference':
+        setState(() => _reference =
+            (bytes: pick.bytes, name: pick.name, mime: pick.mime));
+        _snack('Reference image set from Image Search.');
+        break;
+      case 'prompt':
+        final generated = pick.generatedPrompt?.trim() ?? '';
+        if (generated.isNotEmpty) {
+          if (pick.appendPrompt) {
+            // Auto-add to Prompts list: append as a new line so the
+            // prompt joins the batch list instead of replacing it.
+            final current = _promptCtrl.text.trim();
+            setState(() => _promptCtrl.text =
+                current.isEmpty ? generated : '$current\n$generated');
+            _snack('Prompt added to the Prompts list.');
+          } else {
+            setState(() => _promptCtrl.text = generated);
+            _snack('Prompt added to the Set Designer.');
+          }
+        } else {
+          _snack('No prompt was generated.');
+        }
+        break;
+      case 'prompts':
+        // Multi-select batch generation: one prompt per selected
+        // image — append them all as lines and switch Batch on so
+        // they land straight in the Batch Sets queue.
+        final list = pick.generatedPrompts
+            .map((e) => e.trim())
+            .where((e) => e.isNotEmpty)
+            .toList();
+        if (list.isEmpty) {
+          _snack('No prompts were generated.');
+          break;
+        }
+        final current = _promptCtrl.text.trim();
+        setState(() {
+          _promptCtrl.text =
+              current.isEmpty ? list.join('\n') : '$current\n${list.join('\n')}';
+          _batchMode = true;
+        });
+        _snack('${list.length} prompts added to the Batch Sets box.');
+        break;
+      case 'save':
+        try {
+          final docs = await getApplicationDocumentsDirectory();
+          final dir = Directory(p.join(docs.path, 'GeminiHDStudio', 'Search'));
+          await dir.create(recursive: true);
+          final file = File(p.join(dir.path, pick.name));
+          await file.writeAsBytes(pick.bytes);
+          _snack('Saved image copy: ${file.path}');
+        } catch (e) {
+          _snack('Save failed: $e');
+        }
+        break;
+    }
+  }
+
+  List<String?> _customStagesFor(int count) {
+    return List.generate(count, (i) {
+      final t = _stageCtrls[i]?.text.trim() ?? '';
+      return t.isEmpty ? null : t;
+    });
+  }
+
+  /// Background readiness gate (v72, steps corrected v76+v78):
+  /// before a generation starts, check whether the phone will
+  /// kill it when the screen locks. If not exempt, offer the fix
+  /// once per session — the system exemption screen, or the app
+  /// settings page. HiOS keeps Auto-start inside the Phone Master
+  /// app — on his CAMON 30S (PM 6.x grid home, no Toolbox tab)
+  /// it lives under the "App Management" / "Battery Optimization"
+  /// cards, or via the Settings search for "Auto-start".
+  /// Generation itself is never blocked: "Pore" runs it anyway,
+  /// and the amber banner stays until the phone is exempt. Returns
+  /// the current exemption state.
+  Future<bool> _ensureBackgroundReady() async {
+    final exempt = await ForegroundKeepAlive.isBatteryExempt();
+    if (exempt ||
+        !ForegroundKeepAlive.enabled ||
+        _bgDialogShownThisSession) {
+      return exempt;
+    }
+    _bgDialogShownThisSession = true;
+    final maker = await ForegroundKeepAlive.getManufacturer();
+    final transsion = <String>['tecno', 'infinix', 'itel', 'transsion']
+        .any((m) => maker.toLowerCase().contains(m));
+    if (!mounted) return exempt;
+    final action = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Background generation chalu rakho'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                  'Phone lock korle ba onno app-e gele generation thambe, jodi ei permission-ta na dao.'),
+              const SizedBox(height: 12),
+              const Text(
+                  '1. "Allow koro" chaple system-er screen khulbe — okhane "Allow" / "No restrictions" select koro.'),
+              if (transsion) ...[
+                const SizedBox(height: 8),
+                const Text(
+                    '2. TECNO / Infinix phone-e aro dorkar: Phone Master-e "App Management" ba "Battery Optimization" card kholo — vitore Auto-start / Power Saving Management-e Zedge Studio ON / No restrictions koro. Na pele Settings app-er search-e "Auto-start" likhe khujo.'),
+                const SizedBox(height: 8),
+                const Text(
+                    '3. Recents (square button) chaple Zedge Studio-r card-e 🔒 lock chap dao.'),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, 'later'),
+              child: const Text('Pore')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, 'settings'),
+              child: const Text('Settings kholo')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, 'allow'),
+              child: const Text('Allow koro')),
+        ],
+      ),
+    );
+    if (action == 'allow') {
+      await ForegroundKeepAlive.requestBatteryExemption();
+    } else if (action == 'settings') {
+      await ForegroundKeepAlive.openAppSettings();
+    }
+    final nowExempt = await ForegroundKeepAlive.isBatteryExempt();
+    return nowExempt;
+  }
+
+  Future<void> _generate() async {
+    if (_busy) return;
+    final prompts = _batchMode
+        ? parseBatchPrompts(_promptCtrl.text)
+        : [_promptCtrl.text.trim()];
+    if (prompts.isEmpty || prompts.first.isEmpty) {
+      _snack('Write a prompt first.');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _activeStep = 0;
+    });
+    // Keep the whole run (single or batch) alive in the
+    // background — screen off / other apps must not kill it (v33).
+    await _ensureBackgroundReady();
+    await ForegroundKeepAlive.acquire(
+        'Generating in the background — safe to switch apps');
+    final isSetMode =
+        _mode == 'set_dual' || _mode == 'set_24h' || _mode == 'set_battery';
+    final stageCount = isSetMode ? stagesForMode(_mode).length : 0;
+    if (_batchMode) {
+      setState(() {
+        _batchStatuses = List.filled(prompts.length, 'waiting');
+        _batchStop = false;
+      });
+    }
+    var doneCount = 0;
+    var failCount = 0;
+    try {
+      for (var i = 0; i < prompts.length; i++) {
+        if (_batchMode && _batchStop) {
+          _onStatus(StatusEvent('done', 4,
+              'Batch stopped: $doneCount of ${prompts.length} sets done.'));
+          break;
+        }
+        if (_batchMode) {
+          setState(() => _batchStatuses[i] = 'running');
+          _onStatus(StatusEvent('generating', 1,
+              'Batch ${i + 1}/${prompts.length}: ${prompts[i]}'));
+        }
+        try {
+          final entry = await _engine.generateSet(
+          prompt: prompts[i],
+          negativePrompt: _negativeCtrl.text,
+          workflowMode: _mode,
+          customStages: isSetMode ? _customStagesFor(stageCount) : const [],
+          storyArc: _storyArc,
+          variationStrength: _variation,
+          displayTarget: _displayTarget,
+          colorBoost: _colorBoost,
+          aiDirectorEnabled: _aiDirector,
+          autoWriteMetadata: _autoMetadata,
+          includeFoldableCompanion: _foldableCompanion && isSetMode,
+          referenceBytes: _reference?.bytes,
+          referenceFilename: _reference?.name ?? 'reference_image.jpg',
+          referenceMime: _reference?.mime ?? 'image/jpeg',
+          forceImagePrefix: _forcePrefix,
+          upscaleEnabled: _upscale,
+          useExactZedgeNames: _useExactNames,
+          subfolder: _subfolderCtrl.text.trim().isEmpty
+              ? 'Gemini_HD'
+              : _subfolderCtrl.text.trim(),
+          portraitWidth: _portraitW,
+          portraitHeight: _portraitH,
+          landscapeWidth: _landscapeW,
+          landscapeHeight: _landscapeH,
+        );
+          setState(() {
+            _history = [entry, ..._history];
+            if (_batchMode) _batchStatuses[i] = 'done';
+          });
+          // v85: the new set is below the prompt — scroll to it.
+          _scrollToResults();
+          doneCount++;
+        } catch (e) {
+          if (!_batchMode) rethrow;
+          failCount++;
+          setState(() => _batchStatuses[i] = 'failed');
+          _onStatus(StatusEvent(
+              'error', 1, 'Batch ${i + 1}/${prompts.length} failed: $e'));
+        }
+      }
+      if (_batchMode && prompts.length > 1) {
+        _snack(failCount == 0
+            ? 'Batch finished: $doneCount sets generated.'
+            : 'Batch finished: $doneCount done, $failCount failed.');
+      }
+    } catch (e) {
+      _onStatus(StatusEvent('error', 1, 'Generation failed: $e'));
+      _snack('Generation failed: $e');
+    } finally {
+      await ForegroundKeepAlive.release();
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+
+  // -------------------------------------------------------------------
+  // Overnight queue (v47)
+  // -------------------------------------------------------------------
+
+  static const _queuePrefsKey = 'overnightQueueV47';
+  static const _queueSummaryPrefsKey = 'overnightQueueSummaryV47';
+
+  Future<void> _loadQueue() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _queue
+        ..clear()
+        ..addAll(QueueItem.decodeList(prefs.getString(_queuePrefsKey)));
+      final rawSummary = prefs.getString(_queueSummaryPrefsKey);
+      if (rawSummary != null) {
+        final decoded = jsonDecode(rawSummary);
+        if (decoded is Map) {
+          _queueSummary = Map<String, dynamic>.from(decoded);
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _persistQueue() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_queuePrefsKey, QueueItem.encodeList(_queue));
+    } catch (_) {}
+  }
+
+  Future<void> _persistQueueSummary() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final s = _queueSummary;
+      if (s == null) {
+        await prefs.remove(_queueSummaryPrefsKey);
+      } else {
+        await prefs.setString(_queueSummaryPrefsKey, jsonEncode(s));
+      }
+    } catch (_) {}
+  }
+
+  /// Snapshot the designer's current settings into a queue item —
+  /// the same mapping _generate() uses, minus the reference image
+  /// (bytes are not persisted).
+  QueueItem _snapshotItem(String prompt) {
+    final isSetMode =
+        _mode == 'set_dual' || _mode == 'set_24h' || _mode == 'set_battery';
+    final stageCount = isSetMode ? stagesForMode(_mode).length : 0;
+    return QueueItem(
+      id: '${DateTime.now().microsecondsSinceEpoch}-${_queue.length}',
+      prompt: prompt,
+      negativePrompt: _negativeCtrl.text,
+      workflowMode: _mode,
+      customStages: isSetMode ? _customStagesFor(stageCount) : const [],
+      storyArc: _storyArc,
+      variationStrength: _variation,
+      displayTarget: _displayTarget,
+      colorBoost: _colorBoost,
+      aiDirectorEnabled: _aiDirector,
+      autoWriteMetadata: _autoMetadata,
+      includeFoldableCompanion: _foldableCompanion && isSetMode,
+      forceImagePrefix: _forcePrefix,
+      upscaleEnabled: _upscale,
+      useExactZedgeNames: _useExactNames,
+      subfolder: _subfolderCtrl.text.trim().isEmpty
+          ? 'Gemini_HD'
+          : _subfolderCtrl.text.trim(),
+      portraitWidth: _portraitW,
+      portraitHeight: _portraitH,
+      landscapeWidth: _landscapeW,
+      landscapeHeight: _landscapeH,
+      createdAtMs: DateTime.now().millisecondsSinceEpoch,
+    );
+  }
+
+  void _addToQueue() {
+    final prompts = _batchMode
+        ? parseBatchPrompts(_promptCtrl.text)
+        : [_promptCtrl.text.trim()];
+    if (prompts.isEmpty || prompts.first.isEmpty) {
+      _snack('Write a prompt first.');
+      return;
+    }
+    for (final p in prompts) {
+      _queue.add(_snapshotItem(p));
+    }
+    _persistQueue();
+    _queueTick.value++;
+    setState(() {});
+    final refNote =
+        _reference != null ? ' (reference image is not kept in the queue)' : '';
+    _snack(prompts.length == 1
+        ? 'Added to the overnight queue$refNote.'
+        : '${prompts.length} sets added to the overnight queue$refNote.');
+  }
+
+  Future<void> _runQueue() async {
+    if (_busy || _queueRunning) return;
+    final pending = _queue.where((q) => q.status == 'pending').toList();
+    if (pending.isEmpty) {
+      _snack('Nothing pending in the queue.');
+      return;
+    }
+    setState(() {
+      _queueRunning = true;
+      _queueStop = false;
+      _busy = true;
+      _queueLiveStatus = 'Starting queue...';
+    });
+    _queueTick.value++;
+    await _ensureBackgroundReady();
+    await ForegroundKeepAlive.acquire(
+        'Overnight queue running — safe to switch apps');
+    var done = 0;
+    var failed = 0;
+    try {
+      for (final item in pending) {
+        if (_queueStop) break;
+        item.status = 'running';
+        item.error = '';
+        await _persistQueue();
+        _queueTick.value++;
+        if (mounted) setState(() {});
+        try {
+          final entry = await _engine.generateSet(
+            prompt: item.prompt,
+            negativePrompt: item.negativePrompt,
+            workflowMode: item.workflowMode,
+            customStages: item.customStages,
+            storyArc: item.storyArc,
+            variationStrength: item.variationStrength,
+            displayTarget: item.displayTarget,
+            colorBoost: item.colorBoost,
+            aiDirectorEnabled: item.aiDirectorEnabled,
+            autoWriteMetadata: item.autoWriteMetadata,
+            includeFoldableCompanion: item.includeFoldableCompanion,
+            forceImagePrefix: item.forceImagePrefix,
+            upscaleEnabled: item.upscaleEnabled,
+            useExactZedgeNames: item.useExactZedgeNames,
+            subfolder: item.subfolder,
+            portraitWidth: item.portraitWidth,
+            portraitHeight: item.portraitHeight,
+            landscapeWidth: item.landscapeWidth,
+            landscapeHeight: item.landscapeHeight,
+          );
+          item.status = 'done';
+          done++;
+          if (mounted) setState(() => _history = [entry, ..._history]);
+        } catch (e) {
+          var msg = '$e';
+          if (msg.length > 140) msg = msg.substring(0, 140);
+          item.status = 'failed';
+          item.error = msg;
+          failed++;
+        }
+        await _persistQueue();
+        _queueTick.value++;
+        if (mounted) setState(() {});
+      }
+    } finally {
+      await ForegroundKeepAlive.release();
+      if (mounted) {
+        setState(() {
+          _queueRunning = false;
+          _busy = false;
+        });
+      } else {
+        _queueRunning = false;
+        _busy = false;
+      }
+    }
+    if (done + failed > 0) {
+      final now = DateTime.now();
+      final hh = now.hour.toString().padLeft(2, '0');
+      final mm = now.minute.toString().padLeft(2, '0');
+      _queueSummary = {
+        'done': done,
+        'failed': failed,
+        'total': pending.length,
+        'at': '${now.day}/${now.month} $hh:$mm',
+      };
+      await _persistQueueSummary();
+      _queueTick.value++;
+      await ForegroundKeepAlive.notifyDone(
+        'Zedge Studio — queue finished',
+        '$done set(s) done${failed > 0 ? ', $failed failed' : ''} — open the app to see them',
+      );
+      _snack('Queue finished: $done done, $failed failed.');
+      // v85: show the finished sets below the prompt.
+      _scrollToResults();
+      if (mounted) setState(() {});
+    }
+  }
+
+  void _removeQueueItem(QueueItem item) {
+    if (_queueRunning) return;
+    setState(() => _queue.remove(item));
+    _persistQueue();
+    _queueTick.value++;
+  }
+
+  void _retryFailedQueue() {
+    for (final q in _queue) {
+      if (q.status == 'failed') {
+        q.status = 'pending';
+        q.error = '';
+      }
+    }
+    _persistQueue();
+    _queueTick.value++;
+    setState(() {});
+  }
+
+  void _clearDoneQueue() {
+    setState(() => _queue.removeWhere((q) => q.status == 'done'));
+    _persistQueue();
+    _queueTick.value++;
+  }
+
+  Widget _queueBar() {
+    final pending = _queue.where((q) => q.status == 'pending').length;
+    final failed = _queue.where((q) => q.status == 'failed').length;
+    final s = _queueSummary;
+    final text = _queueRunning
+        ? 'Overnight queue running...'
+        : pending > 0
+            ? 'Overnight queue: $pending pending'
+                '${failed > 0 ? ' · $failed failed' : ''}'
+            : s != null
+                ? 'Last queue run: ${s['done']} done'
+                    '${(s['failed'] as int) > 0 ? ' · ${s['failed']} failed' : ''}'
+                    ' · ${s['at']}'
+                : 'Overnight queue';
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: _openQueue,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surface,
+          border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.nightlight_round,
+                size: 16, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(width: 8),
+            Expanded(
+                child: Text(text, style: const TextStyle(fontSize: 12.5))),
+            Icon(Icons.chevron_right,
+                size: 16, color: Theme.of(context).colorScheme.onSurfaceVariant),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openQueue() {
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (ctx) => Scaffold(
+        appBar: AppBar(title: const Text('Overnight Queue')),
+        body: AnimatedBuilder(
+          animation: _queueTick,
+          builder: (ctx, _) => _queuePageBody(),
+        ),
+      ),
+    ));
+  }
+
+  Widget _queuePageBody() {
+    final pending = _queue.where((q) => q.status == 'pending').length;
+    final failedCount = _queue.where((q) => q.status == 'failed').length;
+    final hasDone = _queue.any((q) => q.status == 'done');
+    final s = _queueSummary;
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (s != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(
+                      'Last run (${s['at']}): ${s['done']} done, '
+                      '${s['failed']} failed of ${s['total']}',
+                      style: TextStyle(
+                          fontSize: 12.5, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                ),
+              if (_queueRunning && _queueLiveStatus.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(_queueLiveStatus,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12.5)),
+                ),
+              FilledButton.icon(
+                onPressed: _queueRunning
+                    ? (_queueStop
+                        ? null
+                        : () => setState(() => _queueStop = true))
+                    : (pending == 0 || _busy ? null : _runQueue),
+                icon: Icon(_queueRunning
+                    ? Icons.stop_circle_outlined
+                    : Icons.play_arrow),
+                label: Text(_queueRunning
+                    ? (_queueStop
+                        ? 'Stopping after this set...'
+                        : 'Stop after current set')
+                    : 'Start queue ($pending pending)'),
+              ),
+              if (!_queueRunning && failedCount > 0)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: OutlinedButton.icon(
+                    onPressed: _retryFailedQueue,
+                    icon: const Icon(Icons.replay, size: 17),
+                    label: Text('Retry failed ($failedCount)'),
+                  ),
+                ),
+              if (!_queueRunning && hasDone)
+                TextButton(
+                  onPressed: _clearDoneQueue,
+                  child: const Text('Clear finished'),
+                ),
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                    'Sets run one by one, each with the settings it was '
+                    'added with. A failed stage retries once on its own. '
+                    'Best overnight: plug the phone in and start the queue.',
+                    style:
+                        TextStyle(fontSize: 11.5, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: _queue.isEmpty
+              ? const Center(
+                  child: Text(
+                      'Queue is empty.\nAdd sets from the Set Designer.',
+                      textAlign: TextAlign.center),
+                )
+              : ListView.builder(
+                  itemCount: _queue.length,
+                  itemBuilder: (ctx, i) => _queueTile(_queue[i]),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _queueTile(QueueItem item) {
+    final (icon, color) = switch (item.status) {
+      'done' => (Icons.check_circle, const Color(0xFF4ADE80)),
+      'failed' => (Icons.error_outline, const Color(0xFFF87171)),
+      'running' => (Icons.autorenew, Theme.of(context).colorScheme.primary),
+      _ => (Icons.schedule, Theme.of(context).colorScheme.onSurfaceVariant),
+    };
+    return ListTile(
+      leading: item.status == 'running'
+          ? const SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2))
+          : Icon(icon, color: color, size: 20),
+      title: Text(item.prompt,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 13.5)),
+      subtitle: Text(
+          item.status == 'failed' && item.error.isNotEmpty
+              ? '${item.modeLabel} · ${item.error}'
+              : '${item.modeLabel} · ${item.status}',
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 11.5)),
+      trailing: (_queueRunning || item.status == 'running')
+          ? null
+          : IconButton(
+              icon: const Icon(Icons.close, size: 18),
+              onPressed: () => _removeQueueItem(item),
+            ),
+    );
+  }
+
+
+  /// v48: rewrite the designer's prompt (or every batch line)
+  /// into a detailed pro prompt via Gemini, with an Undo in the
+  /// confirmation SnackBar. A failed line aborts the polish and
+  /// keeps the original text untouched.
+  Future<void> _polishPrompt() async {
+    if (_busy || _polishing) return;
+    final original = _promptCtrl.text;
+    final lines =
+        _batchMode ? parseBatchPrompts(original) : [original.trim()];
+    if (lines.isEmpty || lines.first.isEmpty) {
+      _snack('Write a prompt first.');
+      return;
+    }
+    setState(() => _polishing = true);
+    try {
+      final polished = <String>[];
+      for (var i = 0; i < lines.length; i++) {
+        if (lines.length > 1) {
+          _onStatus(StatusEvent('generating', 1,
+              'Polishing prompt ${i + 1}/${lines.length}...'));
+        }
+        polished.add(await _engine.polishPrompt(lines[i]));
+      }
+      if (!mounted) return;
+      setState(() => _promptCtrl.text =
+          _batchMode ? polished.join('\n') : polished.first);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(lines.length > 1
+            ? '${lines.length} prompts polished.'
+            : 'Prompt polished.'),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () {
+            if (mounted) setState(() => _promptCtrl.text = original);
+          },
+        ),
+      ));
+    } catch (e) {
+      _snack('Polish failed: $e');
+    } finally {
+      if (mounted) setState(() => _polishing = false);
+    }
+  }
+
+  /// v51: mic toggle for the Designer prompt field. While
+  /// listening, each final transcript chunk is appended to the
+  /// field (a new line per chunk in batch mode); partial results
+  /// are ignored so the text never flickers. The recogniser ends
+  /// the session itself after a pause — onStatus clears the red
+  /// mic — and tapping the mic again stops it early.
+  Future<void> _toggleVoicePrompt() async {
+    if (_busy || _polishing) return;
+    if (_listening) {
+      await _voice.stop();
+      return;
+    }
+    final (ok, message) = await _voice.start(
+      onResult: (text, isFinal) {
+        if (!isFinal || !mounted) return;
+        final chunk = text.trim();
+        if (chunk.isEmpty || chunk == _lastVoiceChunk) return;
+        _lastVoiceChunk = chunk;
+        setState(() => _promptCtrl.text = appendDictation(
+            _promptCtrl.text, chunk,
+            batch: _batchMode));
+      },
+      onFailure: (msg) {
+        if (!mounted) return;
+        _snack(msg);
+        setState(() => _listening = false);
+      },
+      onStatus: (status) {
+        if ((status == 'done' || status == 'notListening') && mounted) {
+          setState(() => _listening = false);
+        }
+      },
+    );
+    if (!mounted) return;
+    if (!ok) {
+      _snack(message ?? 'Voice input is not available on this device.');
+      return;
+    }
+    setState(() => _listening = true);
+  }
+
+  Future<void> _importSet() async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      allowMultiple: true,
+      withData: true,
+    );
+    if (res == null || res.files.isEmpty) return;
+    final files = res.files
+        .where((f) => f.bytes != null)
+        .map((f) => (bytes: f.bytes!, filename: f.name))
+        .toList();
+    if (files.isEmpty || !mounted) return;
+    final mode =
+        (_mode == 'single' || _mode == 'dual_single') ? 'set_24h' : _mode;
+    final conceptCtrl = TextEditingController(text: _promptCtrl.text.trim());
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Import set'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+                '${files.length} image(s) selected. They are formatted to ${_portraitW}x$_portraitH JPG and land in the Showcase as a ${setTypeLabelFor(mode)}.'),
+            const SizedBox(height: 12),
+            TextField(
+              controller: conceptCtrl,
+              decoration: const InputDecoration(
+                labelText: 'Set concept (for AI metadata)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Import')),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      final entry = await _engine.importLocalSet(
+        files: files,
+        workflowMode: mode,
+        prompt: conceptCtrl.text.trim(),
+        upscaleEnabled: _upscale,
+        autoWriteMetadata: _autoMetadata,
+        subfolder: _subfolderCtrl.text.trim().isEmpty
+            ? 'Gemini_HD'
+            : _subfolderCtrl.text.trim(),
+        portraitWidth: _portraitW,
+        portraitHeight: _portraitH,
+      );
+      setState(() => _history = [entry, ..._history]);
+    } catch (e) {
+      _snack('Import failed: $e');
+      _onStatus(StatusEvent('error', 1, 'Import failed: $e'));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _refreshHistory() async {
+    final h = await _engine.loadHistory();
+    if (mounted) setState(() => _history = h);
+  }
+
+  Future<void> _clearHistory() async {
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear Showcase?'),
+        content: const Text(
+            'This removes the set list from the app. Image files stay in the app documents folder.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Clear')),
+        ],
+      ),
+    );
+    if (go == true) {
+      await _engine.saveHistory([]);
+      setState(() => _history = []);
+    }
+  }
+
+  void _showPathDialog(String title, String path) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: SelectableText(path),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: path));
+              Navigator.pop(ctx);
+            },
+            child: const Text('Copy path'),
+          ),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+        ],
+      ),
+    );
+  }
+
+  // Charging Animation (v86): the section drives the user's own
+  // signed-in Gemini session — Neon default, Task mode — through
+  // the in-page video driver; the engine owns the job.
+  Future<void> _generateAnimation(String prompt, String modelId) async {
+    // Video generation is Android-only in v86: the driver is the
+    // Gecko content script, and Windows uses Chromium/CDP instead.
+    // The section UI (gallery + ZIP) still works on Windows.
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      _snack('Video generation ekhon Android app-e.');
+      return;
+    }
+    await _animEngine.start(
+      rawPrompt: prompt,
+      modelId: modelId,
+      signedIn: _accounts.isNotEmpty,
+    );
+  }
+
+  void _playAnimation(AnimationVideo video) {
+    // No new player plugin in v86: the in-app Gecko browser plays
+    // the local MP4 with its built-in HTML5 player.
+    GeckoBrowser.instance.open('file://${video.localPath}');
+  }
+
+  Future<void> _deleteAnimation(AnimationVideo video) async {
+    await _animEngine.deleteVideo(video);
+    _snack('Animation deleted.');
+  }
+
+  // v87 — per-video AI metadata + panel upload, mirroring the
+  // image sets. The account picker is the same SimpleDialog the
+  // image upload uses (spread + named accounts, remembered).
+  Future<void> _generateAnimationMetadata(AnimationVideo video) async {
+    await _animEngine.generateMetadataForVideo(video);
+  }
+
+  Future<String?> _pickPanelTarget() async {
+    var target = _animUploadTarget;
+    final cfg = await _engine.loadDistConfig();
+    if (!mounted) return null;
+    if (cfg.accounts.isEmpty) return target;
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Upload to Panel'),
+        children: [
+          for (final t in [
+            'spread',
+            ...cfg.accounts.map((a) => a.name),
+          ])
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, t),
+              child: Row(
+                children: [
+                  Icon(
+                    t == target
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_unchecked,
+                    size: 18,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                  const SizedBox(width: 10),
+                  Text(t == 'spread' ? 'Spread (Auto-Rotate)' : t),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (picked == null) return null;
+    if (mounted) setState(() => _animUploadTarget = picked);
+    return picked;
+  }
+
+  Future<void> _uploadAnimationToPanel(AnimationVideo video) async {
+    final target = await _pickPanelTarget();
+    if (target == null) return;
+    final ok = await _animEngine.uploadVideoToPanel(video,
+        targetAccount: target);
+    if (!mounted) return;
+    if (ok) {
+      AnimationVideo? fresh;
+      for (final x in _animEngine.videos) {
+        if (x.id == video.id) fresh = x;
+      }
+      _snack('Uploaded to ${fresh?.uploadedAccount ?? target}.');
+    } else {
+      _snack(_animEngine.status);
+    }
+  }
+
+  Future<void> _uploadAllAnimationsToPanel() async {
+    if (_animEngine.videos.isEmpty) {
+      _snack('No animations to upload.');
+      return;
+    }
+    final target = await _pickPanelTarget();
+    if (target == null) return;
+    final done =
+        await _animEngine.uploadAllToPanel(targetAccount: target);
+    if (!mounted) return;
+    _snack('$done/${_animEngine.videos.length} videos uploaded to Panel.');
+  }
+
+  Future<void> _exportAnimationsZip() async {
+    if (_animEngine.videos.isEmpty) {
+      _snack('No animations to export.');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final f = await _animEngine.buildVideosZip();
+      final bytes = await f.readAsBytes();
+      final savedPath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save Animations ZIP',
+        fileName: p.basename(f.path),
+        bytes: bytes,
+      );
+      if (!mounted) return;
+      if (savedPath != null) {
+        _showPathDialog('Animations ZIP saved', savedPath);
+      } else {
+        _snack('Save cancelled — the ZIP is still in the app folder.');
+      }
+    } catch (e) {
+      _snack('ZIP failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _exportZip(List<SetEntry> entries) async {
+    if (entries.isEmpty) {
+      _snack('No sets to export.');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final f = await _engine.buildReadyZip(entries,
+          useHubSetFolders: _useHubFolders);
+      // v74: the ZIP used to land in the app's PRIVATE folder, which
+      // no file manager and no Downloads can see — the user only got
+      // a path dialog, so from his side the download never happened.
+      // Now open the system save picker so he picks the folder
+      // (Downloads) himself; the picker is the download on Android.
+      final bytes = await f.readAsBytes();
+      final savedPath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save Ready ZIP',
+        fileName: p.basename(f.path),
+        bytes: bytes,
+      );
+      if (!mounted) return;
+      if (savedPath != null) {
+        _showPathDialog('Ready ZIP saved', savedPath);
+      } else {
+        _snack('Save cancelled — the ZIP is still in the app folder.');
+      }
+    } catch (e) {
+      _snack('ZIP failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _writeAllMetadata() async {
+    if (_busy || _history.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      for (final entry in _history) {
+        if (entry.metadata == null || entry.metadata!.title.isEmpty) {
+          await _engine.generateMetadataForEntry(entry);
+        }
+      }
+      await _refreshHistory();
+    } catch (e) {
+      _snack('Metadata failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _uploadAllToPanel() async {
+    if (_busy || _history.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      for (final entry in _history) {
+        await _engine.uploadSetToPanel(entry);
+      }
+      await _refreshHistory();
+      _snack('All sets uploaded to Panel.');
+    } catch (e) {
+      _snack('Panel upload failed: $e');
+      _onStatus(StatusEvent('error', 4, 'Panel upload failed: $e'));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Dashboard shell: gradient header + badge navigation + tab body
+  // -------------------------------------------------------------------
+
+  void _onNavSelected(int i) {
+    // v86: Studio (0) and Animation (1) are real tabs; Search /
+    // Login open as routes on top. (v85: only Studio was a tab —
+    // the Showcase moved under the designer.)
+    if (i == 0) {
+      setState(() => _tab = 0);
+    } else if (i == 1) {
+      setState(() => _tab = 1);
+    } else if (i == 2) {
+      _openImageSearch();
+    } else if (i == 3) {
+      _openLogin();
+    }
+  }
+
+  /// Scroll the phone Studio screen down to the generated sets
+  /// (v85) — called after a generation finishes, so the new set
+  /// shows without hunting for it.
+  void _scrollToResults() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _resultsKey.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(ctx,
+            duration: const Duration(milliseconds: 400),
+            curve: Curves.easeOut);
+      }
+    });
+  }
+
+  /// Scroll the phone Studio screen back up to the prompt (v85).
+  void _scrollStudioToTop() {
+    if (_studioScrollCtrl.hasClients) {
+      _studioScrollCtrl.animateTo(0,
+          duration: const Duration(milliseconds: 400), curve: Curves.easeOut);
+    }
+  }
+
+  Widget _navIcon(IconData icon, int badgeCount) {
+    if (badgeCount <= 0) return Icon(icon);
+    return Badge(
+      label: Text('$badgeCount'),
+      backgroundColor: kDashboardScheme.tertiary,
+      textColor: Colors.white,
+      child: Icon(icon),
+    );
+  }
+
+  List<NavigationDestination> get _destinations => [
+        const NavigationDestination(
+          icon: Icon(Icons.dashboard_outlined),
+          selectedIcon: Icon(Icons.dashboard),
+          label: 'Studio',
+        ),
+        const NavigationDestination(
+          icon: Icon(Icons.movie_creation_outlined),
+          selectedIcon: Icon(Icons.movie_creation),
+          label: 'Animation',
+        ),
+        const NavigationDestination(
+          icon: Icon(Icons.image_search_outlined),
+          selectedIcon: Icon(Icons.image_search),
+          label: 'Search',
+        ),
+        NavigationDestination(
+          icon: _navIcon(Icons.account_circle_outlined, _accounts.length),
+          selectedIcon: _navIcon(Icons.account_circle, _accounts.length),
+          label: 'Login',
+        ),
+      ];
+
+  @override
+  Widget build(BuildContext context) {
+    final wide = MediaQuery.of(context).size.width >= 900;
+    return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      body: Stack(
+        children: [
+          const AuroraBackdrop(),
+          SafeArea(
+            child: Column(
+              children: [
+                _appBar(wide),
+                _accountStrip(),
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (wide)
+                    NavigationRail(
+                      selectedIndex: _tab,
+                      onDestinationSelected: _onNavSelected,
+                      labelType: NavigationRailLabelType.all,
+                      destinations: [
+                        for (final d in _destinations)
+                          NavigationRailDestination(
+                            icon: d.icon,
+                            selectedIcon: d.selectedIcon,
+                            label: Text(d.label),
+                          ),
+                      ],
+                    ),
+                Expanded(
+                  child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 300),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) => FadeTransition(
+                        opacity: animation,
+                        child: SlideTransition(
+                          position: Tween<Offset>(
+                                  begin: const Offset(0.03, 0),
+                                  end: Offset.zero)
+                              .animate(animation),
+                          child: child,
+                        ),
+                      ),
+                      child: KeyedSubtree(
+                        key: ValueKey(_tab),
+                        child: _tabBody(wide),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        ),
+        ],
+      ),
+      // Floating pill navigation (v34 redesign).
+      bottomNavigationBar: wide
+          ? null
+          : Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerLow.withValues(alpha: 0.97),
+                  borderRadius: BorderRadius.circular(26),
+                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+                  boxShadow: const [
+                    BoxShadow(
+                        color: Colors.black54,
+                        blurRadius: 18,
+                        offset: Offset(0, 6)),
+                  ],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(26),
+                  child: NavigationBar(
+                    height: 62,
+                    selectedIndex: _tab,
+                    onDestinationSelected: _onNavSelected,
+                    destinations: _destinations,
+                  ),
+                ),
+              ),
+            ),
+    );
+  }
+
+  Widget _tabBody(bool wide) {
+    // v86: the Animation tab is its own section (prompt card on
+    // top, finished videos below — same phone/wide split as
+    // Studio). Search / Login are pushed routes, not tabs.
+    if (_tab == 1) {
+      return AnimationSection(
+        engine: _animEngine,
+        signedIn: _accounts.isNotEmpty,
+        wide: wide,
+        onGenerate: _generateAnimation,
+        onPlay: _playAnimation,
+        onDelete: _deleteAnimation,
+        onExportZip: _exportAnimationsZip,
+        onMetadata: _generateAnimationMetadata,
+        onUploadToPanel: _uploadAnimationToPanel,
+        onUploadAllToPanel: _uploadAllAnimationsToPanel,
+      );
+    }
+    if (wide) {
+      return Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(width: 430, child: _designerPanel()),
+          const VerticalDivider(width: 1),
+          Expanded(child: _showcasePanel()),
+        ],
+      );
+    }
+    // v85: one Studio screen — the prompt + designer on top, the
+    // generated sets below, in a single scroll view. The Showcase
+    // tab is gone; its panel lives inline under the designer.
+    return SingleChildScrollView(
+      controller: _studioScrollCtrl,
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _designerCard(),
+          const SizedBox(height: 12),
+          _showcaseInline(),
+        ],
+      ),
+    );
+  }
+
+  /// Slim professional app bar (v83 redesign): the old gradient hero
+  /// card is gone — it stacked brand, stats and account controls
+  /// into one tall banner that ate a third of the phone screen and
+  /// looked out of place. Now the bar is flat with a hairline
+  /// divider: logo + title + subtitle, the two action icons, and
+  /// the version label. Stats live in the Showcase header,
+  /// account controls in the slim strip below this bar. The old
+  /// Gemini Login icon is gone from here on purpose: Login is
+  /// already a bottom-nav / rail destination, and keeping the icon
+  /// squeezed the title to "Zedge S…" on a 360px phone (measured:
+  /// 3×48px icons + full version left the title column 67px wide
+  /// for a 98.5px title).
+  Widget _appBar(bool wide) {
+    final cs = Theme.of(context).colorScheme;
+    final logoSize = wide ? 24.0 : 28.0;
+    final titleSize = wide ? 14.0 : 16.0;
+    final iconBox = wide ? 28.0 : 32.0;
+    final iconSize = wide ? 16.0 : 18.0;
+    return Container(
+      key: const ValueKey('appBar'),
+      padding: EdgeInsets.fromLTRB(12, wide ? 6 : 8, 12, wide ? 6 : 8),
+      decoration: BoxDecoration(
+        border: Border(
+            bottom: BorderSide(color: cs.onSurface.withValues(alpha: 0.1))),
+      ),
+      child: Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Image.asset(
+              'assets/logo.png',
+              width: logoSize,
+              height: logoSize,
+              fit: BoxFit.cover,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Zedge Studio',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: titleSize,
+                        fontWeight: FontWeight.w800,
+                        color: cs.onSurface)),
+                Text('Wallpaper Set Designer',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: wide ? 10 : 11,
+                        color: cs.onSurface.withValues(alpha: 0.6))),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Import local set',
+            constraints:
+                BoxConstraints(maxWidth: iconBox, maxHeight: iconBox),
+            padding: EdgeInsets.zero,
+            iconSize: iconSize,
+            color: cs.onSurface,
+            onPressed: _busy ? null : _importSet,
+            icon: const Icon(Icons.folder_open_outlined),
+          ),
+          IconButton(
+            tooltip: 'Panel upload settings',
+            constraints:
+                BoxConstraints(maxWidth: iconBox, maxHeight: iconBox),
+            padding: EdgeInsets.zero,
+            iconSize: iconSize,
+            color: cs.onSurface,
+            onPressed: () async {
+              await Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => PanelSettingsScreen(engine: _engine)));
+            },
+            icon: const Icon(Icons.cloud_upload_outlined),
+          ),
+          const SizedBox(width: 8),
+          Text('Version 2.5.42',
+              style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                  color: cs.onSurface.withValues(alpha: 0.38))),
+        ],
+      ),
+    );
+  }
+
+  Widget _statChip(IconData icon, String label) {
+    final cs = Theme.of(context).colorScheme;
+    return Chip(
+      avatar: Icon(icon, size: 14, color: cs.secondary),
+      label: Text(label,
+          style: TextStyle(fontSize: 11.5, color: cs.onSurface)),
+      backgroundColor: cs.onSurface.withValues(alpha: 0.13),
+      side: BorderSide.none,
+      visualDensity: VisualDensity.compact,
+    );
+  }
+
+  /// Slim account strip (v83 redesign): the account controls move
+  /// out of the old hero card into one flat row directly under the
+  /// app bar — dropdown + session status + ⋮ menu, with a hairline
+  /// divider below. Same actions, same labels; on a phone the
+  /// status is inline now instead of a second row, so the strip
+  /// is one row tall everywhere.
+  Widget _accountStrip() {
+    final cs = Theme.of(context).colorScheme;
+    // v93 — theme toggle lives here, not in the app bar: the v83
+    // measurement showed a third app-bar icon squeezes the title
+    // to ~67px on a 360px phone. The strip's Expanded dropdown
+    // absorbs the 28px instead.
+    final isDark = themeModeNotifier.value == ThemeMode.dark;
+    final connected = _sessionLabel != 'Not connected';
+    final status = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 8,
+          height: 8,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: connected
+                ? const Color(0xFF4ADE80)
+                : Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            _sessionLabel,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+                fontSize: 12, color: cs.onSurface.withValues(alpha: 0.7)),
+          ),
+        ),
+      ],
+    );
+    return Container(
+      key: const ValueKey('accountStrip'),
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+      decoration: BoxDecoration(
+        border: Border(
+            bottom: BorderSide(color: cs.onSurface.withValues(alpha: 0.1))),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: DropdownButton<String>(
+              value: _accountMode,
+              isExpanded: true,
+              isDense: true,
+              underline: const SizedBox.shrink(),
+              dropdownColor: cs.surfaceContainer,
+              iconEnabledColor: cs.onSurface,
+              style: TextStyle(color: cs.onSurface, fontSize: 13.5),
+              items: [
+                DropdownMenuItem(
+                  value: 'auto',
+                  child: Text(_accounts.length > 1
+                      ? 'Auto-switch on limit (${_accounts.length} Gmails)'
+                      : 'Auto-switch on limit'),
+                ),
+                for (var u = 0; u < 6; u++)
+                  DropdownMenuItem(
+                    value: '$u',
+                    child: Text(_accounts.any((a) => a.authUser == u)
+                        ? 'u/$u - ${_accounts.firstWhere((a) => a.authUser == u).email}'
+                        : 'u/$u - Gmail Account #${u + 1}'),
+                  ),
+              ],
+              onChanged: (v) {
+                if (v != null) _switchAccount(v);
+              },
+            ),
+          ),
+          const SizedBox(width: 10),
+          status,
+          const SizedBox(width: 4),
+          PopupMenuButton<String>(
+            tooltip: 'Account actions',
+            padding: EdgeInsets.zero,
+            color: cs.surfaceContainer,
+            onSelected: (v) async {
+              if (v == 'scan') {
+                if (!_busy) await _scanAccounts();
+              } else if (v == 'add') {
+                _openLogin(
+                    authUser: _accountMode == 'auto'
+                        ? 0
+                        : int.tryParse(_accountMode) ?? 0);
+              } else if (v == 'verify') {
+                if (!_busy) await _verifySession();
+              }
+            },
+            itemBuilder: (ctx) => const [
+              PopupMenuItem(
+                value: 'scan',
+                child: Row(
+                  children: [
+                    Icon(Icons.search, size: 18),
+                    SizedBox(width: 10),
+                    Text('Scan'),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'add',
+                child: Row(
+                  children: [
+                    Icon(Icons.add, size: 18),
+                    SizedBox(width: 10),
+                    Text('Add Gmail'),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'verify',
+                child: Row(
+                  children: [
+                    Icon(Icons.verified_outlined, size: 18),
+                    SizedBox(width: 10),
+                    Text('Verify'),
+                  ],
+                ),
+              ),
+            ],
+            child: Tooltip(
+              message: 'Account actions',
+              child: SizedBox(
+                width: 28,
+                height: 28,
+                child: Icon(Icons.more_vert, size: 18, color: cs.onSurface),
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          SizedBox(
+            width: 28,
+            height: 28,
+            child: Tooltip(
+              message: isDark ? 'Light theme' : 'Dark theme',
+              child: InkWell(
+                key: const ValueKey('themeToggle'),
+                borderRadius: BorderRadius.circular(14),
+                onTap: () => toggleTheme(),
+                child: Icon(
+                    isDark
+                        ? Icons.light_mode_outlined
+                        : Icons.dark_mode_outlined,
+                    size: 18,
+                    color: cs.onSurface),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // Batch queue panel (batch mode): every prompt line is one job with
+  // a live status — waiting / running / done / failed — plus a Stop
+  // control that lets the current set finish and skips the rest.
+  // -------------------------------------------------------------------
+
+  Widget _batchQueuePanel() {
+    final prompts = parseBatchPrompts(_promptCtrl.text);
+    final scheme = Theme.of(context).colorScheme;
+    if (prompts.isEmpty) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          'Batch mode: write one prompt per line — each line generates one full set, in order.',
+          style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+        ),
+      );
+    }
+    final done = _batchStatuses.where((s) => s == 'done').length;
+    final running = _busy && _batchMode;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.queue_outlined,
+                  size: 16, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 6),
+              const Text('Batch queue',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+              const SizedBox(width: 8),
+              Chip(
+                label: Text(_batchStatuses.isEmpty
+                    ? '${prompts.length} set${prompts.length == 1 ? '' : 's'}'
+                    : '$done/${prompts.length} done'),
+                visualDensity: VisualDensity.compact,
+                labelStyle: const TextStyle(fontSize: 11),
+              ),
+              const Spacer(),
+              if (running)
+                TextButton.icon(
+                  onPressed: () => setState(() => _batchStop = true),
+                  icon: const Icon(Icons.stop_circle_outlined, size: 16),
+                  label: const Text('Stop after current',
+                      style: TextStyle(fontSize: 12)),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 168),
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: prompts.length,
+              itemBuilder: (ctx, i) {
+                final st = i < _batchStatuses.length
+                    ? _batchStatuses[i]
+                    : 'waiting';
+                final (icon, color) = switch (st) {
+                  'running' => (Icons.autorenew, scheme.primary),
+                  'done' => (Icons.check_circle, Colors.green),
+                  'failed' => (Icons.error, scheme.error),
+                  _ => (Icons.schedule, Theme.of(context).colorScheme.onSurfaceVariant),
+                };
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: 18,
+                        child: Text('${i + 1}',
+                            style: TextStyle(
+                                fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                      ),
+                      if (st == 'running')
+                        const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child:
+                              CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      else
+                        Icon(icon, size: 16, color: color),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          prompts[i],
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: st == 'waiting'
+                                ? Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant
+                                : null,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(st,
+                          style: TextStyle(fontSize: 11, color: color)),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // Set Designer panel
+  // -------------------------------------------------------------------
+
+  Widget _designerPanel() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(12),
+      child: _designerCard(),
+    );
+  }
+
+  /// The designer card on its own, without a scroll view: the
+  /// phone Studio screen (v85) stacks it above the generated-sets
+  /// gallery in one shared scroll view, so the card must not
+  /// bring its own scroll view along.
+  Widget _designerCard() {
+    final isSetMode =
+        _mode == 'set_dual' || _mode == 'set_24h' || _mode == 'set_battery';
+    final stages = isSetMode ? stagesForMode(_mode) : const <StageDef>[];
+    return Card(
+        margin: EdgeInsets.zero,
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+          Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                  borderRadius: BorderRadius.circular(11),
+                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+                ),
+                child: Icon(Icons.tune,
+                    size: 19, color: Theme.of(context).colorScheme.primary),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 3,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Set Designer',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            fontSize: 16.5, fontWeight: FontWeight.w800)),
+                    Text('Modes · prompt · tuning',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              // v56: the size spec is a pill now — the old Flexible
+              // text squeezed against the title on narrow phones.
+              // Short label on purpose: the full "4.67 MP" text
+              // squeezed the title to "Set …" at phone widths.
+              Chip(
+                label: Text('JPG · ≤8MB',
+                    style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.onSurface)),
+                backgroundColor: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.10),
+                side: BorderSide.none,
+                visualDensity: VisualDensity.compact,
+                labelPadding: const EdgeInsets.symmetric(horizontal: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          // Mode picker (v56 redesign): one horizontal swipe row
+          // of compact chips. The old Wrap stacked the five modes
+          // into three rows and pushed the prompt off-screen.
+          // Labels and order are OUR OWN (v38, his correction:
+          // "amader kintu ei koyekta cilo") — unchanged.
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _modeChip(
+                    'dual_single', '9:16 + Foldable', Icons.devices_outlined),
+                const SizedBox(width: 8),
+                _modeChip('single', 'Single 9:16', Icons.image_outlined),
+                const SizedBox(width: 8),
+                _modeChip(
+                    'set_dual', 'Dual Set (2)', Icons.view_column_outlined),
+                const SizedBox(width: 8),
+                _modeChip(
+                    'set_24h', '24-Hour Set (4)', Icons.schedule_outlined),
+                const SizedBox(width: 8),
+                _modeChip('set_battery', 'Battery Set (6)',
+                    Icons.battery_charging_full),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _promptCtrl,
+                  minLines: 3,
+                  maxLines: _batchMode ? 8 : 4,
+                  onChanged: (_) {
+                    // Keep the batch queue panel in sync while typing;
+                    // editing the list clears the last run's marks.
+                    if (_batchMode) {
+                      setState(() => _batchStatuses = const []);
+                    }
+                  },
+                  decoration: InputDecoration(
+                    labelText:
+                        _batchMode ? 'Prompts (1 line = 1 set)' : 'Prompt',
+                    border: const OutlineInputBorder(),
+                    // v73: clear button — shows only while there is
+                    // text (ListenableBuilder rebuilds on every
+                    // keystroke); clears the field and, in batch
+                    // mode, the last run's marks, like typing does.
+                    suffixIcon: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        ListenableBuilder(
+                          listenable: _promptCtrl,
+                          builder: (context, _) =>
+                              _promptCtrl.text.isEmpty
+                                  ? const SizedBox.shrink()
+                                  : IconButton(
+                                      icon: const Icon(Icons.clear, size: 18),
+                                      tooltip: 'Clear prompt',
+                                      onPressed: _busy
+                                          ? null
+                                          : () => setState(() {
+                                                _promptCtrl.clear();
+                                                if (_batchMode) {
+                                                  _batchStatuses = const [];
+                                                }
+                                              }),
+                                    ),
+                        ),
+                        if (_voiceSupported)
+                          IconButton(
+                            icon: Icon(
+                                _listening ? Icons.mic : Icons.mic_none,
+                                color: _listening
+                                    ? const Color(0xFFE5484D)
+                                    : null),
+                            tooltip: _listening
+                                ? 'Stop listening'
+                                : 'Speak your prompt',
+                            onPressed: (_busy || _polishing)
+                                ? null
+                                : _toggleVoicePrompt,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          // v56: Polish button on its own, helper line below it as
+          // a caption. The old side-by-side text squeezed into
+          // three wrapped lines; sharing the row with the Batch
+          // switch overflowed at 320px wide.
+          Row(
+            children: [
+              OutlinedButton.icon(
+                onPressed: (_busy || _polishing) ? null : _polishPrompt,
+                icon: _polishing
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.auto_fix_high, size: 16),
+                label: Text(_polishing ? 'Polishing...' : 'Polish prompt'),
+                style: OutlinedButton.styleFrom(
+                  textStyle: const TextStyle(fontSize: 12.5),
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  minimumSize: const Size(0, 34),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+              _listening
+                  ? 'Listening... tap the mic to stop'
+                  : 'AI rewrites your idea into a detailed pro prompt',
+              style: TextStyle(
+                  fontSize: 11,
+                  color: _listening
+                      ? const Color(0xFFE5484D)
+                      : Theme.of(context).colorScheme.onSurfaceVariant)),
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerRight,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('Batch', style: TextStyle(fontSize: 13)),
+                Switch(
+                  key: const ValueKey('batchSwitch'),
+                  value: _batchMode,
+                  onChanged: (v) => setState(() {
+                    _batchMode = v;
+                    _batchStatuses = const [];
+                  }),
+                ),
+              ],
+            ),
+          ),
+          if (_batchMode) ...[
+            _batchQueuePanel(),
+            const SizedBox(height: 8),
+          ],
+          const SizedBox(height: 4),
+          OutlinedButton.icon(
+            onPressed: _pickReference,
+            icon: const Icon(Icons.image_outlined, size: 18),
+            label: Text(
+              _reference == null
+                  ? 'Reference image (optional)'
+                  : 'Reference: ${_reference!.name.length > 26 ? '${_reference!.name.substring(0, 23)}...' : _reference!.name}',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (_reference != null)
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                onPressed: () => setState(() => _reference = null),
+                child: const Text('Remove reference'),
+              ),
+            ),
+          // v58: the foldable adaptation prompt is backend-only now
+          // (kFoldableAdaptationPrompt) — no field in the UI anymore.
+          const SizedBox(height: 10),
+          _tuningRow(),
+          const SizedBox(height: 12),
+          // High-contrast gradient call-to-action (violet -> cyan).
+          Container(
+            decoration: BoxDecoration(
+              gradient: _busy ? null : kAccentGradient,
+              color: _busy
+                  ? Theme.of(context).colorScheme.surfaceContainerHighest
+                  : null,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: FilledButton.icon(
+              onPressed: _busy ? null : _generate,
+              icon: _busy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.auto_awesome),
+              label: Text(_busy ? 'Working...' : 'Generate set'),
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.transparent,
+                shadowColor: Colors.transparent,
+                minimumSize: const Size.fromHeight(52),
+                textStyle: const TextStyle(
+                    fontSize: 16, fontWeight: FontWeight.w800),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: _busy ? null : _addToQueue,
+            icon: const Icon(Icons.playlist_add, size: 18),
+            label: const Text('Add to overnight queue'),
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size.fromHeight(42),
+            ),
+          ),
+          if (_queue.isNotEmpty || _queueSummary != null) ...[
+            const SizedBox(height: 8),
+            _queueBar(),
+          ],
+          const SizedBox(height: 10),
+          _stepper(),
+          const SizedBox(height: 6),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (_busy)
+                  const Padding(
+                    padding: EdgeInsets.only(right: 8, top: 2),
+                    child: SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2)),
+                  ),
+                Expanded(
+                    child: Text(_statusText,
+                        style: const TextStyle(fontSize: 13))),
+              ],
+            ),
+          ),
+          ExpansionTile(
+            title: const Text('Advanced settings'),
+            subtitle: const Text('Negative prompt - Style - Stages - Output',
+                style: TextStyle(fontSize: 12)),
+            children: [
+              TextField(
+                controller: _negativeCtrl,
+                minLines: 2,
+                maxLines: 3,
+                decoration: InputDecoration(
+                  labelText: 'Negative prompt',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    tooltip: 'Reset default',
+                    icon: const Icon(Icons.restart_alt, size: 18),
+                    onPressed: () => setState(
+                        () => _negativeCtrl.text = kDefaultNegativePrompt),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              if (_mode == 'set_24h')
+                _dropdownRow(
+                    'Story arc',
+                    _storyArc,
+                    const {
+                      'auto': 'Auto (Smart Pick)',
+                      'light': 'Light Only',
+                      'bloom': 'Bloom Cycle',
+                      'rhythm': 'Daily Rhythm',
+                    },
+                    (v) => setState(() => _storyArc = v)),
+              if (_mode == 'set_battery')
+                _dropdownRow(
+                    'Story arc',
+                    _storyArc,
+                    const {
+                      'auto': 'Auto (Smart Pick)',
+                      'energy': 'Energy Glow',
+                      'growth': 'Growth',
+                      'awaken': 'Awakening',
+                    },
+                    (v) => setState(() => _storyArc = v)),
+              if (isSetMode) ...[
+                const SizedBox(height: 6),
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text('Stages (leave empty = auto arc/director)',
+                      style:
+                          TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                ),
+                const SizedBox(height: 6),
+                for (var i = 0; i < stages.length; i++)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: TextField(
+                      controller: _stageCtrls.putIfAbsent(
+                          i, () => TextEditingController()),
+                      decoration: InputDecoration(
+                        labelText: stages[i].badge,
+                        border: const OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+              ],
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                      child: _sizeField('Phone W', _portraitW,
+                          (v) => setState(() => _portraitW = v))),
+                  const SizedBox(width: 8),
+                  Expanded(
+                      child: _sizeField('Phone H', _portraitH,
+                          (v) => setState(() => _portraitH = v))),
+                  const SizedBox(width: 8),
+                  Expanded(
+                      child: _sizeField('Foldable W', _landscapeW,
+                          (v) => setState(() => _landscapeW = v))),
+                  const SizedBox(width: 8),
+                  Expanded(
+                      child: _sizeField('Foldable H', _landscapeH,
+                          (v) => setState(() => _landscapeH = v))),
+                ],
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _subfolderCtrl,
+                decoration: const InputDecoration(
+                  labelText: 'Folder name (inside app documents)',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+              _toggleRow('Cloudinary AI Upscale', _upscale,
+                  (v) => setState(() => _upscale = v)),
+              _toggleRow('Auto metadata', _autoMetadata,
+                  (v) => setState(() => _autoMetadata = v)),
+              if (isSetMode)
+                _toggleRow('AI Set Director plan', _aiDirector,
+                    (v) => setState(() => _aiDirector = v)),
+              if (isSetMode)
+                _toggleRow('+ Foldable companion', _foldableCompanion,
+                    (v) => setState(() => _foldableCompanion = v)),
+              _toggleRow('Ready Folder (set-01/)', _useHubFolders,
+                  (v) => setState(() => _useHubFolders = v)),
+              _toggleRow('Zedge file names', _useExactNames,
+                  (v) => setState(() => _useExactNames = v)),
+              _toggleRow('Auto-prefix image verb', _forcePrefix,
+                  (v) => setState(() => _forcePrefix = v)),
+              const SizedBox(height: 8),
+            ],
+          ),
+          if (_log.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            const Text('Log',
+                style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+            const SizedBox(height: 4),
+            Container(
+              constraints: const BoxConstraints(maxHeight: 130),
+              width: double.infinity,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: ListView(
+                reverse: false,
+                children: [
+                  for (final line in _log)
+                    Text(line,
+                        style: const TextStyle(
+                            fontSize: 11, color: Colors.white70)),
+                ],
+              ),
+            ),
+            ],
+            ],
+          ),
+        ),
+      );
+  }
+
+  Widget _modeChip(String value, String label, IconData icon) {
+    final selected = _mode == value;
+    final scheme = Theme.of(context).colorScheme;
+    return ChoiceChip(
+      avatar: Icon(icon,
+          size: 17,
+          color: selected ? scheme.onPrimary : scheme.primary),
+      label: Text(label,
+          style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: selected ? scheme.onPrimary : scheme.onSurface)),
+      labelPadding: const EdgeInsets.only(left: 2, right: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14)),
+      // v99 — the picked mode was invisible in light mode: the
+      // theme's pale containers (selected #E4DEFF vs plain #EDEAFF)
+      // were nearly identical, and the label colour was left to
+      // theme defaults. Selected is now solid primary with an
+      // onPrimary label; unselected keeps the pale surface with a
+      // visible outline and a dark label.
+      selectedColor: scheme.primary,
+      backgroundColor: scheme.surfaceContainer,
+      side: BorderSide(
+          color: selected ? Colors.transparent : scheme.outline),
+      selected: selected,
+      onSelected: (_) => setState(() {
+        _mode = value;
+        _storyArc = 'auto';
+      }),
+    );
+  }
+
+  Widget _stepper() {
+    const labels = ['Generate', 'Anchor Sync', 'Stages', 'Metadata'];
+    return Row(
+      children: [
+        for (var i = 0; i < 4; i++) ...[
+          Column(
+            children: [
+              CircleAvatar(
+                radius: 13,
+                backgroundColor: _busy && i == _activeStep
+                    ? Theme.of(context).colorScheme.primary
+                    : i < _activeStep ||
+                            (!_busy && _statusText.startsWith('Ready in'))
+                        ? Colors.green
+                        : Theme.of(context).colorScheme.surfaceContainerHighest,
+                // v95 — the number is white on the coloured steps,
+                // but the idle step sits on a pale surface in light
+                // mode, so it takes the secondary text colour there.
+                child: Text('${i + 1}',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: _busy && i == _activeStep ||
+                                i < _activeStep ||
+                                (!_busy &&
+                                    _statusText.startsWith('Ready in'))
+                            ? Colors.white
+                            : Theme.of(context)
+                                .colorScheme
+                                .onSurfaceVariant)),
+              ),
+              const SizedBox(height: 3),
+              SizedBox(
+                width: 64,
+                child: Text(labels[i],
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 10)),
+              ),
+            ],
+          ),
+          if (i < 3)
+            const Expanded(
+                child: Padding(
+              padding: EdgeInsets.only(bottom: 16),
+              child: Divider(),
+            )),
+        ],
+      ],
+    );
+  }
+
+  Widget _dropdownRow(String label, String value, Map<String, String> options,
+      ValueChanged<String> onChanged) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          SizedBox(
+              width: 86,
+              child: Text(label, style: const TextStyle(fontSize: 13))),
+          Expanded(
+            child: DropdownButtonFormField<String>(
+              isExpanded: true,
+              value: value,
+              isDense: true,
+              decoration: const InputDecoration(border: OutlineInputBorder()),
+              items: options.entries
+                  .map((e) =>
+                      DropdownMenuItem(value: e.key, child: Text(e.value)))
+                  .toList(),
+              onChanged: (v) {
+                if (v != null) onChanged(v);
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Variation / Display / Colour in ONE compact line above the
+  /// Generate button (user order 2026-11-11 — they used to sit
+  /// inside Advanced settings). Same state fields and options as
+  /// before; only the placement and density changed.
+  // v44: Variation shows in EVERY mode. It used to be set-modes
+  // only, so it vanished when the user picked '9:16 + Foldable' or
+  // 'Single 9:16' — the two modes he uses most ("ei dui ta te click
+  // korle variation option ta dekascce na").
+  Widget _tuningRow() {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: _miniDropdown(
+              'Variation',
+              _variation,
+              const {
+                'subtle': 'Subtle',
+                'clear': 'Clear',
+                'strong': 'Strong',
+              },
+              (v) => setState(() => _variation = v)),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: _miniDropdown(
+              'Display',
+              _displayTarget,
+              const {
+                'any': 'Any',
+                'amoled': 'AMOLED',
+                'ips': 'IPS',
+              },
+              (v) => setState(() => _displayTarget = v)),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: _miniDropdown(
+              'Colour',
+              _colorBoost,
+              const {
+                'off': 'Off',
+                'subtle': 'Subtle',
+                'vivid': 'Vivid',
+                'neon': 'Neon',
+              },
+              (v) => setState(() => _colorBoost = v)),
+        ),
+      ],
+    );
+  }
+
+  /// Compact picker field with the label inside the box, for the
+  /// one-line tuning row. v43: a dialog picker instead of a dropdown
+  /// menu — on the user's phone the dropdown's option menu did not
+  /// show at all, while a dialog always renders.
+  Widget _miniDropdown(String label, String value,
+      Map<String, String> options, ValueChanged<String> onChanged) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: () async {
+        final picked = await showDialog<String>(
+          context: context,
+          builder: (ctx) => SimpleDialog(
+            title: Text(label),
+            children: [
+              for (final e in options.entries)
+                SimpleDialogOption(
+                  onPressed: () => Navigator.pop(ctx, e.key),
+                  child: Row(
+                    children: [
+                      Icon(
+                        e.key == value
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_unchecked,
+                        size: 18,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                      const SizedBox(width: 10),
+                      Text(e.value),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        );
+        if (picked != null) onChanged(picked);
+      },
+      child: InputDecorator(
+        decoration: InputDecoration(
+          labelText: label,
+          border: const OutlineInputBorder(),
+          isDense: true,
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(options[value] ?? value,
+                  overflow: TextOverflow.ellipsis),
+            ),
+            Icon(Icons.arrow_drop_down,
+                size: 20, color: Theme.of(context).colorScheme.onSurfaceVariant),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _sizeField(String label, int value, ValueChanged<int> onChanged) {
+    return TextFormField(
+      initialValue: '$value',
+      keyboardType: TextInputType.number,
+      decoration: InputDecoration(
+          labelText: label, border: const OutlineInputBorder(), isDense: true),
+      onChanged: (t) {
+        final v = int.tryParse(t);
+        if (v != null && v > 0) onChanged(v);
+      },
+    );
+  }
+
+  Widget _toggleRow(String label, bool value, ValueChanged<bool> onChanged) {
+    return Row(
+      children: [
+        Expanded(child: Text(label, style: const TextStyle(fontSize: 13))),
+        Switch(value: value, onChanged: onChanged),
+      ],
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // Showcase panel
+  // -------------------------------------------------------------------
+
+  Widget _showcasePanel() {
+    return Column(
+      children: [
+        _showcaseHeader(),
+        Expanded(
+          child: _history.isEmpty
+              ? Center(child: _showcaseEmptyState())
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  itemCount: _history.length,
+                  itemBuilder: (ctx, i) => SetCard(
+                    entry: _history[i],
+                    engine: _engine,
+                    onChanged: _refreshHistory,
+                    snack: _snack,
+                  ),
+                ),
+        ),
+      ],
+    );
+  }
+
+  /// Phone inline gallery (v85): the Showcase is no longer a tab
+  /// — the generated sets stack below the designer in the Studio
+  /// scroll view. The list is shrink-wrapped and never scrolls on
+  /// its own; the outer scroll view owns the scrolling.
+  Widget _showcaseInline() {
+    return Column(
+      key: _resultsKey,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _showcaseHeader(),
+        if (_history.isEmpty)
+          Center(child: _showcaseEmptyState())
+        else
+          ListView.builder(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            itemCount: _history.length,
+            itemBuilder: (ctx, i) => SetCard(
+              entry: _history[i],
+              engine: _engine,
+              onChanged: _refreshHistory,
+              snack: _snack,
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// Showcase header (v85): title row + stat chips + the three
+  /// actions. Shared by the wide panel and the phone inline
+  /// gallery below the designer.
+  Widget _showcaseHeader() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.grid_view_outlined,
+                  size: 18, color: Color(0xFFC9C2FF)),
+              const SizedBox(width: 7),
+              const Text('Showcase',
+                  style:
+                      TextStyle(fontSize: 15.5, fontWeight: FontWeight.w700)),
+              if (_history.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: kDashboardScheme.tertiary,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text('${_history.length}',
+                      style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white)),
+                ),
+              ],
+              const Spacer(),
+              IconButton(
+                tooltip: 'Clear history',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints:
+                    const BoxConstraints(minWidth: 30, minHeight: 30),
+                onPressed: _history.isEmpty ? null : _clearHistory,
+                icon: const Icon(Icons.delete_outline, size: 17),
+              ),
+            ],
+          ),
+          // v83: the stat chips moved out of the old hero header
+          // into the Showcase header, where they describe the
+          // library they sit above (sets / Gmails / output size).
+          const SizedBox(height: 6),
+          // v85: Wrap, not Row — the inline phone gallery is 24px
+          // narrower than the old Showcase tab (the Studio scroll
+          // view adds its own 12px padding), and the three chips
+          // overflowed a 360px phone by 143px.
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              _statChip(Icons.grid_view_outlined,
+                  '${_history.length} sets'),
+              _statChip(Icons.alternate_email,
+                  '${_accounts.length} Gmail'),
+              _statChip(Icons.photo_size_select_large_outlined,
+                  '${_portraitW}x$_portraitH JPG'),
+            ],
+          ),
+          // v57: the three actions are hidden while the
+          // Showcase is empty — they were all disabled then,
+          // showing as three greyed-out buttons.
+          if (_history.isNotEmpty)
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Row(
+                children: [
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      textStyle: const TextStyle(fontSize: 12.5),
+                    ),
+                    onPressed: _busy ? null : _writeAllMetadata,
+                  icon: const Icon(Icons.description_outlined, size: 15),
+                  label: const Text('Metadata (all)'),
+                ),
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    textStyle: const TextStyle(fontSize: 12.5),
+                  ),
+                  onPressed:
+                      _history.isEmpty ? null : () => _exportZip(_history),
+                  icon: const Icon(Icons.archive_outlined, size: 15),
+                  label: const Text('Ready ZIP'),
+                ),
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    textStyle: const TextStyle(fontSize: 12.5),
+                  ),
+                  onPressed:
+                      _busy || _history.isEmpty ? null : _uploadAllToPanel,
+                  icon: const Icon(Icons.cloud_upload_outlined, size: 15),
+                  label: const Text('Upload to Panel'),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The empty-gallery body, without Expanded/Center — the caller
+  /// adds those (v85).
+  Widget _showcaseEmptyState() {
+    return Padding(
+            padding: const EdgeInsets.fromLTRB(24, 32, 24, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 76,
+                  height: 76,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF37335F),
+                    borderRadius: BorderRadius.circular(22),
+                    border:
+                        Border.all(color: const Color(0xFF4A4480)),
+                  ),
+                  child: const Icon(Icons.grid_view_outlined,
+                      size: 34, color: Color(0xFFC9C2FF)),
+                ),
+                const SizedBox(height: 16),
+                const Text('No sets yet',
+                    style: TextStyle(
+                        fontSize: 17, fontWeight: FontWeight.w800)),
+                const SizedBox(height: 6),
+                Text(
+                    'Sign in with Gemini, write a prompt and Generate.',
+                    textAlign: TextAlign.center,
+                    // v99 — was hardcoded grey, faint on the light
+                    // empty-state card.
+                    style: TextStyle(
+                        fontSize: 13,
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurfaceVariant)),
+                const SizedBox(height: 18),
+                FilledButton.icon(
+                  onPressed: _scrollStudioToTop,
+                  icon: const Icon(Icons.add, size: 18),
+                  label: const Text('Create your first set'),
+                ),
+              ],
+            ),
+    );
+  }
+}
+
+/// One finished set in the Showcase.
+class SetCard extends StatefulWidget {
+  final SetEntry entry;
+  final StudioEngine engine;
+  final Future<void> Function() onChanged;
+  final void Function(String) snack;
+  const SetCard({
+    super.key,
+    required this.entry,
+    required this.engine,
+    required this.onChanged,
+    required this.snack,
+  });
+
+  @override
+  State<SetCard> createState() => _SetCardState();
+}
+
+class _SetCardState extends State<SetCard> {
+  bool _working = false;
+  String _uploadTarget = 'spread';
+
+  /// v96 — the metadata card is compact by default (2-line
+  /// description, one scrollable tag row); tap to expand.
+  bool _metaExpanded = false;
+
+  Future<void> _run(Future<void> Function() fn, String failPrefix) async {
+    if (_working) return;
+    setState(() => _working = true);
+    try {
+      await fn();
+      await widget.onChanged();
+    } catch (e) {
+      widget.snack('$failPrefix: $e');
+    } finally {
+      if (mounted) setState(() => _working = false);
+    }
+  }
+
+  Future<void> _regenerateAll() async {
+    await _run(() async {
+      for (final img in widget.entry.images) {
+        await widget.engine.regenerateStage(widget.entry, img);
+      }
+    }, 'Regenerate failed');
+  }
+
+  Future<void> _uploadToPanel() async {
+    // v42: the card no longer carries a permanent Panel target row;
+    // the target is picked here, on the cloud tap, and remembered.
+    var target = _uploadTarget;
+    final cfg = await widget.engine.loadDistConfig();
+    if (!mounted) return;
+    if (cfg.accounts.isNotEmpty) {
+      final picked = await showDialog<String>(
+        context: context,
+        builder: (ctx) => SimpleDialog(
+          title: const Text('Upload to Panel'),
+          children: [
+            for (final t in [
+              'spread',
+              ...cfg.accounts.map((a) => a.name),
+            ])
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, t),
+                child: Row(
+                  children: [
+                    Icon(
+                      t == target
+                          ? Icons.radio_button_checked
+                          : Icons.radio_button_unchecked,
+                      size: 18,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                    const SizedBox(width: 10),
+                    Text(t == 'spread' ? 'Spread (Auto-Rotate)' : t),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      );
+      if (picked == null) return;
+      target = picked;
+      if (mounted) setState(() => _uploadTarget = target);
+    }
+    await _run(() async {
+      final r = await widget.engine
+          .uploadSetToPanel(widget.entry, targetAccount: target);
+      widget.snack('Uploaded to ${r.accountName} (key ${r.firebaseKey})');
+    }, 'Panel upload failed');
+  }
+
+  Future<void> _confirmDelete() async {
+    final entry = widget.entry;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete this set?'),
+        content: Text(
+            'The set is removed from the Showcase and its ${entry.images.length} image files are deleted from this device. This cannot be undone.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await _run(() async {
+      final history = await widget.engine.loadHistory();
+      history.removeWhere((h) => h.id == entry.id);
+      await widget.engine.saveHistory(history);
+      for (final img in entry.images) {
+        final f = File(img.localPath);
+        if (await f.exists()) {
+          try {
+            await f.delete();
+          } catch (_) {}
+        }
+      }
+    }, 'Delete failed');
+  }
+
+  /// One hashtag chip, shared by the collapsed (one scrollable
+  /// row) and expanded (wrapped) tag layouts.
+  Widget _tagChip(String tag) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF12121B),
+        border: Border.all(color: Colors.white12),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text('#$tag',
+          style:
+              const TextStyle(fontSize: 13, color: Color(0xFFC9C9D2))),
+    );
+  }
+
+  /// Inner metadata card in the reference showcase design: title +
+  /// category pill + AI sparkle, the model line, the description and
+  /// the hashtag chips.
+  /// v96 — compact by default (about half the old height): the
+  /// description shows 2 lines and the tags one scrollable row;
+  /// "Aro dekho" expands to the full description + wrapped tags.
+  Widget _metaCard(SetEntry entry, SetMetadata? meta) {
+    if (meta == null ||
+        (meta.title.isEmpty && meta.description.isEmpty && meta.tags.isEmpty)) {
+      return Container(
+        width: double.infinity,
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainer,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text('No metadata yet',
+                  style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontSize: 13.5)),
+            ),
+            FilledButton.tonalIcon(
+              onPressed: _working
+                  ? null
+                  : () => _run(() async {
+                        await widget.engine.generateMetadataForEntry(entry);
+                      }, 'Metadata failed'),
+              icon: const Icon(Icons.auto_awesome, size: 15),
+              label: const Text('AI Metadata'),
+            ),
+          ],
+        ),
+      );
+    }
+    final expanded = _metaExpanded;
+    // v96 — the toggle only appears when something is actually
+    // hidden: a description longer than ~2 lines, or more tags
+    // than fit one row.
+    final showToggle =
+        meta.description.length > 120 || meta.tags.length > 5;
+    return Container(
+      key: const ValueKey('metaCard'),
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainer,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Text(meta.title,
+                    style: const TextStyle(
+                        fontSize: 19, fontWeight: FontWeight.w700)),
+              ),
+              if (meta.category.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF7A68E0),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(meta.category.toUpperCase(),
+                      style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.8,
+                          color: Colors.white)),
+                ),
+              ],
+              IconButton(
+                tooltip: 'Rewrite with AI',
+                visualDensity: VisualDensity.compact,
+                onPressed: _working
+                    ? null
+                    : () => _run(() async {
+                          await widget.engine.generateMetadataForEntry(entry);
+                        }, 'Metadata failed'),
+                icon: Icon(Icons.auto_awesome,
+                    size: 20,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text('gemini-web (cookie)',
+              style: TextStyle(fontSize: 13.5, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+          if (meta.description.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(meta.description,
+                maxLines: expanded ? null : 2,
+                overflow:
+                    expanded ? TextOverflow.visible : TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 15,
+                    height: 1.35,
+                    color: Theme.of(context).colorScheme.onSurface)),
+          ],
+          if (meta.tags.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            if (expanded)
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [for (final tag in meta.tags) _tagChip(tag)],
+              )
+            else
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    for (var i = 0; i < meta.tags.length; i++) ...[
+                      if (i > 0) const SizedBox(width: 8),
+                      _tagChip(meta.tags[i]),
+                    ],
+                  ],
+                ),
+              ),
+          ],
+          if (showToggle) ...[
+            const SizedBox(height: 8),
+            GestureDetector(
+              key: const ValueKey('metaExpandToggle'),
+              onTap: () => setState(() => _metaExpanded = !_metaExpanded),
+              behavior: HitTestBehavior.opaque,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(expanded ? 'Kom dekho' : 'Aro dekho',
+                      style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: Theme.of(context).colorScheme.primary)),
+                  const SizedBox(width: 2),
+                  Icon(
+                      expanded
+                          ? Icons.keyboard_arrow_up
+                          : Icons.keyboard_arrow_down,
+                      size: 16,
+                      color: Theme.of(context).colorScheme.primary),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Reference-design image grid: equal columns of stage thumbnails
+  /// with circular overlay actions (preview / regenerate / view) and
+  /// the stage label underneath.
+  Widget _imageGrid(SetEntry entry) {
+    return LayoutBuilder(
+      builder: (ctx, constraints) {
+        final count = entry.images.length.clamp(1, 4);
+        final cellW = (constraints.maxWidth - (count - 1) * 10) / count;
+        final imgH = cellW / 0.71;
+        final btn = cellW < 80 ? 27.0 : 34.0;
+        final iconSize = cellW < 80 ? 14.0 : 17.0;
+        return GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: entry.images.length,
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: count,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+            childAspectRatio: cellW / (imgH + 28),
+          ),
+          itemBuilder: (ctx, i) {
+            final img = entry.images[i];
+            final file = File(img.localPath);
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                GestureDetector(
+                  onTap: () => _openLightbox(img),
+                  child: SizedBox(
+                    height: imgH,
+                    width: cellW,
+                    child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: file.existsSync()
+                            ? Image.file(file, fit: BoxFit.cover)
+                            : Container(
+                                color: Colors.black26,
+                                child:
+                                    const Icon(Icons.broken_image_outlined),
+                              ),
+                      ),
+                      Positioned(
+                        top: 6,
+                        left: 6,
+                        child: Row(
+                          children: [
+                            _overlayButton(
+                              Icons.smartphone_outlined,
+                              btn,
+                              iconSize,
+                              () => _openSimulator(entry, initialIndex: i),
+                            ),
+                            const SizedBox(width: 5),
+                            _overlayButton(
+                              Icons.refresh,
+                              btn,
+                              iconSize,
+                              _working
+                                  ? null
+                                  : () => _run(() async {
+                                        await widget.engine
+                                            .regenerateStage(entry, img);
+                                      }, 'Regenerate failed'),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Positioned(
+                        bottom: 6,
+                        left: 0,
+                        right: 0,
+                        child: Center(
+                          child: _overlayButton(
+                            Icons.fact_check_outlined,
+                            btn,
+                            iconSize,
+                            () => _openOriginality(entry, img),
+                          ),
+                        ),
+                      ),
+                    ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    if (img.hdUrl != null) ...[
+                      Icon(Icons.link, size: 13, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                      const SizedBox(width: 3),
+                    ],
+                    Expanded(
+                      child: Text(img.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 13)),
+                    ),
+                  ],
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _overlayButton(
+      IconData icon, double size, double iconSize, VoidCallback? onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: size,
+        height: size,
+        decoration: const BoxDecoration(
+          color: Color(0x8C000000),
+          shape: BoxShape.circle,
+        ),
+        child: Icon(icon, size: iconSize, color: Colors.white),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final entry = widget.entry;
+    final meta = entry.metadata;
+    return Card(
+      color: Theme.of(context).colorScheme.surface,
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      margin: const EdgeInsets.only(bottom: 12),
+      clipBehavior: Clip.antiAlias,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Header (reference showcase design): the prompt as the
+            // title, then regenerate / upload / delete icon actions
+            // and the finished-stage count (e.g. 4/4).
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      entry.prompt.isEmpty ? entry.setTypeLabel : entry.prompt,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 16.5,
+                          fontWeight: FontWeight.w700,
+                          height: 1.25),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Regenerate whole set',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _working ? null : _regenerateAll,
+                  icon: Icon(Icons.refresh,
+                      size: 21, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                ),
+                IconButton(
+                  tooltip: 'Upload to Panel',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _working ? null : _uploadToPanel,
+                  icon: Icon(Icons.cloud_upload_outlined,
+                      size: 21, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                ),
+                IconButton(
+                  tooltip: 'Delete set',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _working ? null : _confirmDelete,
+                  icon: const Icon(Icons.delete_outline,
+                      size: 21, color: Color(0xFFE5534B)),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(top: 9),
+                  child: Text(
+                      '${entry.images.length}/${entry.images.length}',
+                      style: const TextStyle(
+                          fontSize: 14, fontWeight: FontWeight.w700)),
+                ),
+              ],
+            ),
+            if (entry.uploadedToPanel != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Chip(
+                  avatar: const Icon(Icons.check_circle_outline, size: 14),
+                  label: Text(
+                      'Queued on ${entry.uploadedToPanel!['accountName']}',
+                      style: const TextStyle(fontSize: 11)),
+                ),
+              ),
+            const SizedBox(height: 12),
+            _metaCard(entry, meta),
+            const SizedBox(height: 14),
+            _imageGrid(entry),
+            if (_working)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: LinearProgressIndicator(),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openOriginality(SetEntry entry, SetImage img) async {
+    final prefs = await SharedPreferences.getInstance();
+    final target = prefs.getInt('i2pSimilarity') ?? 20;
+    final ref = ReferenceStore.lookup(entry.prompt);
+    if (!mounted) return;
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => OriginalityCheckScreen(
+        generatedFile: File(img.localPath),
+        generatedLabel: img.label,
+        referenceBytes: ref?.bytes,
+        referenceLabel: ref?.label,
+        targetSimilarity: target,
+        onLessSimilar: (bytes, reduced) async {
+          final options = PromptOptions()..similarity = reduced;
+          return generatePromptChecked(
+            bytes: bytes,
+            name: 'reference.jpg',
+            mime: 'image/jpeg',
+            options: options,
+          );
+        },
+      ),
+    ));
+  }
+
+  void _openLightbox(SetImage img) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => Dialog(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                        '${img.badge} - ${img.width}x${img.height} JPG - ${(img.byteSize / 1048576).toStringAsFixed(2)} MB',
+                        style: const TextStyle(fontSize: 13)),
+                  ),
+                  IconButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      icon: const Icon(Icons.close)),
+                ],
+              ),
+            ),
+            Flexible(
+              child: File(img.localPath).existsSync()
+                  ? Image.file(File(img.localPath), fit: BoxFit.contain)
+                  : const Padding(
+                      padding: EdgeInsets.all(24),
+                      child: Text('File missing on this device.'),
+                    ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(10),
+              child: Wrap(
+                spacing: 6,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: img.localPath));
+                      widget.snack('Image path copied');
+                    },
+                    icon: const Icon(Icons.copy, size: 15),
+                    label: const Text('Copy path'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () => _run(() async {
+                      await widget.engine.regenerateStage(widget.entry, img);
+                      if (ctx.mounted) Navigator.pop(ctx);
+                    }, 'Regenerate failed'),
+                    icon: const Icon(Icons.refresh, size: 15),
+                    label: const Text('Regenerate this stage'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      _openOriginality(widget.entry, img);
+                    },
+                    icon: const Icon(Icons.fact_check_outlined, size: 15),
+                    label: const Text('Originality check'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openSimulator(SetEntry entry, {int initialIndex = 0}) {
+    var index = initialIndex;
+    Timer? timer;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          final img = entry.images[index.clamp(0, entry.images.length - 1)];
+          // Scale the phone preview down on short phone screens and let
+          // the dialog scroll, so it never overflows small displays.
+          final screenH = MediaQuery.of(ctx).size.height;
+          final previewW = screenH < 640 ? 148.0 : 190.0;
+          final previewH = previewW * 340 / 190;
+          return Dialog(
+            child: SingleChildScrollView(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                  Row(
+                    children: [
+                      const Expanded(
+                          child: Text('Set preview',
+                              style: TextStyle(fontWeight: FontWeight.w700))),
+                      IconButton(
+                        tooltip: 'Auto-cycle',
+                        onPressed: () {
+                          if (timer != null) {
+                            timer!.cancel();
+                            timer = null;
+                          } else {
+                            timer =
+                                Timer.periodic(const Duration(seconds: 2), (_) {
+                              setLocal(() =>
+                                  index = (index + 1) % entry.images.length);
+                            });
+                          }
+                          setLocal(() {});
+                        },
+                        icon: Icon(
+                            timer != null ? Icons.pause : Icons.play_arrow),
+                      ),
+                      IconButton(
+                          onPressed: () {
+                            timer?.cancel();
+                            Navigator.pop(ctx);
+                          },
+                          icon: const Icon(Icons.close)),
+                    ],
+                  ),
+                  Container(
+                    width: previewW,
+                    height: previewH,
+                    decoration: BoxDecoration(
+                      color: Colors.black,
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(color: Colors.white24),
+                    ),
+                    clipBehavior: Clip.antiAlias,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        if (File(img.localPath).existsSync())
+                          Image.file(File(img.localPath), fit: BoxFit.cover),
+                        const Positioned(
+                          top: 26,
+                          left: 0,
+                          right: 0,
+                          child: Column(
+                            children: [
+                              Text('09:41',
+                                  style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 34,
+                                      fontWeight: FontWeight.w300,
+                                      shadows: [
+                                        Shadow(
+                                            blurRadius: 8,
+                                            color: Colors.black54)
+                                      ])),
+                              Text('Saturday, November 7',
+                                  style: TextStyle(
+                                      color: Colors.white70, fontSize: 11)),
+                            ],
+                          ),
+                        ),
+                        Positioned(
+                          bottom: 12,
+                          left: 0,
+                          right: 0,
+                          child: Text(img.exactFilename,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                  color: Colors.white70, fontSize: 9)),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    alignment: WrapAlignment.center,
+                    children: [
+                      for (var i = 0; i < entry.images.length; i++)
+                        ChoiceChip(
+                          label: Text(entry.images[i].label,
+                              style: const TextStyle(fontSize: 11)),
+                          selected: i == index,
+                          onSelected: (_) => setLocal(() => index = i),
+                        ),
+                    ],
+                  ),
+                  Text(
+                      '${img.width}x${img.height} px - JPEG - ${img.megapixels.toStringAsFixed(2)} MP',
+                      style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    ).then((_) => timer?.cancel());
+  }
+
+}
