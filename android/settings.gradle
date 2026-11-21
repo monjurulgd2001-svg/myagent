@@ -1,0 +1,35 @@
+pluginManagement {
+    def flutterSdkPath = {
+        def properties = new Properties()
+        file("local.properties").withInputStream { properties.load(it) }
+        def flutterSdkPath = properties.getProperty("flutter.sdk")
+        assert flutterSdkPath != null, "flutter.sdk not set in local.properties"
+        return flutterSdkPath
+    }()
+
+    includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+
+    repositories {
+        google()
+        // Google's Maven Central mirror FIRST: on 2026-11-09 a CI
+        // build died when repo.maven.apache.org redirected the
+        // Kotlin compiler jar to GitHub releases and got a 504.
+        // The mirror serves the same artifacts without that hop.
+        maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    id "dev.flutter.flutter-plugin-loader" version "1.0.0"
+    // Toolchain aligned with the AI Image Studio source app
+    // (Flutter 3.35.x template): AGP 8.9.1 + Kotlin 2.3.21.
+    // GeckoView 152 ships kotlin-stdlib 2.3.x + androidx.core 1.18,
+    // which fits AGP 8.9 / compileSdk 36 (GeckoView 154+ needs
+    // AGP 9.1 — do not bump past 152 on this toolchain).
+    id "com.android.application" version "8.9.1" apply false
+    id "org.jetbrains.kotlin.android" version "2.3.21" apply false
+}
+
+include ":app"
