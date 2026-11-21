@@ -17,6 +17,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'animation_models.dart';
+import 'gecko_signin.dart';
 import 'gemini_api.dart';
 import 'foreground_keep_alive.dart';
 import 'image_service.dart';
@@ -219,6 +220,12 @@ class StudioEngine {
     http.Client? httpClient,
   }) async {
     final session = await gemini.getSession();
+    // v125 — keep GeckoView's cookie store synced with the active
+    // account's cookies before PageBackendTransport opens the headless
+    // Gemini tab, so Charging Animation works with pasted cookies too.
+    if (GeckoSignIn.supported && session.cookieHeader.isNotEmpty) {
+      await GeckoSignIn.syncCookies(session.cookieHeader);
+    }
     // v97 — the signaler key is one of the page HTML's own keys
     // (v94's bundle-keys idea was wrong, and fetching the 6 MB
     // bundle stalled 180s on a slow network). The client tries

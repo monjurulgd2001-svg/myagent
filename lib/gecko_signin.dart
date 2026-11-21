@@ -67,17 +67,38 @@ class GeckoSignIn {
   /// renews the Google session itself, then returns the fresh
   /// sign-in result payload (same shape as [signIn]; null =
   /// profile not signed in).
-  static Future<String?> refresh() async {
+  static Future<String?> refresh({String? cookieHeader}) async {
     // v123 — the Kotlin side may wait up to 150s for the slow
     // headless page to parse (plus its own reads), so the Dart
     // timeout must cover it; 60s cut the answer off mid-load on a
     // slow network (live 2026-11-21: 2.4 KB/s).
+    // v125 — optional cookieHeader seeds GeckoView when the user
+    // saved/pasted cookies in Dart and the browser profile has none.
     try {
+      final args = (cookieHeader != null && cookieHeader.trim().isNotEmpty)
+          ? {'cookieHeader': cookieHeader.trim()}
+          : null;
       return await _ch
-          .invokeMethod<String>('refresh')
+          .invokeMethod<String>('refresh', args)
           .timeout(const Duration(seconds: 180));
     } on TimeoutException {
       return null;
+    }
+  }
+
+  /// v125 — copies a Dart Cookie header into GeckoView's own cookie
+  /// store so pasted/saved cookies also drive headless refresh() and
+  /// Animation PageBackendTransport without hitting Dart bot-check.
+  static Future<bool> syncCookies(String cookieHeader) async {
+    if (!supported || cookieHeader.trim().isEmpty) return false;
+    try {
+      final ok = await _ch
+          .invokeMethod<bool>(
+              'syncCookies', {'cookieHeader': cookieHeader.trim()})
+          .timeout(const Duration(seconds: 12));
+      return ok == true;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -158,8 +179,8 @@ class GeckoSignIn {
   /// Null when the profile holds no signed-in session or the page
   /// read missed — the caller falls back to the Dart HTTP path.
   static Future<({String header, GeckoSessionPage page})?>
-      refreshSessionPage() async {
-    final raw = await refresh();
+      refreshSessionPage({String? cookieHeader}) async {
+    final raw = await refresh(cookieHeader: cookieHeader);
     final header = headerFromCookiesJson(raw);
     if (!SessionStore.cookieHeaderLooksLoggedIn(header)) return null;
     final page = sessionPageFromResult(raw);

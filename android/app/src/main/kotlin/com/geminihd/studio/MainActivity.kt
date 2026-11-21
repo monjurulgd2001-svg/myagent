@@ -179,7 +179,11 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "signIn" -> GeckoBridge.signIn(
                         this, call.argument<String>("url"), result)
-                    "refresh" -> GeckoBridge.refresh(this, result)
+                    "refresh" -> GeckoBridge.refresh(
+                        this, result, call.argument<String>("cookieHeader"))
+                    "syncCookies" -> GeckoBridge.syncCookies(
+                        this, call.argument<String>("cookieHeader") ?: ""
+                    ) { result.success(it) }
                     "cookies" -> GeckoBridge.readCookies(this) {
                         result.success(it)
                     }

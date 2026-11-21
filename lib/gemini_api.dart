@@ -25,6 +25,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'gecko_signin.dart';
 import 'models.dart';
 import 'session_store.dart';
 import 'studio_constants.dart';
@@ -115,9 +116,13 @@ class GeminiApi {
   // re-fetched over Dart HTTP — the exact fetch Google bot-checks.
   // Now one browser sign-in feeds every later getSession() call.
   static final Map<int, GeminiSession> _sessionCache = {};
+  static bool _ignorePersistedForTest = false;
 
   @visibleForTesting
-  static void clearSessionCacheForTest() => _sessionCache.clear();
+  static void clearSessionCacheForTest() {
+    _sessionCache.clear();
+    _ignorePersistedForTest = true;
+  }
   int activeAuthUserIndex = 0;
 
   static const String uploadInitUrl =
@@ -357,7 +362,32 @@ class GeminiApi {
       int? explicitAuthUser,
       String? verifyHeader}) async {
     final authUser = await resolveTargetAuthUser(explicit: explicitAuthUser);
-    final cached = _sessionCache[authUser];
+    var cookieHeader =
+        verifyHeader ?? await SessionStore.cookieForUser(authUser) ?? '';
+    var cached = _sessionCache[authUser];
+    // v125 — hydrate last proven session from disk across app restarts
+    // so image & animation generation keep working without hitting
+    // Google's bot-checked Dart /app fetch.
+    if (cached == null &&
+        verifyHeader == null &&
+        !_ignorePersistedForTest &&
+        cookieHeader.isNotEmpty) {
+      final persisted = await SessionStore.loadSessionSnapshot(authUser);
+      if (persisted != null && persisted.at.isNotEmpty) {
+        cached = GeminiSession(
+          authUser: persisted.authUser,
+          email: persisted.email,
+          at: persisted.at,
+          bl: persisted.bl.isEmpty ? defaultBl : persisted.bl,
+          fSid: persisted.fSid,
+          cookieHeader: cookieHeader,
+          fetchedAtMs: persisted.fetchedAtMs,
+          apiKeys: persisted.apiKeys,
+          serverToken: persisted.serverToken,
+        );
+        _sessionCache[authUser] = cached;
+      }
+    }
     if (!forceRefresh &&
         cached != null &&
         cached.at.isNotEmpty &&
@@ -365,11 +395,41 @@ class GeminiApi {
       return cached;
     }
 
-    var cookieHeader =
-        verifyHeader ?? await SessionStore.cookieForUser(authUser) ?? '';
     if (cookieHeader.isEmpty) {
       throw Exception(
           'No Gemini login found for Account u/$authUser. Open the Gemini Login tab and sign in first.');
+    }
+
+    // v125 — on Android, try the built-in Firefox browser FIRST so
+    // image & animation generation refresh SNlM0e + apiKeys +
+    // serverToken without hitting Google's Dart HTTP bot-check.
+    if (verifyHeader == null && GeckoSignIn.supported) {
+      try {
+        _status('authenticating', 1,
+            'Refreshing Gemini session in built-in browser (Account u/$authUser)...');
+        final refreshed =
+            await GeckoSignIn.refreshSessionPage(cookieHeader: cookieHeader);
+        if (refreshed != null &&
+            (refreshed.page.authUser == null ||
+                refreshed.page.authUser == authUser)) {
+          final browserSession = sessionFromPageFields(
+            authUser: authUser,
+            cookieHeader: refreshed.header,
+            at: refreshed.page.at,
+            bl: refreshed.page.bl,
+            fSid: refreshed.page.fSid,
+            email: refreshed.page.email,
+            serverToken: refreshed.page.serverToken,
+            apiKeys: refreshed.page.apiKeys,
+          );
+          await SessionStore.saveCookieForUser(authUser, refreshed.header);
+          await adoptSession(browserSession);
+          return browserSession;
+        }
+      } catch (_) {
+        // Browser path missed — fall through to Dart HTTP or cached
+        // session fallback below.
+      }
     }
 
     // v123 — a blocked fresh check must not kill a generation when
@@ -411,6 +471,10 @@ class GeminiApi {
             'Could not find Gemini session token (SNlM0e) for Account u/$authUser. ${diagnoseSessionPage(html)}');
       }
       _sessionCache[authUser] = session;
+      if (verifyHeader == null) {
+        _ignorePersistedForTest = false;
+        await SessionStore.saveSessionSnapshot(session);
+      }
       await SessionStore.saveActiveInfo(session);
       return session;
     } catch (e) {
@@ -485,7 +549,9 @@ class GeminiApi {
   /// in-browser read): caches it and records it as the active
   /// session, exactly like a fetched one.
   Future<void> adoptSession(GeminiSession session) async {
+    _ignorePersistedForTest = false;
     _sessionCache[session.authUser] = session;
+    await SessionStore.saveSessionSnapshot(session);
     await SessionStore.saveActiveInfo(session);
   }
 

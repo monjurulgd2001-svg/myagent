@@ -74,7 +74,7 @@ void main() {
     // The Login screen shows the build, so its screenshots prove
     // which version is installed.
     final login = await File('lib/login_screen.dart').readAsString();
-    expect(login, contains('App v2.5.59'));
+    expect(login, contains('App v2.5.60'));
   });
 
   test('v121: the browser reads the session token off its own page',
@@ -588,5 +588,51 @@ void main() {
     // Refresh wording is a different message and stays).
     expect(login, isNot(contains('Sign-in closed without a session. '
         'If you did sign in, tap Refresh')));
+  });
+
+  test('v125: proven session persists across restarts and syncs cookies '
+      'into GeckoView for image + animation generation', () async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    SharedPreferences.setMockInitialValues({});
+    await SessionStore.saveCookieForUser(
+        0, '__Secure-1PSID=p1; __Secure-1PSIDTS=t1; SAPISID=s1');
+    final signInApi = GeminiApi();
+    await signInApi.adoptSession(GeminiSession(
+      authUser: 0,
+      email: 'borer.jazmin@gmail.com',
+      at: 'PERSISTED_AT',
+      bl: 'PERSISTED_BL',
+      fSid: 'FSID1',
+      cookieHeader: '__Secure-1PSID=p1; __Secure-1PSIDTS=t1; SAPISID=s1',
+      fetchedAtMs: DateTime.now().millisecondsSinceEpoch,
+      apiKeys: const ['AIzaSyTestKey1234567890123456789012345'],
+      serverToken: 'SRVTOK',
+    ));
+    final snap = await SessionStore.loadSessionSnapshot(0);
+    expect(snap, isNotNull);
+    expect(snap!.at, 'PERSISTED_AT');
+    expect(snap.serverToken, 'SRVTOK');
+    expect(snap.apiKeys, hasLength(1));
+
+    final bg = await File(
+            'android/app/src/main/assets/ais_cookies/background.js')
+        .readAsString();
+    expect(bg, contains('async function setCookies'));
+    expect(bg, contains('case "setCookies"'));
+    expect(bg, contains('retriedSessionPages'));
+
+    final content =
+        await File('android/app/src/main/assets/ais_cookies/content.js')
+            .readAsString();
+    expect(content, contains('WIZ_global_data'));
+    expect(content, contains('readSessionFieldsNow'));
+
+    final bridge = await File(
+            'android/app/src/main/kotlin/com/geminihd/studio/GeckoBridge.kt')
+        .readAsString();
+    expect(bridge, contains('fun syncCookies('));
+
+    final engine = await File('lib/studio_engine.dart').readAsString();
+    expect(engine, contains('GeckoSignIn.syncCookies(session.cookieHeader)'));
   });
 }

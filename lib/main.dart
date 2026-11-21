@@ -614,7 +614,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<GeminiSession?> _renewSessionViaBrowser(GeminiApi api) async {
     if (!GeckoSignIn.supported) return null;
     try {
-      final refreshed = await GeckoSignIn.refreshSessionPage();
+      final explicitSlot =
+          _accountMode == 'auto' ? null : int.tryParse(_accountMode);
+      final savedCookie = await SessionStore.cookieForUser(
+          explicitSlot ?? api.activeAuthUserIndex);
+      final refreshed =
+          await GeckoSignIn.refreshSessionPage(cookieHeader: savedCookie);
       if (refreshed == null) return null;
       final explicit =
           _accountMode == 'auto' ? null : int.tryParse(_accountMode);
@@ -2204,7 +2209,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               PopupMenuItem(
                 enabled: false,
-                child: Text('Version 2.5.59',
+                child: Text('Version 2.5.60',
                     style: TextStyle(
                         fontSize: 12, color: cs.onSurfaceVariant)),
               ),

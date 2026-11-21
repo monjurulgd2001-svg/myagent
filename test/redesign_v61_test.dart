@@ -23,7 +23,7 @@ void main() {
     // the Login screen and in the gear menu.
     expect(find.text('Zedge Studio'), findsNothing);
     expect(find.text('Wallpaper Set Designer'), findsNothing);
-    expect(find.text('Version 2.5.59'), findsNothing);
+    expect(find.text('Version 2.5.60'), findsNothing);
     // The four function icons are there instead.
     expect(find.byTooltip('Import local set'), findsOneWidget);
     expect(find.byTooltip('Panel upload settings'), findsOneWidget);

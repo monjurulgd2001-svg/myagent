@@ -31,6 +31,10 @@ let pendingBackendFetch = [];
 // v121: same queue for session-page reads: the sign-in tab may
 // not have connected yet when the app asks for the token.
 let pendingSessionPage = [];
+// v125: track sessionPage request ids already retried once after a stale
+// existing tab replied with an error (no token), so a newly opening
+// refresh() tab gets a chance to answer instead of failing early.
+const retriedSessionPages = new Set();
 function backendFetchTab() {
   for (const t of tabs) {
     if (isGeminiTab(t)) return t;
@@ -72,6 +76,32 @@ async function cookies(msg) {
   }
 }
 
+// v125: import user-saved/pasted Google session cookies into GeckoView's
+// own cookie store so headless refresh() and Animation PageBackendTransport
+// work with pasted cookies too (no Dart HTTP bot-check).
+async function setCookies(msg) {
+  try {
+    const list = Array.isArray(msg.cookies) ? msg.cookies : [];
+    let count = 0;
+    for (const item of list) {
+      if (!item || !item.name || !item.value) continue;
+      if (!NAMES.has(item.name)) continue;
+      await browser.cookies.set({
+        url: "https://gemini.google.com/",
+        name: String(item.name),
+        value: String(item.value),
+        domain: ".google.com",
+        path: "/",
+        secure: true,
+      });
+      count++;
+    }
+    port && port.postMessage({ id: msg.id, ok: true, count: count });
+  } catch (e) {
+    port && port.postMessage({ id: msg.id, error: String(e) });
+  }
+}
+
 async function fetchPic(msg) {
   try {
     const r = await fetch(msg.src, { credentials: "omit" });
@@ -94,6 +124,7 @@ function fromApp(msg) {
   if (!msg) return;
   switch (msg.cmd) {
     case "get": cookies(msg); break;
+    case "setCookies": setCookies(msg); break;
     case "fetch": fetchPic(msg); break;
     case "basket":
       basket = { srcs: msg.srcs || [], v: msg.v || 0, pages: msg.pages || 0 };
@@ -166,6 +197,12 @@ browser.runtime.onConnect.addListener((p) => {
     }
   }
   p.onMessage.addListener((m) => {
+    if (m && m.type === "sessionPage" && m.error && m.id != null && !retriedSessionPages.has(m.id)) {
+      retriedSessionPages.add(m.id);
+      if (retriedSessionPages.size > 50) retriedSessionPages.clear();
+      pendingSessionPage.push({ type: "sessionPage", id: m.id });
+      return;
+    }
     if (m && (m.type === "q" || m.type === "backendFetch" || m.type === "sessionPage") && port) port.postMessage(m);
   });
   p.onDisconnect.addListener(() => tabs.delete(p));

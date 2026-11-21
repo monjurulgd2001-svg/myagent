@@ -280,9 +280,14 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _connecting = true);
     try {
       final candidates = <({String header, GeminiSession? session})>[];
+      final savedForRefresh = await SessionStore.cookieForUser(_authUser);
       if (GeckoSignIn.supported) {
         try {
-          final raw = await GeckoSignIn.refresh();
+          // v125 — pass saved cookies so manually pasted cookies are
+          // also synced into GeckoView and verified in Firefox instead
+          // of falling back to Google's bot-checked Dart HTTP fetch.
+          final raw =
+              await GeckoSignIn.refresh(cookieHeader: savedForRefresh);
           final header = GeckoSignIn.headerFromCookiesJson(raw);
           if (SessionStore.cookieHeaderLooksLoggedIn(header)) {
             // v121 — the headless refresh read the token off its
@@ -393,6 +398,9 @@ class _LoginScreenState extends State<LoginScreen> {
       return false;
     }
     await SessionStore.saveCookieForUser(_authUser, normalised);
+    if (GeckoSignIn.supported) {
+      unawaited(GeckoSignIn.syncCookies(normalised));
+    }
     if (mounted) setState(() => _cookieCtrl.text = normalised);
     if (!quiet) _say('Session cookies saved for Account u/$_authUser.');
     await _refreshSavedInfo();
@@ -439,9 +447,13 @@ class _LoginScreenState extends State<LoginScreen> {
       // is unchanged — the jar under test IS the saved login the
       // profile holds. A fresh paste can only be proven by
       // fetching with it, so it keeps the Dart verify below.
-      if (headerToSave == null && GeckoSignIn.supported) {
+      if (GeckoSignIn.supported) {
         try {
-          final refreshed = await GeckoSignIn.refreshSessionPage();
+          // v125 — test saved AND newly pasted cookies via GeckoView
+          // first (seeds the profile if empty, verifies in Firefox so
+          // Google does not bot-check the request).
+          final refreshed = await GeckoSignIn.refreshSessionPage(
+              cookieHeader: headerToSave ?? saved);
           final session = refreshed == null
               ? null
               : _browserSessionFromPage(refreshed.page, refreshed.header);
@@ -556,6 +568,9 @@ class _LoginScreenState extends State<LoginScreen> {
     }
     if (headerToSave != null) {
       await SessionStore.saveCookieForUser(_authUser, headerToSave);
+      if (GeckoSignIn.supported) {
+        unawaited(GeckoSignIn.syncCookies(headerToSave));
+      }
       if (mounted) setState(() => _cookieCtrl.text = headerToSave);
     }
     _say('Connected! Gemini Account u/${session.authUser} — ${session.email}');
@@ -981,7 +996,7 @@ class _LoginScreenState extends State<LoginScreen> {
             child: Align(
               alignment: Alignment.centerRight,
               child: Text(
-                'App v2.5.59',
+                'App v2.5.60',
                 style: TextStyle(
                   fontSize: 11,
                   color: Theme.of(context).colorScheme.onSurfaceVariant,

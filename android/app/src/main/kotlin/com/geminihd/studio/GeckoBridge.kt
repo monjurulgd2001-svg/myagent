@@ -177,6 +177,29 @@ object GeckoBridge {
         }
     }
 
+    /** v125 — imports a Dart Cookie header ("name=value; ...") into
+     * GeckoView's own cookie store so pasted/saved cookies also work
+     * inside headless refresh() and Animation PageBackendTransport
+     * without hitting Google's Dart HTTP bot-check. */
+    fun syncCookies(context: Context, cookieHeader: String, done: (Boolean) -> Unit) {
+        val arr = JSONArray()
+        for (part in cookieHeader.split(";")) {
+            val eq = part.indexOf('=')
+            if (eq <= 0) continue
+            val name = part.substring(0, eq).trim()
+            val value = part.substring(eq + 1).trim()
+            if (name.isEmpty() || value.isEmpty()) continue
+            arr.put(JSONObject().put("name", name).put("value", value))
+        }
+        if (arr.length() == 0) {
+            done(false)
+            return
+        }
+        request(context, JSONObject().put("cmd", "setCookies").put("cookies", arr), 8000) { o ->
+            done(o?.optBoolean("ok") == true)
+        }
+    }
+
     fun hasPsid(json: String?): Boolean {
         if (json == null) return false
         return try {
@@ -232,7 +255,27 @@ object GeckoBridge {
      * the engine renews the Google session itself, then returns the
      * cookies.
      */
-    fun refresh(context: Context, result: MethodChannel.Result) {
+    fun refresh(context: Context, result: MethodChannel.Result, cookieHeader: String? = null) {
+        // v125 — when the user saved/pasted cookies in Dart but the
+        // GeckoView profile has no __Secure-1PSID yet, seed the
+        // profile with those cookies first so the real Firefox engine
+        // loads /app and reads SNlM0e without hitting Dart bot-check.
+        if (!cookieHeader.isNullOrBlank()) {
+            readCookies(context, 4000) { existing ->
+                if (hasPsid(existing)) {
+                    runHeadlessRefresh(context, result)
+                } else {
+                    syncCookies(context, cookieHeader) { _ ->
+                        runHeadlessRefresh(context, result)
+                    }
+                }
+            }
+            return
+        }
+        runHeadlessRefresh(context, result)
+    }
+
+    private fun runHeadlessRefresh(context: Context, result: MethodChannel.Result) {
         val rt = runtime(context)
         var answered = false
         // v122 — the redirect chain may stop first on a consent

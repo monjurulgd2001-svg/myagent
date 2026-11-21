@@ -68,20 +68,20 @@ jobs:
         run: flutter build apk --release --target-platform android-arm64
 
       - name: Rename APK
-        run: cp build/app/outputs/flutter-apk/app-release.apk ZedgeStudio-2.5.59-release.apk
+        run: cp build/app/outputs/flutter-apk/app-release.apk ZedgeStudio-2.5.60-release.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: gemini-hd-studio-android-apk
-          path: ZedgeStudio-2.5.59-release.apk
+          path: ZedgeStudio-2.5.60-release.apk
           retention-days: 90
 
       - name: Publish APK to Release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ZedgeStudio-2.5.59-release.apk
+          files: ZedgeStudio-2.5.60-release.apk
 
   build-windows:
     name: Windows App + Setup .exe
@@ -91,8 +91,8 @@ jobs:
     # (source app-o tai use kore). windows-2022-te VS 2022 ache.
     runs-on: windows-2022
     steps:
-      - name: Workflow version (v124)
-        run: echo "WORKFLOW FILE VERSION = v124 (Version 2.5.59 label, Sign-in polls instead of waiting for a page-stop; no upfront profile wipe; stale-jar wipe only; slow-connection status line)"
+      - name: Workflow version (v125)
+        run: echo "WORKFLOW FILE VERSION = v125 (Version 2.5.60 label, Persist proven GeminiSession across restarts; GeckoView cookie sync for pasted cookies; browser-first getSession; resilient WIZ_global_data + stale-tab retry)"
 
       - name: Checkout
         uses: actions/checkout@v4

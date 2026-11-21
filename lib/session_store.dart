@@ -16,6 +16,7 @@ class SessionStore {
   static const _kActiveInfo = 'activeGeminiAccountInfoJson';
   static const _kManualCookie = 'manualCookieHeader';
   static const _kAutoRenew = 'sessionAutoRenew';
+  static const _kSavedSessions = 'savedSessionsByUserJson';
 
   /// Whether the app may refresh saved Gemini sessions in the
   /// background (startup + every 15 minutes). Default ON: it keeps
@@ -48,7 +49,8 @@ class SessionStore {
   static Future<void> saveCookieForUser(
       int authUser, String cookieHeader) async {
     final all = await loadCookiesByUser();
-    if (cookieHeader.trim().isEmpty) {
+    final cleared = cookieHeader.trim().isEmpty;
+    if (cleared) {
       all.remove(authUser);
     } else {
       all[authUser] = cookieHeader.trim();
@@ -58,6 +60,9 @@ class SessionStore {
       _kCookiesByUser,
       jsonEncode(all.map((k, v) => MapEntry(k.toString(), v))),
     );
+    if (cleared) {
+      await clearSessionSnapshot(authUser);
+    }
   }
 
   static Future<String?> cookieForUser(int authUser) async {
@@ -71,6 +76,77 @@ class SessionStore {
     await prefs.remove(_kManualCookie);
     await prefs.remove(_kActiveInfo);
     await prefs.remove(_kDiscovered);
+    await prefs.remove(_kSavedSessions);
+  }
+
+  /// v125 — persists a proven GeminiSession (SNlM0e, bl, fSid,
+  /// apiKeys, serverToken) per account slot so app restarts keep
+  /// working for both Image and Animation generation without
+  /// forcing a bot-checked Dart /app fetch.
+  static Future<void> saveSessionSnapshot(GeminiSession s) async {
+    if (s.at.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    Map<String, dynamic> map = {};
+    final raw = prefs.getString(_kSavedSessions);
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        map = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      } catch (_) {}
+    }
+    map[s.authUser.toString()] = {
+      'authUser': s.authUser,
+      'email': s.email,
+      'at': s.at,
+      'bl': s.bl,
+      'fSid': s.fSid,
+      'cookieHeader': s.cookieHeader,
+      'fetchedAtMs': s.fetchedAtMs,
+      'apiKeys': s.apiKeys,
+      'serverToken': s.serverToken,
+    };
+    await prefs.setString(_kSavedSessions, jsonEncode(map));
+  }
+
+  static Future<GeminiSession?> loadSessionSnapshot(int authUser) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kSavedSessions);
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final map = jsonDecode(raw) as Map<String, dynamic>;
+      final item = map[authUser.toString()];
+      if (item is! Map) return null;
+      final at = item['at']?.toString() ?? '';
+      if (at.isEmpty) return null;
+      return GeminiSession(
+        authUser: (item['authUser'] as num?)?.toInt() ?? authUser,
+        email: item['email']?.toString() ?? 'Account u/$authUser',
+        at: at,
+        bl: item['bl']?.toString() ?? '',
+        fSid: item['fSid']?.toString() ?? '',
+        cookieHeader: item['cookieHeader']?.toString() ?? '',
+        fetchedAtMs: (item['fetchedAtMs'] as num?)?.toInt() ?? 0,
+        apiKeys: (item['apiKeys'] as List?)
+                ?.map((e) => e.toString())
+                .where((e) => e.isNotEmpty)
+                .toList() ??
+            const [],
+        serverToken: item['serverToken']?.toString() ?? '',
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> clearSessionSnapshot(int authUser) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kSavedSessions);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final map = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      if (map.remove(authUser.toString()) != null) {
+        await prefs.setString(_kSavedSessions, jsonEncode(map));
+      }
+    } catch (_) {}
   }
 
   static Future<void> saveManualCookie(String cookieHeader) async {

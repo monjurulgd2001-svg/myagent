@@ -32,7 +32,7 @@ void main() {
     // toggle and the gear menu sit beside the two actions.
     expect(find.text('Zedge Studio'), findsNothing);
     expect(find.text('Wallpaper Set Designer'), findsNothing);
-    expect(find.text('Version 2.5.59'), findsNothing);
+    expect(find.text('Version 2.5.60'), findsNothing);
     expect(find.byKey(const ValueKey('themeToggle')), findsOneWidget);
     expect(find.byTooltip('Account actions'), findsOneWidget);
     expect(tester.takeException(), isNull);

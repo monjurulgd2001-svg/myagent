@@ -741,35 +741,70 @@ window.__aisTouchUI = true;
   // sign-in itself worked, the verify fetch was what got
   // blocked.) Only the extracted fields leave the page — never
   // the whole HTML. Same field set as Dart's _parseSessionHtml.
-  function sessionPage(m) {
+  // v125: resilient sessionPage extraction — reads from both GeckoView's
+  // window.wrappedJSObject.WIZ_global_data and document innerHTML, and
+  // briefly polls on /app when a slow network hydrates WIZ data after
+  // document_end.
+  function readSessionFieldsNow() {
+    let wiz = null;
     try {
-      const html = document.documentElement ? document.documentElement.innerHTML : '';
-      const pick = (re) => { const x = re.exec(html); return x ? x[1] : ''; };
-      const at = pick(/"SNlM0e":"([^"]+)"/);
-      if (!at) {
+      const w = window.wrappedJSObject || window;
+      if (w && w.WIZ_global_data) wiz = w.WIZ_global_data;
+    } catch (_) {}
+    const html = document.documentElement ? document.documentElement.innerHTML : '';
+    const pick = (re) => { const x = re.exec(html); return x ? x[1] : ''; };
+    const wizStr = (k) => {
+      try {
+        const v = wiz && wiz[k];
+        return typeof v === 'string' ? v : '';
+      } catch (_) { return ''; }
+    };
+    const at = wizStr('SNlM0e') || pick(/"SNlM0e":"([^"]+)"/);
+    if (!at) return null;
+    const keys = [];
+    const kre = /AIza[0-9A-Za-z_\-]{35}/g;
+    let km;
+    while ((km = kre.exec(html)) !== null && keys.length < 20) {
+      if (keys.indexOf(km[0]) === -1) keys.push(km[0]);
+    }
+    let email = wizStr('oPEP7c') || pick(/"oPEP7c":"([^"]+@[^"]+)"/);
+    if (!email) {
+      const em = /([a-zA-Z0-9._%+\-]+@(?:gmail\.com|googlemail\.com))/i.exec(html);
+      email = em ? em[1].toLowerCase() : '';
+    }
+    return {
+      at: at,
+      bl: wizStr('cfb2h') || pick(/"cfb2h":"([^"]+)"/),
+      fSid: wizStr('FdrFJe') || pick(/"FdrFJe":"([^"]+)"/),
+      email: email,
+      serverToken: wizStr('PI9WOb') || pick(/"PI9WOb":"([^"]+)"/),
+      apiKeys: keys,
+      url: location.href,
+    };
+  }
+
+  async function sessionPage(m) {
+    try {
+      let data = readSessionFieldsNow();
+      if (!data && /\/app\b/.test(location.pathname || '')) {
+        for (let i = 0; i < 20 && !data; i++) {
+          await sleep(500);
+          data = readSessionFieldsNow();
+        }
+      }
+      if (!data) {
         try { port.postMessage({ type: 'sessionPage', id: m.id, error: 'no session token on this page' }); } catch (_) {}
         return;
       }
-      const keys = [];
-      const kre = /AIza[0-9A-Za-z_\-]{35}/g;
-      let km;
-      while ((km = kre.exec(html)) !== null && keys.length < 20) {
-        if (keys.indexOf(km[0]) === -1) keys.push(km[0]);
-      }
-      let email = pick(/"oPEP7c":"([^"]+@[^"]+)"/);
-      if (!email) {
-        const em = /([a-zA-Z0-9._%+\-]+@(?:gmail\.com|googlemail\.com))/i.exec(html);
-        email = em ? em[1].toLowerCase() : '';
-      }
       port.postMessage({
         type: 'sessionPage', id: m.id,
-        at: at,
-        bl: pick(/"cfb2h":"([^"]+)"/),
-        fSid: pick(/"FdrFJe":"([^"]+)"/),
-        email: email,
-        serverToken: pick(/"PI9WOb":"([^"]+)"/),
-        apiKeys: keys,
-        url: location.href,
+        at: data.at,
+        bl: data.bl,
+        fSid: data.fSid,
+        email: data.email,
+        serverToken: data.serverToken,
+        apiKeys: data.apiKeys,
+        url: data.url,
       });
     } catch (e) {
       try { port.postMessage({ type: 'sessionPage', id: m.id, error: String(e && e.message || e) }); } catch (_) {}

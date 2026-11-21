@@ -25,7 +25,7 @@ void main() {
     // v111: no title column — logo + four function icons only.
     expect(find.text('Zedge Studio'), findsNothing);
     expect(find.text('Wallpaper Set Designer'), findsNothing);
-    expect(find.text('Version 2.5.59'), findsNothing);
+    expect(find.text('Version 2.5.60'), findsNothing);
     expect(find.byTooltip('Import local set'), findsOneWidget);
     expect(find.byTooltip('Panel upload settings'), findsOneWidget);
     expect(find.byKey(const ValueKey('themeToggle')), findsOneWidget);
