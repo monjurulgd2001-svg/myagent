@@ -18,6 +18,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_platform_interface/video_player_platform_interface.dart';
 
 import 'fake_video_player.dart';
+import 'mp4_test_helpers.dart';
 
 import 'package:gemini_hd_studio/animation_engine.dart';
 import 'package:gemini_hd_studio/animation_models.dart';
@@ -65,6 +66,10 @@ void main() {
       expect(p, contains('1620x2880'));
       expect(p, contains('9:16'));
       expect(p, contains('60fps'));
+      // v155 — the frame rate is spelled out in full words too, so
+      // the backend payload (and the driver text) never relies on
+      // the bare "60fps" token alone.
+      expect(p, contains('60 frames per second'));
       expect(p, contains('seamless loop'));
       expect(p, contains('no text'));
       expect(p, contains('no logo'));
@@ -226,12 +231,46 @@ void main() {
       expect(backendText, contains('1620x2880'));
       expect(backendText, contains('seamless loop'));
       expect(backendText, contains('animation video'));
+      // v155 — the backend gets the SAME 60fps ask as the driver:
+      // the Task lead says it in full words and the spec suffix
+      // says it twice ("60fps" + "60 frames per second"). The
+      // backend prompt is one text, so it can never drift from
+      // the driver — this pins the backend side of that contract.
+      expect(backendText, contains('60fps'));
+      expect(backendText, contains('60 frames per second'));
       expect(engine.currentJobId, isNotEmpty);
       // A second start while busy is refused.
       expect(
           await engine.start(
               rawPrompt: 'another', modelId: 'neon', signedIn: true),
           isFalse);
+    });
+
+    test('v155: fpsRetry hands the backend the emphatic 60fps ask',
+        () async {
+      // The manual "abar 60fps-e banaw" retry: the backend prompt
+      // must carry the NOT-30fps line too — the same text the
+      // driver types, so the retry asks just as hard on either path.
+      var backendText = '';
+      final engine = engineWith(
+        runner: (taskText, {required onPhase, required deadline}) async {
+          backendText = taskText;
+          return hangingRunner(taskText,
+              onPhase: onPhase, deadline: deadline);
+        },
+      );
+      await engine.load();
+      expect(
+          await engine.start(
+              rawPrompt: 'neon blue liquid energy phone',
+              modelId: 'neon',
+              signedIn: true,
+              fpsRetry: true),
+          isTrue);
+      await Future.delayed(const Duration(milliseconds: 100));
+      expect(backendText, contains('NOT 30fps'));
+      expect(backendText, contains('60 frames per second'));
+      expect(backendText, contains('60fps'));
     });
 
     test('v140: watchdog fails a quiet job (no phase progress)', () async {
@@ -276,8 +315,11 @@ void main() {
     });
 
     test('progress -> ready (https URL) saves the MP4', () async {
+      // v154 — the saved bytes must be a real MP4 now: _finishBytes
+      // rejects anything without an ftyp box.
+      final mp4 = minimalMp4(fps: 30, durationSec: 6);
       final client = MockClient((req) async =>
-          http.Response.bytes([0, 1, 2, 3, 4, 5], 200));
+          http.Response.bytes(mp4, 200));
       final engine = engineWith(client: client);
       await engine.load();
       await engine.start(
@@ -317,7 +359,7 @@ void main() {
       expect(v.title, contains('neon blue phone'));
       expect(v.durationSec, 6);
       expect(await File(v.localPath).exists(), isTrue);
-      expect(await File(v.localPath).length(), 6);
+      expect(await File(v.localPath).length(), mp4.length);
       // The video survives a reload from SharedPreferences.
       final again = engineWith();
       await again.load();
@@ -331,7 +373,9 @@ void main() {
       await engine.start(
           rawPrompt: 'molten gold phone', modelId: 'neon', signedIn: true);
       final jobId = engine.currentJobId;
-      final b64 = base64Encode([9, 8, 7]);
+      // v154 — real MP4 bytes: _finishBytes rejects non-MP4 now.
+      final mp4 = minimalMp4(fps: 30, durationSec: 6);
+      final b64 = base64Encode(mp4);
       expect(
           await engine.handleRequest(_videoReq('video_ready', {
             'jobId': jobId,
@@ -340,7 +384,8 @@ void main() {
           })),
           isTrue);
       expect(engine.videos.length, 1);
-      expect(await File(engine.videos.first.localPath).length(), 3);
+      expect(await File(engine.videos.first.localPath).length(),
+          mp4.length);
       await engine.deleteVideo(engine.videos.first);
       expect(engine.videos, isEmpty);
       // Error: the step + message reach the status line.
@@ -402,8 +447,9 @@ void main() {
     });
 
     test('buildVideosZip holds the MP4 + metadata.json', () async {
+      // v154 — real MP4 bytes: _finishBytes rejects non-MP4 now.
       final client = MockClient((req) async =>
-          http.Response.bytes([1, 2, 3], 200));
+          http.Response.bytes(minimalMp4(fps: 30, durationSec: 6), 200));
       final engine = engineWith(client: client);
       await engine.load();
       await engine.start(
@@ -941,7 +987,7 @@ void main() {
       await engine.setDurationSec(8);
       await engine.start(
           rawPrompt: 'a phone charging', modelId: 'neon', signedIn: true);
-      final b64 = base64Encode([9, 8, 7, 6]);
+      final b64 = base64Encode(minimalMp4(fps: 30, durationSec: 6));
       expect(
           await engine.handleRequest(_videoReq('video_ready', {
             'jobId': engine.currentJobId,
@@ -988,7 +1034,7 @@ void main() {
     /// metadata + a panel queue entry (the file itself need not
     /// exist — the card never reads it).
     Map<String, Object> prefsWithVideo(
-        {bool withMeta = false, String? localPath}) {
+        {bool withMeta = false, String? localPath, int fps = 60}) {
       final video = <String, Object>{
         'id': 'v1',
         'title': 'Neon blue phone',
@@ -998,7 +1044,7 @@ void main() {
         'fileName': 'anim_v1.mp4',
         'width': 1620,
         'height': 2880,
-        'fps': 60,
+        'fps': fps,
         'durationSec': 6,
         'sizeBytes': 4,
         'createdAt': '2026-11-19T00:00:00.000Z',
@@ -1218,6 +1264,38 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
+    testWidgets('v154 phone: 30fps card offers Retry 60fps and asks first',
+        (tester) async {
+      // localPath does not exist on purpose: the load() re-probe
+      // must not rewrite the stored 30fps (another test file
+      // writes a 30fps /tmp/anim_v1.mp4 while this suite runs).
+      await pumpPhone(tester, prefsWithVideo(
+          fps: 30, localPath: '/tmp/anim_v154_nope.mp4'));
+      expect(find.textContaining('60fps deyni'), findsOneWidget);
+      await tester.ensureVisible(
+          find.byKey(const ValueKey('animRetry60-v1')));
+      await tester.pump(const Duration(milliseconds: 200));
+      await tester.tap(find.byKey(const ValueKey('animRetry60-v1')));
+      await tester.pump();
+      // The tap asks first (a regeneration spends video quota) —
+      // it never starts one on its own.
+      expect(find.text('60fps-e abar banabe?'), findsOneWidget);
+      expect(find.textContaining('Abar banale prompt-e'), findsOneWidget);
+      await tester.tap(find.text('Na, thak'));
+      await tester.pump();
+      expect(find.text('60fps-e abar banabe?'), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('v154 phone: 60fps card offers no Retry 60fps',
+        (tester) async {
+      await pumpPhone(tester, prefsWithVideo(
+          localPath: '/tmp/anim_v154_nope.mp4'));
+      expect(find.byKey(const ValueKey('animRetry60-v1')), findsNothing);
+      expect(find.textContaining('60fps deyni'), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
     testWidgets('v140 phone: error log shows the last backend failure',
         (tester) async {
       await pumpPhone(tester, {
@@ -1347,12 +1425,14 @@ void main() {
 
     test('backend success: MP4 saved, browser never opens', () async {
       var runnerCalls = 0;
+      // v154 — real MP4 bytes: _finishBytes rejects non-MP4 now.
+      final mp4 = minimalMp4(fps: 30, durationSec: 10);
       final engine = engineWith(
         runner: (taskText, {required onPhase, required deadline}) async {
           runnerCalls++;
           expect(taskText, contains('1620x2880'));
           onPhase('creating', 'Backend-e video banacche…');
-          return Uint8List.fromList([1, 2, 3, 4, 5]);
+          return mp4;
         },
       );
       await engine.load();
@@ -1366,7 +1446,8 @@ void main() {
       expect(runnerCalls, 1);
       expect(engine.phase, AnimationPhase.ready);
       expect(engine.videos.length, 1);
-      expect(await File(engine.videos.first.localPath).length(), 5);
+      expect(await File(engine.videos.first.localPath).length(),
+          mp4.length);
       expect(engine.videos.first.width, 1620);
       expect(engine.videos.first.height, 2880);
     });

@@ -16,6 +16,8 @@ import 'package:gemini_hd_studio/gecko_browser.dart';
 import 'package:gemini_hd_studio/gemini_api.dart';
 import 'package:gemini_hd_studio/task_backend.dart';
 
+import 'mp4_test_helpers.dart';
+
 GeckoBrowserRequest _videoReq(String action, Map<String, dynamic> data) =>
     GeckoBrowserRequest(action, const [], 'https://gemini.google.com/app',
         'Gemini',
@@ -115,7 +117,8 @@ void main() {
       expect(engine.currentJobId, isNotEmpty);
       expect(engine.phase, isNot(AnimationPhase.error));
       // The driver finishing the video finishes the job.
-      final b64 = base64Encode([9, 8, 7]);
+      // v154 — real MP4 bytes: _finishBytes rejects non-MP4 now.
+      final b64 = base64Encode(minimalMp4(fps: 30, durationSec: 10));
       expect(
           await engine.handleRequest(_videoReq('video_ready', {
             'jobId': engine.currentJobId,
@@ -129,10 +132,12 @@ void main() {
 
     test('backend success never calls the driver', () async {
       var driverCalls = 0;
+      // v154 — real MP4 bytes: _finishBytes rejects non-MP4 now,
+      // so junk bytes would fail the job and fire the driver.
       final engine = engineWith(
         runner: (taskText,
                 {required onPhase, required deadline}) async =>
-            Uint8List.fromList([1, 2, 3]),
+            minimalMp4(fps: 30, durationSec: 10),
         driver: ({required prompt, required modelId, required jobId}) async {
           driverCalls++;
           return true;

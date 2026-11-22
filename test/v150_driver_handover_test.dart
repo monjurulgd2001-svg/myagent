@@ -17,6 +17,8 @@ import 'package:gemini_hd_studio/animation_models.dart';
 import 'package:gemini_hd_studio/gecko_browser.dart';
 import 'package:gemini_hd_studio/task_backend.dart';
 
+import 'mp4_test_helpers.dart';
+
 GeckoBrowserRequest _videoReq(String action, Map<String, dynamic> data) =>
     GeckoBrowserRequest(action, const [], 'https://gemini.google.com/app',
         'Gemini',
@@ -184,7 +186,8 @@ void main() {
           engine.errorLog.any((l) => l.contains('driver_handover')),
           isFalse);
       // The job still finishes normally when the driver delivers.
-      final b64 = base64Encode([9, 8, 7]);
+      // v154 — real MP4 bytes: _finishBytes rejects non-MP4 now.
+      final b64 = base64Encode(minimalMp4(fps: 30, durationSec: 10));
       expect(
           await engine.handleRequest(_videoReq('video_ready', {
             'jobId': engine.currentJobId,

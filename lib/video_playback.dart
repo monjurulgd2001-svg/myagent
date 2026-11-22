@@ -13,10 +13,13 @@
 //
 // Returns false instead of throwing when nothing could open it,
 // so the caller can say so instead of crashing.
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 
 import 'external_browser.dart';
 import 'gecko_browser.dart';
+import 'mp4_info.dart';
 
 enum VideoPlaybackTarget { gecko, external }
 
@@ -40,4 +43,36 @@ Future<bool> openVideoFile(String path,
   } catch (_) {
     return false;
   }
+}
+
+/// v154 — preview source resolution: the in-frame player only ever
+/// gets a LOCAL file that exists and starts with an MP4 ftyp box.
+/// Returns a Banglish problem message (naming the file) when the
+/// file is missing or is not an MP4, else null. The caller shows
+/// the message instead of letting ExoPlayer fail with a raw
+/// PlatformException ("Source error", live 2026-11-22) — and a
+/// remote URL needing auth is never passed to the player at all.
+///
+/// Synchronous on purpose: a 64-byte header read is sub-ms, and
+/// async file IO never completes inside flutter_test's fake-async
+/// zone — the dialog's _initVideo would hang on the check there.
+String? videoPreviewProblem(String path) {
+  final file = File(path);
+  if (!file.existsSync()) {
+    return 'Video file-ti pawa jayni: $path — abar Generate koro.';
+  }
+  try {
+    final raf = file.openSync();
+    try {
+      final head = raf.readSync(64);
+      if (!isMp4Bytes(Uint8List.fromList(head))) {
+        return 'Video file-ti kharap (MP4 na): $path — abar Generate koro.';
+      }
+    } finally {
+      raf.closeSync();
+    }
+  } catch (_) {
+    return 'Video file-ti khola jayni: $path — abar Generate koro.';
+  }
+  return null;
 }

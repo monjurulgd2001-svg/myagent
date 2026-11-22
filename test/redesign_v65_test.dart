@@ -19,18 +19,18 @@ void main() {
     await tester.pumpWidget(const GeminiHdStudioApp());
     await tester.pump(const Duration(milliseconds: 300));
     // No version text on the Studio screen itself.
-    expect(find.text('Version 2.5.88'), findsNothing);
+    expect(find.text('Version 2.5.89'), findsNothing);
     await tester.tap(find.text('Login'));
     await tester.pump(const Duration(milliseconds: 300));
     // The route transition needs a second frame before the new
     // screen's content is in the tree.
     await tester.pump(const Duration(milliseconds: 300));
-    expect(find.text('App v2.5.88'), findsOneWidget);
+    expect(find.text('App v2.5.90'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
   test('v65 app version matches the displayed label', () {
     final pubspec = File('pubspec.yaml').readAsStringSync();
-    expect(pubspec.contains('version: 2.5.88+153'), isTrue);
+    expect(pubspec.contains('version: 2.5.90+155'), isTrue);
   });
 }

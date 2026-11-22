@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
+import 'package:gemini_hd_studio/animation_models.dart';
 import 'package:gemini_hd_studio/models.dart';
 import 'package:gemini_hd_studio/task_backend.dart';
 
@@ -81,6 +82,35 @@ void main() {
       expect(outer[0].value, 1); // f1: 1
       final inner = pbDecode(outer[1].value as List<int>);
       expect(utf8.decode(inner.single.value as List<int>), text);
+    });
+
+    test('v155: backend payload carries the 60fps ask verbatim', () {
+      // The exact prompt text AnimationEngine hands the backend
+      // (buildAnimationPrompt output) must reach the ofs=1 payload
+      // untouched: the suffix asks for 60fps in full words and as
+      // a token, and an fpsRetry adds the emphatic NOT-30fps line.
+      // The Task lead's "60 frames per second" is pinned by the
+      // engine test in animation_test.dart; this pins the wire.
+      String taskTextOf(List<int> bytes) {
+        final root = pbDecode(bytes);
+        final f2 = root.first.value as List<int>;
+        final outer = pbDecode(f2);
+        final inner = pbDecode(outer[1].value as List<int>);
+        return utf8.decode(inner.single.value as List<int>);
+      }
+
+      final built = buildAnimationPrompt('neon blue liquid energy phone');
+      final decoded = taskTextOf(buildTaskMessage(built));
+      expect(decoded, built);
+      expect(decoded, contains('60fps'));
+      expect(decoded, contains('60 frames per second'));
+
+      final retry = buildAnimationPrompt('neon blue liquid energy phone',
+          fpsRetry: true);
+      final decodedRetry = taskTextOf(buildTaskMessage(retry));
+      expect(decodedRetry, retry);
+      expect(decodedRetry, contains('NOT 30fps'));
+      expect(decodedRetry, contains('60 frames per second'));
     });
 
     test('buildSetupMessage: client id + uuid twice, no blob/hash', () {

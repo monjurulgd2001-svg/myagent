@@ -439,6 +439,15 @@ class _HomeScreenState extends State<HomeScreen> {
       // v151 — the backend never succeeded live (no f4/f5 token): go
       // straight to the headless driver instead of waiting on it.
       backendFirst: false,
+      // v154 — the video download sends the signed-in session's
+      // cookies, so an auth-gated Gemini download link returns the
+      // real MP4 instead of an HTML sign-in page served with HTTP
+      // 200 (live 2026-11-22: that HTML was saved as `.mp4` and
+      // the player failed with ExoPlayer "Source error").
+      cookieHeaderProvider: () async {
+        final s = await GeminiApi().getSession();
+        return s.cookieHeader;
+      },
     );
     _animEngine.load();
     _animBrowserSub =
@@ -1536,7 +1545,8 @@ class _HomeScreenState extends State<HomeScreen> {
   // Charging Animation (v86): the section drives the user's own
   // signed-in Gemini session — Neon default, Task mode — through
   // the in-page video driver; the engine owns the job.
-  Future<void> _generateAnimation(String prompt, String modelId) async {
+  Future<void> _generateAnimation(String prompt, String modelId,
+      {bool fpsRetry = false}) async {
     // v153 — video generation is no longer Android-only: Android
     // drives it through the headless Gecko driver, Windows through
     // the headless Chrome driver (WindowsVideoDriver, same job +
@@ -1550,7 +1560,17 @@ class _HomeScreenState extends State<HomeScreen> {
       rawPrompt: prompt,
       modelId: modelId,
       signedIn: _isSignedIn,
+      fpsRetry: fpsRetry,
     );
+  }
+
+  // v154 — manual "60fps-e abar banaw" retry from the video card:
+  // same prompt + model, stronger 60fps wording (see
+  // buildAnimationPrompt fpsRetry). The card asks first — a
+  // regeneration spends video quota.
+  Future<void> _retryAnimation60Fps(AnimationVideo video) async {
+    await _generateAnimation(video.prompt, video.modelId,
+        fpsRetry: true);
   }
 
   Future<void> _playAnimation(AnimationVideo video) async {
@@ -1921,6 +1941,7 @@ class _HomeScreenState extends State<HomeScreen> {
         onMetadata: _generateAnimationMetadata,
         onUploadToPanel: _uploadAnimationToPanel,
         onUploadAllToPanel: _uploadAllAnimationsToPanel,
+        onRetry60Fps: _retryAnimation60Fps,
       );
     }
     if (wide) {
@@ -2111,7 +2132,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               PopupMenuItem(
                 enabled: false,
-                child: Text('Version 2.5.88',
+                child: Text('Version 2.5.90',
                     style: TextStyle(
                         fontSize: 12, color: cs.onSurfaceVariant)),
               ),

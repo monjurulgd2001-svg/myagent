@@ -6,6 +6,8 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
+import '../video_playback.dart';
+
 /// Realistic phone mockup preview: shows a generated wallpaper as it
 /// would look on a device — plain wallpaper, lock screen, home screen,
 /// an in-app (chat) view and an incoming call screen.
@@ -280,6 +282,16 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
   Future<void> _initVideo() async {
     final path = widget.videoPath;
     if (path == null) return;
+    // v154 — never hand the player a missing or non-MP4 file: live
+    // 2026-11-22 it failed with a raw "Source error" instead of a
+    // message. The check names the file; the "Open in browser"
+    // fallback stays as it is. (Sync check — see videoPreviewProblem.)
+    final problem = videoPreviewProblem(path);
+    if (problem != null) {
+      if (!mounted) return;
+      setState(() => _videoError = problem);
+      return;
+    }
     final ctl = VideoPlayerController.file(File(path));
     _videoCtl = ctl;
     try {

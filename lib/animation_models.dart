@@ -75,9 +75,13 @@ AnimationModel animationModelById(String id) => kAnimationModels.firstWhere(
 /// 60fps creative thought, realistic no logo"). The loop phrase
 /// is NOT in here — the seamless switch owns it (v88), so turning
 /// the switch off really removes it.
+/// v154 — the frame rate is spelled out in words too ("60 frames
+/// per second"): live 2026-11-22 the clip came back 30fps although
+/// the prompt said "60fps", so the spec now says it twice, in
+/// full, instead of relying on the bare "60fps" token.
 const String kAnimationSpecSuffix =
-    ', 1620x2880 vertical 9:16, 60fps, realistic, no text, '
-    'no logo, no watermark';
+    ', 1620x2880 vertical 9:16, 60fps, 60 frames per second, '
+    'realistic, no text, no logo, no watermark';
 
 /// v104 — originality + motion clause, appended to EVERY animation
 /// prompt (not only the no-size branch). Same language the Prompt
@@ -255,11 +259,16 @@ List<String> checkAnimationPromptSafety(String prompt) {
 /// prompt (the Generate button stays disabled then). A prompt
 /// that already carries the size keeps it (never written twice);
 /// a prompt that already asks for a loop never gets it twice.
+/// v154 — [fpsRetry] is the manual "abar 60fps-e banaw" retry: the
+/// previous clip came back under 60fps, so the prompt says it once
+/// more, emphatically (NOT 30fps). A retry is always the user's
+/// tap, never automatic — a regeneration spends video quota.
 String buildAnimationPrompt(
   String raw, {
   String styleId = kDefaultAnimationMoodId,
   int durationSec = kDefaultAnimationDurationSec,
   bool seamless = kDefaultAnimationSeamless,
+  bool fpsRetry = false,
 }) {
   final p = raw.trim();
   if (p.isEmpty) return '';
@@ -278,11 +287,22 @@ String buildAnimationPrompt(
     out.write(kAnimationOriginalityClause);
   }
   if (p.contains('1620') || p.contains('9:16')) {
+    // v154 — the size branch skipped the spec suffix, so it also
+    // skipped the frame rate: a prompt that already carries the
+    // size still gets the 60fps ask in full words.
+    if (!lower.contains('60fps') &&
+        !lower.contains('frames per second')) {
+      out.write(', 60fps, 60 frames per second');
+    }
     if (!lower.contains('no text')) {
       out.write(', no text, no logo, no watermark');
     }
   } else {
     out.write(kAnimationSpecSuffix);
+  }
+  if (fpsRetry) {
+    out.write(', IMPORTANT: render this at 60 frames per second '
+        '(60fps) — smooth high-frame-rate motion, NOT 30fps');
   }
   return out.toString();
 }
@@ -311,6 +331,11 @@ class AnimationVideo {
   final String fileName;
   final int width;
   final int height;
+  // v154 — the MEASURED frame rate of the saved file (MP4 probe in
+  // _finishBytes / load). The 60 default is only the fallback for a
+  // file whose rate could not be read — the card never shows the
+  // asked 60fps as if it were measured (live 2026-11-22: the clip
+  // was 30fps while the card said 60fps).
   final int fps;
   final double durationSec;
   final int sizeBytes;
@@ -340,6 +365,12 @@ class AnimationVideo {
   AnimationVideo copyWith({
     SetMetadata? metadata,
     Map<String, dynamic>? uploadedToPanel,
+    // v154 — the MP4 probe corrects these after the file lands
+    // (real fps / duration / size instead of the requested spec).
+    int? fps,
+    double? durationSec,
+    int? width,
+    int? height,
   }) =>
       AnimationVideo(
         id: id,
@@ -350,10 +381,10 @@ class AnimationVideo {
         requestedDurationSec: requestedDurationSec,
         localPath: localPath,
         fileName: fileName,
-        width: width,
-        height: height,
-        fps: fps,
-        durationSec: durationSec,
+        width: width ?? this.width,
+        height: height ?? this.height,
+        fps: fps ?? this.fps,
+        durationSec: durationSec ?? this.durationSec,
         sizeBytes: sizeBytes,
         createdAt: createdAt,
         metadata: metadata ?? this.metadata,
@@ -364,16 +395,56 @@ class AnimationVideo {
 
   bool get isUploaded => uploadedToPanel != null;
 
+  /// v154 — the settings the video was asked for (style + asked
+  /// length): stored since v88 but never shown on the card, so a
+  /// finished video looked like a bare truncated prompt. The card
+  /// shows this line next to the real spec line.
+  String get settingsLine =>
+      '${animationMoodById(styleId).label} · ${requestedDurationSec}s asked';
+
+  /// v154 — honest fps note: [fps] is the MEASURED frame rate now
+  /// (see Mp4 probe), so a clip that came back under 60fps says
+  /// so on the card instead of the card claiming the asked 60fps.
+  /// Empty when the clip really is 60fps (or the rate is unknown).
+  String get fpsNote =>
+      fps > 0 && fps < 60 ? 'Gemini 60fps deyni — $fps fps' : '';
+
   String get uploadedAccount =>
       uploadedToPanel?['accountName']?.toString() ?? '';
 
+  /// v154 — the length that was actually produced (the file's real
+  /// duration when known, else the length that was asked for, so a
+  /// card never shows no duration at all — live 2026-11-22 the
+  /// `<video>` duration came back 0 and the card hid the 10s).
+  double get displayDurationSec =>
+      durationSec > 0 ? durationSec : requestedDurationSec.toDouble();
+
   String get specLine {
-    final dur = durationSec > 0 ? '${durationSec.toStringAsFixed(0)}s · ' : '';
+    // v154 — duration = what was produced (else what was asked);
+    // fps = the file's REAL fps, left out entirely when it was
+    // never measured (fps 0) instead of claiming a hardcoded 60 —
+    // live 2026-11-22 the file was 30fps while the card said 60fps.
+    final dur = displayDurationSec > 0
+        ? '${displayDurationSec.toStringAsFixed(0)}s · '
+        : '';
+    final fpsPart = fps > 0 ? ' · ${fps}fps' : '';
     final size = sizeBytes > 0
         ? ' · ${(sizeBytes / 1048576).toStringAsFixed(1)} MB'
         : '';
-    return '$dur${width}x$height · ${fps}fps$size';
+    return '$dur${width}x$height$fpsPart$size';
   }
+
+  /// v154 — the gallery card's second line: spec (duration · size ·
+  /// real fps) + STYLE + model. The style was stored (styleId) but
+  /// never shown, so the card read like a generic file — live
+  /// 2026-11-22 the user said "মেটাডেটাও কিন্তু নেয় নি". The title
+  /// above it is the prompt itself (AnimationEngine._titleFor,
+  /// capped at 120 chars on a word boundary), so title + style +
+  /// duration are now all on the card, taken from the job itself —
+  /// nothing invented.
+  String get cardLine =>
+      '$specLine · ${animationMoodById(styleId).label} · '
+      '${animationModelById(modelId).label}';
 
   Map<String, dynamic> toJson() => {
         'id': id,

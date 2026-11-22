@@ -1,7 +1,7 @@
 name: gemini_hd_studio
 description: "Zedge Studio — Wallpaper Set Designer, AI Metadata & Panel Uploader (Android + Windows). Flutter port of the Gemini HD Studio v2.5.3 Chrome extension."
 publish_to: 'none'
-version: 2.5.88+153
+version: 2.5.90+155
 
 environment:
   sdk: ^3.5.4

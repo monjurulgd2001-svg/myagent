@@ -33,6 +33,10 @@ class AnimationSection extends StatefulWidget {
     required this.onMetadata,
     required this.onUploadToPanel,
     required this.onUploadAllToPanel,
+    // v154 — manual "60fps-e abar banaw" retry (a regeneration
+    // spends quota, so it is the user's tap, never automatic).
+    // Null = no retry offered (e.g. tests / old call sites).
+    this.onRetry60Fps,
   });
 
   final AnimationEngine engine;
@@ -45,6 +49,7 @@ class AnimationSection extends StatefulWidget {
   final Future<void> Function(AnimationVideo video) onMetadata;
   final Future<void> Function(AnimationVideo video) onUploadToPanel;
   final Future<void> Function() onUploadAllToPanel;
+  final Future<void> Function(AnimationVideo video)? onRetry60Fps;
 
   @override
   State<AnimationSection> createState() => _AnimationSectionState();
@@ -993,14 +998,13 @@ class _AnimationSectionState extends State<AnimationSection> {
               ),
               const SizedBox(height: 4),
               // v140 — the tile's spec line matches the list card:
-              // spec + model, plus the queued account when uploaded
-              // (the v87 test reads 'Queued on <account>' off it).
+              // spec + style + model, plus the queued account when
+              // uploaded (the v87 test reads 'Queued on <account>'
+              // off it). v154 — the style was never shown before.
               Text.rich(
                 TextSpan(
                   children: [
-                    TextSpan(
-                        text:
-                            '${v.specLine} · ${animationModelById(v.modelId).label}'),
+                    TextSpan(text: v.cardLine),
                     if (v.isUploaded)
                       TextSpan(
                         text: ' · Queued on ${v.uploadedAccount}',
@@ -1012,6 +1016,20 @@ class _AnimationSectionState extends State<AnimationSection> {
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(fontSize: 10, color: _cs.onSurfaceVariant),
               ),
+              // v154 — honest fps note: the clip came back under
+              // 60fps, say so on the card (the cardLine already
+              // shows the real fps number).
+              if (v.fpsNote.isNotEmpty) ...[
+                const SizedBox(height: 2),
+                Text(
+                  v.fpsNote,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                      fontSize: 10, color: Color(0xFFFFB020)),
+                ),
+              ],
             ],
           ),
         ),
@@ -1141,6 +1159,7 @@ class _AnimationSectionState extends State<AnimationSection> {
                   children: [
                     _animIconAction(
                       key: ValueKey('animMeta-${v.id}'),
+                      size: 32,
                       icon: v.hasMetadata
                           ? Icons.auto_awesome
                           : Icons.auto_awesome_outlined,
@@ -1154,6 +1173,7 @@ class _AnimationSectionState extends State<AnimationSection> {
                     ),
                     _animIconAction(
                       key: ValueKey('animUpload-${v.id}'),
+                      size: 32,
                       icon: v.isUploaded
                           ? Icons.cloud_done_outlined
                           : Icons.cloud_upload_outlined,
@@ -1165,6 +1185,19 @@ class _AnimationSectionState extends State<AnimationSection> {
                           ? null
                           : () => widget.onUploadToPanel(v),
                     ),
+                    // v154 — retry at 60fps, only for a clip whose
+                    // measured fps came back under 60 (quota: the
+                    // tap asks first — see _confirmRetry60Fps).
+                    if (_needsRetry60Fps(v))
+                      _animIconAction(
+                        key: ValueKey('animRetry60-${v.id}'),
+                        size: 32,
+                        icon: Icons.sixty_fps,
+                        tooltip: 'Retry 60fps',
+                        color: const Color(0xFFFFB020),
+                        onPressed:
+                            busy ? null : () => _confirmRetry60Fps(v),
+                      ),
                   ],
                 ),
               ],
@@ -1173,6 +1206,39 @@ class _AnimationSectionState extends State<AnimationSection> {
         );
       },
     );
+  }
+
+  /// v154 — "60fps-e abar banaw": only for a clip whose MEASURED
+  /// fps came back under 60. A regeneration spends video quota, so
+  /// the tap asks first instead of silently spending it.
+  bool get _canRetry60Fps => widget.onRetry60Fps != null;
+
+  bool _needsRetry60Fps(AnimationVideo v) =>
+      _canRetry60Fps && v.fps > 0 && v.fps < 60;
+
+  Future<void> _confirmRetry60Fps(AnimationVideo v) async {
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('60fps-e abar banabe?'),
+        content: Text(
+          'Ei video-ta ${v.fps}fps-e esheche. Abar banale prompt-e '
+          '60fps jore kore bola hobe — kintu Gemini 60fps dibei, '
+          'eta guarantee na. Eta ekta notun generation, video quota khabe.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Na, thak'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Banaw'),
+          ),
+        ],
+      ),
+    );
+    if (go == true) await widget.onRetry60Fps!(v);
   }
 
   /// v87 — Metadata tap: when the video already has AI metadata,
@@ -1315,9 +1381,7 @@ class _AnimationSectionState extends State<AnimationSection> {
                   Text.rich(
                     TextSpan(
                       children: [
-                        TextSpan(
-                            text:
-                                '${v.specLine} · ${animationModelById(v.modelId).label}'),
+                        TextSpan(text: v.cardLine),
                         if (v.isUploaded)
                           TextSpan(
                             text: ' · Queued on ${v.uploadedAccount}',
@@ -1331,6 +1395,17 @@ class _AnimationSectionState extends State<AnimationSection> {
                         fontSize: 12,
                         color: _cs.onSurface.withValues(alpha: 0.54)),
                   ),
+                  // v154 — honest fps note under the spec line.
+                  if (v.fpsNote.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      v.fpsNote,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 11, color: Color(0xFFFFB020)),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1356,6 +1431,15 @@ class _AnimationSectionState extends State<AnimationSection> {
                   : _cs.onSurface.withValues(alpha: 0.7),
               onPressed: busy ? null : () => widget.onUploadToPanel(v),
             ),
+            // v154 — retry at 60fps (see _confirmRetry60Fps).
+            if (_needsRetry60Fps(v))
+              _animIconAction(
+                key: ValueKey('animRetry60-${v.id}'),
+                icon: Icons.sixty_fps,
+                tooltip: 'Retry 60fps',
+                color: const Color(0xFFFFB020),
+                onPressed: busy ? null : () => _confirmRetry60Fps(v),
+              ),
             _animIconAction(
               key: ValueKey('animDelete-${v.id}'),
               icon: Icons.delete_outline,
@@ -1372,23 +1456,28 @@ class _AnimationSectionState extends State<AnimationSection> {
   /// One compact 36px icon action for the video card (v120):
   /// IconButton's 48px minimum would not fit three of them beside
   /// the title, so the tap target is an explicit 36px box.
+  /// v154 — [size] is the tap box (default 36). The grid row passes
+  /// 32: at 3 columns on a 360dp phone a cell is ~105px wide and
+  /// three 36px actions (108px) overflow it by ~3px — live layout
+  /// bug the v154 retry button exposed (it is the 3rd action).
   Widget _animIconAction({
     required Key key,
     required IconData icon,
     required String tooltip,
     required Color color,
     required VoidCallback? onPressed,
+    double size = 36,
   }) {
     return SizedBox(
-      width: 36,
-      height: 36,
+      width: size,
+      height: size,
       child: IconButton(
         key: key,
         icon: Icon(icon, size: 18, color: color),
         tooltip: tooltip,
         onPressed: onPressed,
         padding: EdgeInsets.zero,
-        constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+        constraints: BoxConstraints.tightFor(width: size, height: size),
       ),
     );
   }

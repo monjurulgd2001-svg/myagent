@@ -43,6 +43,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'animation_models.dart';
 import 'foreground_keep_alive.dart';
+import 'mp4_info.dart';
 import 'gecko_browser.dart';
 import 'gecko_signin.dart';
 import 'session_store.dart';
@@ -141,6 +142,17 @@ typedef VideoDriverRunner = Future<bool> Function({
 /// flag is freed for the next job.
 typedef VideoCancelRunner = Future<void> Function(String jobId);
 
+/// v154 — injected by the app: the signed-in session's Cookie header
+/// for the video download (the driver URL branch). The download link
+/// is auth-gated: without cookies Gemini answers HTTP 200 with an
+/// HTML sign-in page, which used to be saved as `.mp4` and marked
+/// "Animation ready ✓" — then the player failed with ExoPlayer
+/// "Source error" (live 2026-11-22). The app wires it to
+/// `GeminiApi().getSession()`; null in tests (plain GET, as before).
+/// A provider failure is swallowed — the download still tries
+/// without cookies rather than failing on a session hiccup.
+typedef VideoCookieHeaderProvider = Future<String> Function();
+
 class AnimationEngine {
   AnimationEngine({
     http.Client? httpClient,
@@ -174,6 +186,7 @@ class AnimationEngine {
     TaskBackendRunner? taskBackendRunner,
     VideoDriverRunner? videoDriverRunner,
     VideoCancelRunner? videoCancelRunner,
+    VideoCookieHeaderProvider? cookieHeaderProvider,
     // v151 — false = driver FIRST: the Task backend never succeeded
     // live (no f4/f5 token), so waiting for it (up to the 10-min quiet
     // window) before the driver only delays the job — and a backend
@@ -188,10 +201,12 @@ class AnimationEngine {
         _promptPolisher = promptPolisher,
         _taskBackendRunner = taskBackendRunner,
         _videoDriverRunner = videoDriverRunner,
-        _videoCancelRunner = videoCancelRunner;
+        _videoCancelRunner = videoCancelRunner,
+        _cookieHeaderProvider = cookieHeaderProvider;
 
   final bool backendFirst;
   final VideoCancelRunner? _videoCancelRunner;
+  final VideoCookieHeaderProvider? _cookieHeaderProvider;
   // v151 — jobs the user cancelled: late events for them are ignored.
   final Set<String> _cancelledJobIds = {};
   final http.Client? _httpClient;
@@ -310,6 +325,34 @@ class AnimationEngine {
         videos = [];
       }
     }
+    // v154 — videos saved by v153 or earlier carry the ASSUMED
+    // 60fps (the field defaulted to 60 and nothing ever measured
+    // it): re-probe the real file once and fix fps / duration, so
+    // the old card stops claiming 60fps it never had — no
+    // regeneration needed, the file itself is the truth. Files are
+    // capped at 25 MB by the driver, so a bounded read is cheap;
+    // a missing or unreadable file keeps its stored values.
+    var fixed = false;
+    for (var i = 0; i < videos.length; i++) {
+      final v = videos[i];
+      try {
+        if (v.localPath.isEmpty) continue;
+        final f = File(v.localPath);
+        if (!await f.exists()) continue;
+        final len = await f.length();
+        if (len <= 0 || len > 32 * 1024 * 1024) continue;
+        final info = readMp4Info(await f.readAsBytes());
+        if (info == null) continue;
+        final fps = info.fps > 0 ? info.fps : v.fps;
+        final dur =
+            info.durationSec > 0 ? info.durationSec : v.durationSec;
+        if (fps != v.fps || dur != v.durationSec) {
+          videos[i] = v.copyWith(fps: fps, durationSec: dur);
+          fixed = true;
+        }
+      } catch (_) {}
+    }
+    if (fixed) await _save();
     errorLog = prefs.getStringList(kAnimationErrorLogKey) ?? [];
     _emit();
   }
@@ -442,10 +485,15 @@ class AnimationEngine {
   /// Starts one animation. Returns false when it cannot start
   /// (blank prompt, already busy, not signed in, copyright-risk
   /// prompt) — [status] says why.
+  /// v154 — [fpsRetry] is the manual "60fps-e abar banaw" retry: the
+  /// previous clip came back under 60fps, so the prompt asks for
+  /// 60fps emphatically (see buildAnimationPrompt). Always the
+  /// user's tap, never automatic — a regeneration spends quota.
   Future<bool> start({
     required String rawPrompt,
     required String modelId,
     required bool signedIn,
+    bool fpsRetry = false,
   }) async {
     // v88 — copyright guard FIRST: a prompt naming a brand,
     // character or celebrity can get his Zedge account struck,
@@ -462,6 +510,7 @@ class AnimationEngine {
       styleId: selectedStyleId,
       durationSec: selectedDurationSec,
       seamless: seamlessMode,
+      fpsRetry: fpsRetry,
     );
     // v101 — the Task agent must hear "video" FIRST and
     // unambiguously: live 2026-11-20 it answered a video request
@@ -472,7 +521,13 @@ class AnimationEngine {
     final taskPrompt = taskMode
         ? 'Create a video now — an animation video, an animated MP4 '
             'file, not an image and not a keyframe. Video size '
-            '1620x2880, 9:16 vertical. '
+            '1620x2880, 9:16 vertical, 60 frames per second. '
+            // v154 — "60 frames per second" spelled out in the lead
+            // (the spec suffix already said "60fps" once, buried at
+            // the end): live 2026-11-22 the file came back 30fps.
+            // Gemini's encoder decides the output — the prompt is
+            // the only lever, so ask in both places and measure the
+            // file honestly (see _finishBytes) instead of assuming.
             'Make it original and unique — not a copy of any existing '
             'video, artwork, character or brand, no copyrighted '
             'element, and avoid common generic scenes. $prompt'
@@ -950,7 +1005,18 @@ class AnimationEngine {
       } else if (ev.url.isNotEmpty) {
         final client = _httpClient ?? http.Client();
         try {
-          final res = await client.get(Uri.parse(ev.url));
+          // v154 — send the session cookies: an auth-gated Gemini
+          // download link answers HTTP 200 with an HTML sign-in
+          // page when no cookies ride along, and that HTML used to
+          // be saved as `.mp4` (see _finishBytes).
+          String cookie = '';
+          try {
+            cookie = await _cookieHeaderProvider?.call() ?? '';
+          } catch (_) {}
+          final res = await client.get(
+            Uri.parse(ev.url),
+            headers: cookie.isEmpty ? null : {'Cookie': cookie},
+          );
           if (res.statusCode != 200 || res.bodyBytes.isEmpty) {
             throw 'Download failed: HTTP ${res.statusCode}';
           }
@@ -982,6 +1048,27 @@ class AnimationEngine {
       {int width = 1620,
       int height = 2880,
       double durationSec = 0}) async {
+    // v154 — the choke point: the bytes MUST be an MP4 before
+    // anything is saved. Live 2026-11-22 an auth-gated download
+    // answered HTTP 200 with an HTML sign-in page, which was saved
+    // as `.mp4` and marked "Animation ready ✓"; the player then
+    // failed with ExoPlayer "Source error" and the card claimed
+    // 60fps for a file that was never a video. A bad download now
+    // fails the job here, with a clear message, instead.
+    if (!isMp4Bytes(bytes)) {
+      throw 'Video download thik hoyni — file-ti MP4 na '
+          '(${bytes.length} byte pelam). Abar try koro.';
+    }
+    // v154 — the real fps + duration from the file itself, never a
+    // hardcoded 60fps: live 2026-11-22 the rendered file was 30fps
+    // while the card claimed 60fps. The prompt asks for 60fps
+    // (see start() lead + spec suffix) but Gemini's encoder
+    // decides — so the record + card show what actually arrived.
+    final info = readMp4Info(bytes);
+    final fps = info?.fps ?? 0;
+    final realDurationSec = (info != null && info.durationSec > 0)
+        ? info.durationSec
+        : durationSec;
     final dir = await videosDir();
     final id = DateTime.now().millisecondsSinceEpoch.toString();
     final fileName = 'anim_$id.mp4';
@@ -1000,7 +1087,8 @@ class AnimationEngine {
       fileName: fileName,
       width: width,
       height: height,
-      durationSec: durationSec,
+      durationSec: realDurationSec,
+      fps: fps,
       sizeBytes: size,
       createdAt: DateTime.now(),
     );
@@ -1014,12 +1102,28 @@ class AnimationEngine {
     }
     currentJobId = '';
     _setPhase(AnimationPhase.ready);
+    // v154 — say so on the status line when Gemini rendered slower
+    // than the 60fps that was asked for, so the next report names
+    // it instead of the card silently claiming 60fps.
+    if (fps > 0 && fps != 60) {
+      status =
+          'Animation ready ✓ — video ${fps}fps-e esheche (60fps chawa hoyechilo).';
+      _emit();
+    }
   }
 
   String _titleFor(String prompt) {
     final p = prompt.trim();
     if (p.isEmpty) return 'Animation ${videos.length + 1}';
-    return p.length <= 40 ? p : '${p.substring(0, 40)}…';
+    // v154 — the title IS the prompt, not a 40-char fragment: live
+    // 2026-11-22 the card read "High-angle vertical 9:16 c…" for a
+    // long polished prompt, which identifies nothing. Cap at 120
+    // chars on a word boundary instead; the card ellipsises anyway.
+    if (p.length <= 120) return p;
+    final cut = p.substring(0, 120);
+    final lastSpace = cut.lastIndexOf(' ');
+    final head = lastSpace > 60 ? cut.substring(0, lastSpace) : cut;
+    return '$head…';
   }
 
   Future<void> deleteVideo(AnimationVideo video) async {

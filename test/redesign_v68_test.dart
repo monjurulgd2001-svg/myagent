@@ -42,7 +42,7 @@ void main() {
     expect(find.text('0 sets'), findsOneWidget);
     expect(find.text('Zedge Studio'), findsNothing);
     expect(find.text('Wallpaper Set Designer'), findsNothing);
-    expect(find.text('Version 2.5.88'), findsNothing);
+    expect(find.text('Version 2.5.89'), findsNothing);
     expect(find.text('Not connected'), findsNothing);
     expect(find.byTooltip('Account actions'), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -57,7 +57,7 @@ void main() {
     // = 65px measured on a phone).
     expect(tester.getSize(find.byKey(const ValueKey('appBar'))).height,
         lessThanOrEqualTo(72));
-    expect(find.text('Version 2.5.88'), findsNothing);
+    expect(find.text('Version 2.5.89'), findsNothing);
     expect(find.text('Wallpaper Set Designer'), findsNothing);
     expect(find.text('Not connected'), findsNothing);
     expect(find.byType(NavigationBar), findsOneWidget);
