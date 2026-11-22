@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:video_player_platform_interface/video_player_platform_interface.dart';
@@ -11,6 +13,19 @@ class FakeVideoPlayerPlatform extends VideoPlayerPlatform {
   /// When true, createWithOptions throws (player init failure path).
   bool failCreate = false;
 
+  /// v156 — when set, createWithOptions throws this exact error
+  /// (init failure path with a chosen message, e.g. the live
+  /// MediaCodecVideoRenderer error).
+  PlatformException? failCreateError;
+
+  /// The player id of the most recently created controller.
+  int? lastPlayerId;
+
+  /// v156 — per-player event streams, so a test can report a
+  /// playback error AFTER init succeeded (the live MediaCodec
+  /// failure mode: value.hasError, not a thrown exception).
+  final _eventControllers = <int, StreamController<VideoEvent>>{};
+
   DataSource? lastDataSource;
   final List<String> calls = [];
   int _nextPlayerId = 1;
@@ -18,22 +33,35 @@ class FakeVideoPlayerPlatform extends VideoPlayerPlatform {
   @override
   Future<int?> createWithOptions(VideoCreationOptions options) async {
     calls.add('create');
+    if (failCreateError != null) throw failCreateError!;
     if (failCreate) {
       throw PlatformException(code: 'error', message: 'no player');
     }
     lastDataSource = options.dataSource;
+    lastPlayerId = _nextPlayerId;
     return _nextPlayerId++;
   }
 
   @override
   Stream<VideoEvent> videoEventsFor(int playerId) {
-    return Stream<VideoEvent>.value(
+    final c = StreamController<VideoEvent>();
+    _eventControllers[playerId] = c;
+    c.add(
       VideoEvent(
         eventType: VideoEventType.initialized,
         duration: const Duration(seconds: 1),
         size: const Size(1620, 2880),
       ),
     );
+    return c.stream;
+  }
+
+  /// v156 — test control: make the platform report a playback
+  /// error after init succeeded (delivered to the controller's
+  /// error listener, which sets value.hasError).
+  void emitRuntimeError(int playerId, String message) {
+    _eventControllers[playerId]?.addError(
+        PlatformException(code: 'VideoError', message: message));
   }
 
   @override

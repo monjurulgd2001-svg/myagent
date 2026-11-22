@@ -20,6 +20,7 @@ import 'app_theme.dart';
 import 'foreground_keep_alive.dart';
 import 'gecko_browser.dart';
 import 'gecko_signin.dart';
+import 'meta_card_style.dart';
 import 'video_playback.dart';
 import 'voice_prompt.dart';
 import 'windows_session_renewal.dart';
@@ -2132,7 +2133,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               PopupMenuItem(
                 enabled: false,
-                child: Text('Version 2.5.90',
+                child: Text('Version 2.5.95',
                     style: TextStyle(
                         fontSize: 12, color: cs.onSurfaceVariant)),
               ),
@@ -3763,19 +3764,7 @@ class _SetCardState extends State<SetCard> {
 
   /// One hashtag chip, shared by the collapsed (one scrollable
   /// row) and expanded (wrapped) tag layouts.
-  Widget _tagChip(String tag) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: const Color(0xFF12121B),
-        border: Border.all(color: Colors.white12),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text('#$tag',
-          style:
-              const TextStyle(fontSize: 13, color: Color(0xFFC9C9D2))),
-    );
-  }
+  Widget _tagChip(String tag) => metaTagChip(tag);
 
   /// Inner metadata card in the reference showcase design: title +
   /// category pill + AI sparkle, the model line, the description and
@@ -3823,9 +3812,9 @@ class _SetCardState extends State<SetCard> {
       width: double.infinity,
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surfaceContainer,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(kMetaCardRadius),
       ),
-      padding: const EdgeInsets.all(12),
+      padding: kMetaCardPadding,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -3843,7 +3832,7 @@ class _SetCardState extends State<SetCard> {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF7A68E0),
+                    color: kMetaCategoryPillColor,
                     borderRadius: BorderRadius.circular(999),
                   ),
                   child: Text(meta.category.toUpperCase(),

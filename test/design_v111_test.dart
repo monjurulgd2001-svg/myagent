@@ -31,7 +31,7 @@ void main() {
     expect(main, contains("Icons.settings_outlined"));
     // Account actions + version live in the gear menu.
     expect(main, contains("'Switch account'"));
-    expect(main, contains("Text('Version 2.5.90'"));
+    expect(main, contains("Text('Version 2.5.95'"));
     expect(main, contains('_sessionLabel'));
   });
 

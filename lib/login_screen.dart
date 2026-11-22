@@ -1002,7 +1002,7 @@ class _LoginScreenState extends State<LoginScreen> {
             child: Align(
               alignment: Alignment.centerRight,
               child: Text(
-                'App v2.5.90',
+                'App v2.5.95',
                 style: TextStyle(
                   fontSize: 11,
                   color: Theme.of(context).colorScheme.onSurfaceVariant,

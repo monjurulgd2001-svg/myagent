@@ -29,6 +29,14 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // v156 — embedded GeckoView video playback inside the phone
+        // mockup (GeckoVideoViewFactory): the fallback when the
+        // phone's hardware decoder rejects an MP4. Same package, so
+        // no import is needed.
+        flutterEngine.platformViewsController.registry.registerViewFactory(
+            "com.geminihd.studio/gecko_video",
+            GeckoVideoViewFactory()
+        )
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.geminihd.studio/browser"
@@ -223,6 +231,8 @@ class MainActivity : FlutterActivity() {
                         GeckoBridge.browserVideoCancel(call.arguments as String)
                         result.success(true)
                     }
+                    "captureVideoCover" -> GeckoBridge.captureVideoCover(
+                        this, call.arguments as String, result)
                     "backendFetch" -> GeckoBridge.backendFetch(
                         this, call.arguments as String) {
                         result.success(it)

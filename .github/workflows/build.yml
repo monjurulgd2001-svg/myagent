@@ -123,20 +123,20 @@ jobs:
           }
 
       - name: Rename APK
-        run: cp build/app/outputs/flutter-apk/app-release.apk ZedgeStudio-2.5.90-release.apk
+        run: cp build/app/outputs/flutter-apk/app-release.apk ZedgeStudio-2.5.95-release.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: gemini-hd-studio-android-apk
-          path: ZedgeStudio-2.5.90-release.apk
+          path: ZedgeStudio-2.5.95-release.apk
           retention-days: 90
 
       - name: Publish APK to Release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ZedgeStudio-2.5.90-release.apk
+          files: ZedgeStudio-2.5.95-release.apk
 
   build-windows:
     name: Windows App + Setup .exe
@@ -147,7 +147,7 @@ jobs:
     runs-on: windows-2022
     steps:
       - name: Workflow version (v150)
-        run: echo "WORKFLOW FILE VERSION = v155 (Version 2.5.90 label, backend 60fps regression tests - prompt already carried it, verified end to end)"
+        run: echo "WORKFLOW FILE VERSION = v160 (Version 2.5.95 label, desktop cover capture via headless Chrome)"
 
       - name: Checkout
         uses: actions/checkout@v4

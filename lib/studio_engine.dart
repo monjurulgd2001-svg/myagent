@@ -24,11 +24,22 @@ import 'image_service.dart';
 import 'models.dart';
 import 'studio_constants.dart';
 import 'task_backend.dart';
+import 'video_cover.dart';
 
 class StudioEngine {
-  StudioEngine({StatusSink? onStatus, http.Client? client})
+  StudioEngine(
+      {StatusSink? onStatus,
+      http.Client? client,
+      VideoCoverCapture? coverCapture,
+      VideoCoverCapture? browserCoverCapture,
+      VideoCoverCapture? chromeCoverCapture})
       : onStatus = onStatus ?? ((_) {}),
         _client = client ?? http.Client(),
+        _coverCapture = coverCapture ?? captureVideoCover,
+        _browserCoverCapture =
+            browserCoverCapture ?? captureVideoCoverViaBrowser,
+        _chromeCoverCapture =
+            chromeCoverCapture ?? captureVideoCoverViaChrome,
         gemini = GeminiApi(onStatus: onStatus),
         images = ImageService(onStatus: onStatus) {
     images.cloudinary = cloudinary;
@@ -39,6 +50,22 @@ class StudioEngine {
   final ImageService images;
   CloudinaryConfig cloudinary = CloudinaryConfig();
   final http.Client _client;
+  // v158 — the cover-frame capture seam (injected so tests can
+  // fake it; the real one needs a real video file on Android).
+  final VideoCoverCapture _coverCapture;
+  // v159 — the browser-canvas fallback seam: same shape as
+  // [_coverCapture], tried only when the hardware capture returns
+  // no frame. The real one runs the frame through a hidden
+  // headless Gecko session (software decode); injected so tests
+  // can fake it, and null on desktop by design.
+  final VideoCoverCapture _browserCoverCapture;
+  // v160 — the desktop cover seam: same shape as [_coverCapture],
+  // tried only when the hardware capture AND the browser-canvas
+  // fallback found no frame. The real one runs the frame through
+  // headless Chrome on Windows (the plugin has no desktop
+  // implementation and there is no Gecko bridge there); injected
+  // so tests can fake it, and null on non-Windows by design.
+  final VideoCoverCapture _chromeCoverCapture;
 
   void _status(String state, int step, String message) =>
       onStatus(StatusEvent(state, step, message));
@@ -1312,7 +1339,7 @@ class StudioEngine {
       case 'set_battery':
         return 'WALLPAPER_BATTERY';
       case 'animation':
-        return 'LIVE_WALLPAPER';
+        return 'CHARGING_ANIMATION';
       default:
         return 'WALLPAPER';
     }
@@ -1573,9 +1600,10 @@ class StudioEngine {
   // and the same R2 + Firebase queue record. The MP4 goes to the
   // same proven R2 folder as the wallpapers (the worker path is
   // unchanged); the queue record carries isVideo + type video/mp4
-  // + contentType LIVE_WALLPAPER so the panel can tell it apart
-  // from a JPG set. Whether the panel UI lists video entries is
-  // the panel's side — the record is what the app can send.
+  // + contentType from the video's own panel-type choice
+  // (v157: Charging Animation by default, Live Wallpaper when
+  // the user picks it on the card) — the panel files by that
+  // contentType verbatim, so the choice IS the section.
 
   /// AI listing metadata for one finished video, from the user's
   /// own Gemini session (same session the image metadata uses).
@@ -1590,6 +1618,13 @@ class StudioEngine {
 
   /// The Firebase queue record for one video — pure, so the unit
   /// tests cover the panel contract without network.
+  /// v157 — [panelType] is the section the panel files it under
+  /// (its contentType, verbatim): the video's own choice from the
+  /// card when no override is passed (Charging Animation when
+  /// the video carries no choice), an explicit override otherwise.
+  /// v158 — [thumbUrl] is the panel cover (the record's thumbUrl):
+  /// included only when non-empty, so a video whose cover could
+  /// not be captured still uploads — without a cover.
   static Map<String, dynamic> buildVideoPanelRecord({
     required AnimationVideo video,
     required String fileUrl,
@@ -1598,6 +1633,8 @@ class StudioEngine {
     required String fileSha,
     SetMetadata? meta,
     required int now,
+    String? panelType,
+    String? thumbUrl,
   }) {
     final record = <String, dynamic>{
       'name': fileName,
@@ -1610,7 +1647,7 @@ class StudioEngine {
       'isMp3': false,
       'isImage': false,
       'isVideo': true,
-      'contentType': 'LIVE_WALLPAPER',
+      'contentType': normalizeVideoPanelType(panelType ?? video.panelType),
       'fileUrl': fileUrl,
       'status': 'queued',
       'prompt': video.prompt,
@@ -1620,6 +1657,9 @@ class StudioEngine {
       'sha256': fileSha,
       'createdAt': now,
     };
+    if (thumbUrl != null && thumbUrl.isNotEmpty) {
+      record['thumbUrl'] = thumbUrl;
+    }
     if (meta != null &&
         (meta.title.isNotEmpty ||
             meta.tags.isNotEmpty ||
@@ -1641,14 +1681,42 @@ class StudioEngine {
   /// Firebase queue record). Returns the account + queue key and
   /// the metadata that was used (generated on the fly when the
   /// video had none yet — the caller stores it on the video).
+  /// v157 — [panelType] overrides the video's own choice for
+  /// this upload; otherwise the video's stored choice is used
+  /// (Charging Animation by default). It becomes the record's
+  /// contentType, which is the section the panel files it under.
+  /// v158 — the returned [thumbUrl] is the cover URL when a cover
+  /// was captured and uploaded; the caller stores it on the video
+  /// so a re-upload reuses the same cover instead of capturing it
+  /// again.
+  /// v159 — [coverError] names the failed cover step (capture vs
+  /// R2 upload) when the cover failed, so the caller can write the
+  /// actual reason into the persisted error log instead of
+  /// swallowing it; null when a cover was uploaded (or a cached
+  /// one was reused).
+  /// v159 SECOND PASS — HARD GUARANTEE (user order 2026-11-22:
+  /// "ki hoy hok thumbnail jeno jay, ditiyobar jeno ar erokom na
+  /// ashe"): a missing cover now BLOCKS the queue — this method
+  /// THROWS before the Firebase record is pushed, so a record
+  /// without thumbUrl can never reach the panel again. The v158
+  /// behaviour ("upload anyway without a cover") is REVOKED.
+  /// The MP4 may already be on R2 when the cover fails (orphan
+  /// file — acceptable, the record is what matters); the video
+  /// stays on the device so the upload can be retried. [coverError]
+  /// is therefore only ever set on paths that still return (it is
+  /// kept for API compatibility); a total cover failure throws
+  /// instead of returning.
   Future<
       ({
         String accountName,
         String firebaseKey,
         SetMetadata? metadata,
+        String? thumbUrl,
+        String? coverError,
       })> uploadVideoToPanel(
     AnimationVideo video, {
     String targetAccount = 'spread',
+    String? panelType,
   }) async {
     final distConfig = await loadDistConfig();
     if (distConfig.r2WorkerUrl.isEmpty || distConfig.accounts.isEmpty) {
@@ -1685,6 +1753,42 @@ class StudioEngine {
       fileType: 'video/mp4',
     );
 
+    // v158 — cover frame for the panel card, from the local MP4.
+    // A cover already stored on the video (a previous upload) is
+    // reused as-is; otherwise one frame is captured (three
+    // timestamps per path, hardware first, then the browser
+    // fallback) and uploaded beside the video.
+    // v159 — when the hardware capture finds no frame, the
+    // browser-canvas fallback runs before giving up, and a cover
+    // failure is reported (not swallowed): the returned [error]
+    // names the failed step (cover capture vs cover R2 upload)
+    // plus the exception.
+    // v159 SECOND PASS — the failure is no longer "upload without
+    // a cover": a missing cover THROWS below, before the Firebase
+    // record is pushed (thumbnail guarantee — see the gate).
+    var thumbUrl = video.thumbUrl;
+    String? coverError;
+    if (thumbUrl.isEmpty) {
+      final cover = await _captureAndUploadCover(
+          video, distConfig, r2Folder, baseSlug);
+      thumbUrl = cover.url;
+      coverError = cover.error;
+    }
+
+    // v159 SECOND PASS — HARD GUARANTEE (user order 2026-11-22:
+    // "ki hoy hok thumbnail jeno jay"): a missing cover BLOCKS
+    // the queue. The Firebase record is NEVER pushed without a
+    // thumbUrl — the v158 "upload anyway without a cover" is
+    // revoked. The MP4 may already be on R2 (orphan file,
+    // acceptable — the record is what matters); the video stays
+    // on the device so the upload can be retried.
+    if (thumbUrl.isEmpty) {
+      throw Exception(
+          'Thumbnail banano jayni — video Panel-e pathano hoyni. '
+          '${coverError ?? 'cover capture failed'}. '
+          'Video device-e ache, thumbnail thik hole abar upload korte parben.');
+    }
+
     _status('downloading', 4,
         'Pushing video record + metadata to ${acc.name} Firebase Queue (${distConfig.queuePath})...');
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -1696,6 +1800,8 @@ class StudioEngine {
       fileSha: fileSha,
       meta: meta,
       now: now,
+      panelType: panelType ?? video.panelType,
+      thumbUrl: thumbUrl.isEmpty ? null : thumbUrl,
     );
     final dbSecret = acc.secret;
     final firebaseKey = await _pushRecordToFirebase(
@@ -1710,6 +1816,110 @@ class StudioEngine {
       accountName: acc.name,
       firebaseKey: firebaseKey,
       metadata: meta,
+      thumbUrl: thumbUrl.isEmpty ? null : thumbUrl,
+      coverError: coverError,
     );
+  }
+
+  /// v158 — captures one cover frame from the local MP4 (~1s in,
+  /// first frame as fallback) at the video's full native
+  /// resolution and uploads it to R2 beside the video.
+  /// v159 — two capture paths, in order: (1) the hardware
+  /// capture ([_coverCapture], MediaMetadataRetriever — fast, and
+  /// it works for normal files); (2) when it finds no frame, the
+  /// browser-canvas fallback ([_browserCoverCapture], a hidden
+  /// headless Gecko session that software-decodes the MP4 —
+  /// live 2026-11-22 the hardware path returned null for Gemini's
+  /// H.264 High @ Level 5.2 1620x2880@60fps file on TECNO CAMON
+  /// 30S). Returns the public URL plus a null error on success.
+  /// v160 — a third path, tried last: (3) the desktop Chrome
+  /// capture ([_chromeCoverCapture], headless Chrome canvas —
+  /// the plugin has no desktop implementation and there is no
+  /// Gecko bridge on Windows, so without it the guarantee
+  /// blocked every desktop upload).
+  /// v159 SECOND PASS — three timestamps per path (1000ms, then
+  /// first frame, then 2000ms): "ki hoy hok thumbnail jeno jay".
+  /// A missing cover must now FAIL the video upload (the caller
+  /// throws before the Firebase push), so every failure still
+  /// returns url '' — but the returned [error] names the failed
+  /// step (cover capture vs cover R2 upload) plus the exception,
+  /// so the caller can write it into the persisted error log.
+  Future<({String url, String? error})> _captureAndUploadCover(
+    AnimationVideo video,
+    DistConfig distConfig,
+    String r2Folder,
+    String baseSlug,
+  ) async {
+    Uint8List? bytes;
+    // One note per path that threw, so the logged reason names
+    // every path that failed instead of only the first.
+    final failures = <String>[];
+    // v159 second pass — three timestamps per path, in order:
+    // ~1s in, first frame, then 2s in. Whatever it takes to get
+    // a real frame.
+    const coverTimesMs = [1000, 0, 2000];
+    try {
+      for (final t in coverTimesMs) {
+        bytes = await _coverCapture(video.localPath, timeMs: t);
+        if (bytes != null && bytes.isNotEmpty) break;
+      }
+    } catch (e) {
+      failures.add('hardware capture threw: $e');
+      bytes = null;
+    }
+    if (bytes == null || bytes.isEmpty) {
+      // v159 fallback — Gecko software-decodes what the phone's
+      // hardware decoder rejects. Only runs when the fast path
+      // found no frame; the browser gets the same three tries.
+      try {
+        for (final t in coverTimesMs) {
+          bytes = await _browserCoverCapture(video.localPath, timeMs: t);
+          if (bytes != null && bytes.isNotEmpty) break;
+        }
+      } catch (e) {
+        failures.add('browser capture threw: $e');
+        bytes = null;
+      }
+    }
+    if (bytes == null || bytes.isEmpty) {
+      // v160 — desktop: headless Chrome software-decodes what
+      // neither the hardware decoder nor the Gecko fallback can
+      // reach (on Android this seam returns null at once, so the
+      // order there is unchanged). Only runs when both earlier
+      // paths found no frame; the browser gets the same three
+      // tries.
+      try {
+        for (final t in coverTimesMs) {
+          bytes = await _chromeCoverCapture(video.localPath, timeMs: t);
+          if (bytes != null && bytes.isNotEmpty) break;
+        }
+      } catch (e) {
+        failures.add('chrome capture threw: $e');
+        bytes = null;
+      }
+    }
+    if (bytes == null || bytes.isEmpty) {
+      final reason = failures.isEmpty
+          ? 'hardware + browser + chrome capture returned no frame '
+              '(1000ms + 0ms + 2000ms each)'
+          : '${failures.join('; ')}; no frame from any path';
+      _status('uploading', 3,
+          'Video-r cover banano jayni — thumbnail chara record push hobe na.');
+      return (url: '', error: 'cover capture failed: $reason');
+    }
+    try {
+      final url = await _uploadFileToR2Worker(
+        bytes: bytes,
+        fileName: '${baseSlug}_thumb.jpg',
+        workerUrl: distConfig.r2WorkerUrl,
+        folder: r2Folder,
+        fileType: 'image/jpeg',
+      );
+      return (url: url, error: null);
+    } catch (e) {
+      _status('uploading', 3,
+          'Cover upload hoyni ($e) — thumbnail chara record push hobe na.');
+      return (url: '', error: 'cover R2 upload failed: $e');
+    }
   }
 }

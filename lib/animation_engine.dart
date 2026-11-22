@@ -90,6 +90,19 @@ typedef VideoPanelUploader = Future<
       String accountName,
       String firebaseKey,
       SetMetadata? metadata,
+      // v158 — the cover URL when a cover was captured + uploaded
+      // (null when the video goes without one).
+      String? thumbUrl,
+      // v159 — the failed cover step (capture vs R2 upload) when
+      // the video went without a cover, so the failure lands in
+      // the persisted error log instead of being swallowed;
+      // null when a cover was uploaded (or a cached one reused).
+      // v159 SECOND PASS — the hard guarantee: a total cover
+      // failure now THROWS in the uploader before the Firebase
+      // record is pushed, so it never reaches this return; the
+      // field is kept for API compatibility and for the
+      // defensive log branch in AnimationEngine.uploadVideoToPanel.
+      String? coverError,
     })> Function(AnimationVideo video, {String targetAccount});
 
 /// v88 — injected by the app: polishes a rough animation idea
@@ -340,16 +353,31 @@ class AnimationEngine {
         final f = File(v.localPath);
         if (!await f.exists()) continue;
         final len = await f.length();
-        if (len <= 0 || len > 32 * 1024 * 1024) continue;
-        final info = readMp4Info(await f.readAsBytes());
-        if (info == null) continue;
-        final fps = info.fps > 0 ? info.fps : v.fps;
-        final dur =
-            info.durationSec > 0 ? info.durationSec : v.durationSec;
-        if (fps != v.fps || dur != v.durationSec) {
-          videos[i] = v.copyWith(fps: fps, durationSec: dur);
+        if (len <= 0) continue;
+        var next = v;
+        // v159 second pass — the real file length is the truth
+        // for the card's size too (old records were saved with
+        // sizeBytes 0). The live 36 MB file is above the 32 MB
+        // probe cap below, so the size fix must NOT ride on the
+        // probe — it is fixed from the length alone.
+        if (len != v.sizeBytes) {
+          next = next.copyWith(sizeBytes: len);
           fixed = true;
         }
+        if (len <= 32 * 1024 * 1024) {
+          final info = readMp4Info(await f.readAsBytes());
+          if (info != null) {
+            final fps = info.fps > 0 ? info.fps : next.fps;
+            final dur = info.durationSec > 0
+                ? info.durationSec
+                : next.durationSec;
+            if (fps != next.fps || dur != next.durationSec) {
+              next = next.copyWith(fps: fps, durationSec: dur);
+              fixed = true;
+            }
+          }
+        }
+        videos[i] = next;
       } catch (_) {}
     }
     if (fixed) await _save();
@@ -1105,9 +1133,20 @@ class AnimationEngine {
     // v154 — say so on the status line when Gemini rendered slower
     // than the 60fps that was asked for, so the next report names
     // it instead of the card silently claiming 60fps.
+    // v159 second pass — same for an over-target file: the clip
+    // was asked for under 10 MB, so when Gemini gives a bigger
+    // file the status names it (the card's sizeNote shows it too).
+    // The video itself stays usable — size never blocks anything.
+    final sizeNotes = <String>[];
     if (fps > 0 && fps != 60) {
-      status =
-          'Animation ready ✓ — video ${fps}fps-e esheche (60fps chawa hoyechilo).';
+      sizeNotes.add('video ${fps}fps-e esheche (60fps chawa hoyechilo)');
+    }
+    if (size > kVideoTargetMaxSizeBytes) {
+      sizeNotes.add(
+          'file ${(size / 1000000).toStringAsFixed(1)} MB — 10 MB chawa hoyechilo');
+    }
+    if (sizeNotes.isNotEmpty) {
+      status = 'Animation ready ✓ — ${sizeNotes.join('; ')}.';
       _emit();
     }
   }
@@ -1193,6 +1232,9 @@ class AnimationEngine {
           await _panelUploader(video, targetAccount: targetAccount);
       _replaceVideo(video.copyWith(
         metadata: result.metadata,
+        // v158 — the cover URL the upload returned (null keeps
+        // the video's stored cover, e.g. a previous upload's).
+        thumbUrl: result.thumbUrl,
         uploadedToPanel: {
           'accountName': result.accountName,
           'firebaseKey': result.firebaseKey,
@@ -1200,9 +1242,28 @@ class AnimationEngine {
         },
       ));
       await _save();
+      // v159 — the video uploaded fine, but a cover failure must
+      // not vanish: write the actual step + reason into the
+      // persisted error log so the Animation screen shows WHY the
+      // panel card has no cover (live 2026-11-22: v158 swallowed
+      // it with a brief status note and the record went without
+      // thumbUrl, with nothing to diagnose from).
+      if (result.coverError != null && result.coverError!.isNotEmpty) {
+        await _logError('Cover (${video.fileName}): ${result.coverError}');
+      }
       status = 'Panel-e upload hoye geche (${result.accountName}) ✓';
       return true;
     } catch (e) {
+      // v159 second pass — the thumbnail block must land in the
+      // persisted error log (step + exception), not just the
+      // status line: the StudioEngine throws 'Thumbnail banano
+      // jayni…' before the Firebase push, and the video stays on
+      // the device — the log is how the Animation screen shows
+      // WHY it is still there. Other upload failures keep the
+      // old behaviour (status only).
+      if ('$e'.contains('Thumbnail banano jayni')) {
+        await _logError('Cover (${video.fileName}): $e');
+      }
       status = 'Panel upload hoyni: $e';
       return false;
     } finally {
@@ -1210,6 +1271,19 @@ class AnimationEngine {
       busyAction = '';
       _emit();
     }
+  }
+
+  /// v157 — the per-video panel section choice (Live Wallpaper /
+  /// Charging Animation) from the card chips. Persisted with the
+  /// video, so Upload-all uses each video's own choice and the
+  /// choice survives a restart. No-op when unchanged.
+  Future<void> setVideoPanelType(
+      AnimationVideo video, String panelType) async {
+    final type = normalizeVideoPanelType(panelType);
+    if (type == video.panelType) return;
+    _replaceVideo(video.copyWith(panelType: type));
+    await _save();
+    _emit();
   }
 
   /// v87 — uploads every video to the panel, one by one. Returns

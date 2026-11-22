@@ -41,6 +41,155 @@ class Mp4Info {
   final double durationSec;
 }
 
+/// v156 — the video track's codec identity, read from the MP4
+/// header (sample entry + avcC/hvcC). Used on the preview error
+/// path so the next diagnosis is grounded in what the file really
+/// is — live 2026-11-22 the TECNO CAMON 30S hardware decoder
+/// rejected a file Chrome plays, and nothing in the app could say
+/// which codec/profile it was.
+class Mp4VideoCodec {
+  const Mp4VideoCodec({
+    required this.codec,
+    this.detail = '',
+    this.width = 0,
+    this.height = 0,
+  });
+
+  /// 'H.264', 'HEVC', 'VP9', 'AV1', 'MPEG-4', or 'unknown'.
+  final String codec;
+
+  /// e.g. 'High @ 5.1', 'Main 10 @ 5.1' — '' when not applicable.
+  final String detail;
+
+  /// Frame size from the sample entry (0 = unknown).
+  final int width;
+  final int height;
+
+  /// One line for the preview error / log, e.g.
+  /// 'H.264 High @ 5.1 · 1620x2880' or 'unknown codec'.
+  String get label {
+    final size = width > 0 && height > 0 ? ' · ${width}x$height' : '';
+    final det = detail.isNotEmpty ? ' $detail' : '';
+    return '$codec$det$size';
+  }
+}
+
+/// Reads the video track's codec + size from the stsd sample entry.
+/// Returns null when the boxes are missing — the caller then says
+/// 'unknown codec' instead of inventing one. Never throws.
+Mp4VideoCodec? readMp4VideoCodec(Uint8List bytes) {
+  final moov = _findBox(bytes, 0, bytes.length, 'moov');
+  if (moov == null) return null;
+  var off = moov.start;
+  while (true) {
+    final trak = _nextBox(bytes, off, moov.end, 'trak');
+    if (trak == null) break;
+    off = trak.end;
+    final mdia = _findBox(bytes, trak.start, trak.end, 'mdia');
+    if (mdia == null) continue;
+    final hdlr = _findBox(bytes, mdia.start, mdia.end, 'hdlr');
+    if (hdlr != null) {
+      final h = _boxBody(bytes, hdlr);
+      if (h == null || h.length < 12) continue;
+      if (String.fromCharCodes(h.sublist(8, 12)) != 'vide') continue;
+    }
+    final minf = _findBox(bytes, mdia.start, mdia.end, 'minf');
+    final stbl =
+        minf != null ? _findBox(bytes, minf.start, minf.end, 'stbl') : null;
+    if (stbl == null) continue;
+    final stsd = _findBox(bytes, stbl.start, stbl.end, 'stsd');
+    if (stsd == null) continue;
+    final body = _boxBody(bytes, stsd);
+    // stsd: version/flags (4) + entry_count (4) + first entry.
+    if (body == null || body.length < 8) continue;
+    final entryCount = _u32(body, 4);
+    if (entryCount <= 0 || body.length < 16) continue;
+    final entrySize = _u32(body, 8);
+    if (entrySize < 86 || body.length < 8 + entrySize) continue;
+    final type = String.fromCharCodes(body.sublist(12, 16));
+    // VisualSampleEntry: 24 bytes before width/height (6 reserved
+    // + data ref + pre-defined + reserved + 12 pre-defined), then
+    // width u16, height u16. Entry starts at body offset 8.
+    final width = _u16(body, 8 + 8 + 24);
+    final height = _u16(body, 8 + 8 + 26);
+    // Child boxes (avcC / hvcC) follow the 78-byte sample entry.
+    const childStart = 8 + 8 + 78;
+    final childEnd = 8 + entrySize;
+    switch (type) {
+      case 'avc1':
+      case 'avc3':
+        final avcC = _findBox(body, childStart, childEnd, 'avcC');
+        final avcBody = avcC != null ? _boxBody(body, avcC) : null;
+        return Mp4VideoCodec(
+          codec: 'H.264',
+          detail: avcBody != null && avcBody.length >= 4
+              ? '${_avcProfileName(avcBody[1])} @ ${_avcLevel(avcBody[3])}'
+              : '',
+          width: width,
+          height: height,
+        );
+      case 'hev1':
+      case 'hvc1':
+        final hvcC = _findBox(body, childStart, childEnd, 'hvcC');
+        final hvcBody = hvcC != null ? _boxBody(body, hvcC) : null;
+        return Mp4VideoCodec(
+          codec: 'HEVC',
+          detail: hvcBody != null && hvcBody.length >= 13
+              ? '${_hevcProfileName(hvcBody[1] & 0x1f)}'
+                  '${((hvcBody[1] >> 5) & 1) == 1 ? ' High Tier' : ''}'
+                  ' @ ${_hevcLevel(hvcBody[12])}'
+              : '',
+          width: width,
+          height: height,
+        );
+      case 'vp09':
+        return Mp4VideoCodec(
+            codec: 'VP9', width: width, height: height);
+      case 'av01':
+        return Mp4VideoCodec(
+            codec: 'AV1', width: width, height: height);
+      case 'mp4v':
+        return Mp4VideoCodec(
+            codec: 'MPEG-4', width: width, height: height);
+      default:
+        return Mp4VideoCodec(
+            codec: 'unknown',
+            detail: '($type)',
+            width: width,
+            height: height);
+    }
+  }
+  return null;
+}
+
+int _u16(Uint8List b, int off) => (b[off] << 8) | b[off + 1];
+
+String _avcProfileName(int id) => switch (id) {
+      66 => 'Baseline',
+      77 => 'Main',
+      88 => 'Extended',
+      100 => 'High',
+      110 => 'High 10',
+      122 => 'High 4:2:2',
+      144 => 'High 4:4:4',
+      _ => 'Profile $id',
+    };
+
+/// AVC level_idc is level x10 (51 -> 5.1).
+String _avcLevel(int levelIdc) =>
+    '${levelIdc ~/ 10}.${levelIdc % 10}';
+
+String _hevcProfileName(int id) => switch (id) {
+      1 => 'Main',
+      2 => 'Main 10',
+      3 => 'Main Still Picture',
+      _ => 'Profile $id',
+    };
+
+/// HEVC level_idc is level x30 (150 -> 5.0, 153 -> 5.1).
+String _hevcLevel(int levelIdc) =>
+    '${levelIdc ~/ 30}.${(levelIdc % 30) ~/ 3}';
+
 /// Reads fps + duration from the moov box (mvhd duration/timescale,
 /// video trak mdhd timescale + stts sample deltas). Returns null
 /// when the boxes are missing or inconsistent — the caller then

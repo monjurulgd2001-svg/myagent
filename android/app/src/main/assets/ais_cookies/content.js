@@ -1322,3 +1322,120 @@ window.__aisTouchUI = true;
     }
   }
 })();
+
+// v159 — cover-frame capture for a finished animation video.
+// Runs ONLY on a local file:// MP4 page: the hidden cover tab
+// Kotlin opens for one capture (the backend session must stay on
+// the Gemini page, so the cover gets its own tab). The page IS
+// the video — Gecko's built-in viewer already has a <video> — so
+// seek to the requested time, canvas-draw the frame at FULL
+// native size (1620x2880, never downscaled — JPEG 0.85, mirroring
+// the panel's own submitVideo canvas capture) and answer the
+// frame as a JPEG data URL. Never runs on Gemini pages (the
+// driver guard above returns first) or http(s) pages.
+(() => {
+  try {
+    if (window.top !== window.self) return;
+    if (location.protocol !== 'file:') return;
+    if (!/\.mp4($|\?)/i.test(location.pathname)) return;
+    if (window.__ghsCoverInstalled) return;
+    window.__ghsCoverInstalled = true;
+  } catch (e) { return; }
+
+  let port = null;
+  function connect() {
+    try {
+      port = browser.runtime.connect({ name: 'ais-cover' });
+      port.onMessage.addListener((m) => {
+        if (m && m.type === 'coverCapture') onCapture(m);
+      });
+      port.onDisconnect.addListener(() => { port = null; setTimeout(connect, 1000); });
+    } catch (e) { setTimeout(connect, 1000); }
+  }
+  connect();
+
+  function send(id, data, error) {
+    try { port && port.postMessage({ type: 'coverCapture', id: id, data: data || null, error: error || null }); } catch (e) {}
+  }
+  function waitFor(cond, ms) {
+    return new Promise((ok, bad) => {
+      const end = Date.now() + ms;
+      (function tick() {
+        let v = false;
+        try { v = cond(); } catch (e) {}
+        if (v) return ok();
+        if (Date.now() > end) return bad(new Error('metadata timeout'));
+        setTimeout(tick, 100);
+      })();
+    });
+  }
+  function waitEvent(el, name, ms) {
+    return new Promise((ok, bad) => {
+      const to = setTimeout(() => { el.removeEventListener(name, done); bad(new Error(name + ' timeout')); }, ms);
+      function done() { clearTimeout(to); el.removeEventListener(name, done); ok(); }
+      el.addEventListener(name, done);
+    });
+  }
+  function blobToDataUrl(blob) {
+    return new Promise((ok, bad) => {
+      const fr = new FileReader();
+      fr.onload = () => ok(fr.result);
+      fr.onerror = () => bad(fr.error || new Error('read failed'));
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  async function onCapture(m) {
+    const id = m.id;
+    const timeMs = (typeof m.timeMs === 'number' && m.timeMs >= 0) ? m.timeMs : 1000;
+    try {
+      // Gecko's built-in viewer for a video file renders a
+      // <video>; fall back to our own element on the same file.
+      let v = document.querySelector('video');
+      if (!v) {
+        v = document.createElement('video');
+        v.src = location.href;
+        v.muted = true;
+        v.preload = 'auto';
+        v.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;background:#000';
+        document.body.appendChild(v);
+      }
+      v.muted = true;
+      // Prime the software decoder, then pause: seeking works on
+      // a paused video and the tab stays silent.
+      try { await v.play(); } catch (e) {}
+      try { v.pause(); } catch (e) {}
+      // Metadata first (native size known) — up to 20s.
+      await waitFor(() => v.readyState >= 1 && v.videoWidth > 0, 20000);
+      const w = v.videoWidth, h = v.videoHeight;
+      if (!w || !h) throw new Error('no video size (videoWidth 0)');
+      // Seek to ~1s (or the requested time) and wait for the
+      // seek to land — up to 20s. Clamp inside the duration so a
+      // short clip still seeks; skip the seek when already there
+      // (no 'seeked' event fires then).
+      let t = timeMs / 1000;
+      if (isFinite(v.duration) && v.duration > 0) t = Math.min(t, Math.max(0, v.duration - 0.05));
+      if (t > 0 && Math.abs(v.currentTime - t) > 0.05) {
+        const seeked = waitEvent(v, 'seeked', 20000);
+        v.currentTime = t;
+        await seeked;
+      }
+      // Full native size — NEVER downscaled (user order:
+      // cover stays 1620x2880).
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('no 2d context');
+      ctx.drawImage(v, 0, 0, w, h);
+      const blob = await new Promise((ok, bad) => {
+        try { canvas.toBlob((b) => b ? ok(b) : bad(new Error('toBlob null')), 'image/jpeg', 0.85); }
+        catch (e) { bad(e); }
+      });
+      const data = await blobToDataUrl(blob);
+      send(id, data, null);
+    } catch (e) {
+      send(id, null, 'coverCapture: ' + (e && e.message ? e.message : String(e)));
+    }
+  }
+})();

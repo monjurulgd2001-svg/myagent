@@ -1,7 +1,7 @@
 name: gemini_hd_studio
 description: "Zedge Studio — Wallpaper Set Designer, AI Metadata & Panel Uploader (Android + Windows). Flutter port of the Gemini HD Studio v2.5.3 Chrome extension."
 publish_to: 'none'
-version: 2.5.90+155
+version: 2.5.95+160
 
 environment:
   sdk: ^3.5.4
@@ -23,6 +23,12 @@ dependencies:
   # preview (video_player; Android/iOS/macOS/web only — on
   # Windows the preview falls back to the in-app browser).
   video_player: ^2.9.1
+  # v158 — cover frame ("thumbnail") for a finished animation
+  # video, sent to the panel as the record's thumbUrl. Android +
+  # iOS only (MediaMetadataRetriever; no Windows/macOS/web
+  # implementation) — on desktop the capture is skipped and the
+  # video uploads without a cover (see lib/video_cover.dart).
+  video_thumbnail: ^0.5.6
   file_picker: ^8.1.2
   image: ^4.2.0
   archive: ^3.6.1

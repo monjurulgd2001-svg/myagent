@@ -18,6 +18,8 @@ import 'package:flutter/material.dart';
 
 import 'animation_engine.dart';
 import 'animation_models.dart';
+import 'meta_card_style.dart';
+import 'models.dart';
 import 'voice_prompt.dart';
 
 class AnimationSection extends StatefulWidget {
@@ -63,6 +65,11 @@ class _AnimationSectionState extends State<AnimationSection> {
   bool _listening = false;
   // v133 — Animation gallery grid columns (1..6, default 3 like generate-main).
   int _gridCols = 3;
+  // v159 second pass — per-video metadata expand state: the image
+  // card's single shared bool cannot be reused across a list (one
+  // tap would expand every card). One video id in here = its
+  // metadata block is expanded.
+  final Set<String> _expandedVideoMeta = {};
   final _scrollCtrl = ScrollController();
   final _galleryKey = GlobalKey();
   int _seenVideoCount = 0;
@@ -1016,6 +1023,17 @@ class _AnimationSectionState extends State<AnimationSection> {
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(fontSize: 10, color: _cs.onSurfaceVariant),
               ),
+              // v157 — the panel section this video will upload
+              // to (its own choice, Charging Animation by
+              // default). Read-only here — change it on the list
+              // card (1 column). One line, so the tile never grows.
+              Text(
+                'Panel: ${videoPanelTypeLabel(v.panelType)}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 10, color: _cs.onSurfaceVariant),
+              ),
               // v154 — honest fps note: the clip came back under
               // 60fps, say so on the card (the cardLine already
               // shows the real fps number).
@@ -1029,6 +1047,29 @@ class _AnimationSectionState extends State<AnimationSection> {
                   style: const TextStyle(
                       fontSize: 10, color: Color(0xFFFFB020)),
                 ),
+              ],
+              // v159 second pass — over-target file: Gemini gave a
+              // bigger file than the 10 MB asked for — say so on
+              // the card instead of silently accepting it. The
+              // video itself stays usable.
+              if (v.sizeNote.isNotEmpty) ...[
+                const SizedBox(height: 2),
+                Text(
+                  v.sizeNote,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                      fontSize: 10, color: Color(0xFFFFB020)),
+                ),
+              ],
+              // v156 — metadata attached to the tile too (compact):
+              // the grid is the default view, so a video's metadata
+              // must be visible there as well, not only on the
+              // list card.
+              if (v.hasMetadata) ...[
+                const SizedBox(height: 4),
+                _videoMetaBlock(v, compact: true),
               ],
             ],
           ),
@@ -1087,7 +1128,14 @@ class _AnimationSectionState extends State<AnimationSection> {
       builder: (ctx, constraints) {
         final count = _gridCols.clamp(1, 6);
         final cellW = (constraints.maxWidth - (count - 1) * 10) / count;
-        final imgH = cellW / 0.60;
+        // v156 — the compact tile carries the metadata block now
+        // (description up to 2 lines + tag row, ~60px), so the
+        // tile must grow by that much when any video has metadata —
+        // otherwise the fixed imgH overflows by ~13px on a phone.
+        // The column centres the content, so tiles without metadata
+        // just get a little breathing room.
+        final hasMeta = engine.videos.any((v) => v.hasMetadata);
+        final imgH = cellW / 0.60 + (hasMeta ? 64 : 0);
         return GridView.builder(
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
@@ -1347,8 +1395,12 @@ class _AnimationSectionState extends State<AnimationSection> {
       ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            Row(
+              children: [
             InkWell(
               key: ValueKey('animPlay-${v.id}'),
               onTap: () => widget.onPlay(v),
@@ -1406,6 +1458,20 @@ class _AnimationSectionState extends State<AnimationSection> {
                           fontSize: 11, color: Color(0xFFFFB020)),
                     ),
                   ],
+                  // v159 second pass — over-target file: Gemini gave
+                  // a bigger file than the 10 MB asked for — say so
+                  // on the card instead of silently accepting it.
+                  // The video itself stays usable.
+                  if (v.sizeNote.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      v.sizeNote,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                          fontSize: 11, color: Color(0xFFFFB020)),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1447,8 +1513,283 @@ class _AnimationSectionState extends State<AnimationSection> {
               color: _cs.onSurface.withValues(alpha: 0.54),
               onPressed: () => widget.onDelete(v),
             ),
+              ],
+            ),
+            // v157 — per-video panel section (user decision
+            // 2026-11-22): the panel files by the record's
+            // contentType, so the card picks it before upload —
+            // Charging Animation by default. Locked once the
+            // video is queued (changing it after upload would
+            // not re-file the record already in Firebase).
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Text('Panel:',
+                      style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: _cs.onSurface.withValues(alpha: 0.7))),
+                  _panelTypeChip(v, kVideoPanelTypeCharging, busy),
+                  _panelTypeChip(v, kVideoPanelTypeLive, busy),
+                ],
+              ),
+            ),
+            // v156 — the video's AI metadata attached to its card
+            // (see _videoMetaBlock): image cards show metadata with
+            // the image, video cards only hid it behind the
+            // sparkle-icon dialog. The card stays compact when no
+            // metadata was generated yet.
+            if (v.hasMetadata) _videoMetaBlock(v),
           ],
         ),
+      ),
+    );
+  }
+
+  /// v157 — one panel-type chip on the video card. Tapping
+  /// persists the choice on the video (engine.setVideoPanelType)
+  /// so the next upload — single or Upload-all — sends it as the
+  /// record's contentType, which is the section the panel files
+  /// it under. Disabled once the video is queued or busy.
+  Widget _panelTypeChip(AnimationVideo v, String type, bool busy) {
+    final selected = v.panelType == type;
+    final locked = busy || v.isUploaded;
+    return ChoiceChip(
+      key: ValueKey(
+          'animPanelType-${type == kVideoPanelTypeLive ? 'live' : 'charging'}-${v.id}'),
+      label: Text(videoPanelTypeLabel(type),
+          style: const TextStyle(fontSize: 11)),
+      selected: selected,
+      onSelected: locked
+          ? null
+          : (_) => widget.engine.setVideoPanelType(v, type),
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      labelPadding: const EdgeInsets.symmetric(horizontal: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+    );
+  }
+
+  /// v156 — the video's AI metadata attached to its card, the same
+  /// way image cards show metadata with the image: category pill +
+  /// description + tag chips. [compact] is the grid tile (centred,
+  /// smaller, tags in one scrollable row); the list card gets the
+  /// full mirrored block (see [_videoMetaCard]). Only called when
+  /// [v.hasMetadata] is true.
+  Widget _videoMetaBlock(AnimationVideo v, {bool compact = false}) {
+    final meta = v.metadata!;
+    if (!compact) return _videoMetaCard(v, meta);
+    final descStyle = TextStyle(
+        fontSize: compact ? 10 : 12,
+        color: _cs.onSurface.withValues(alpha: 0.7));
+    final tagStyle = TextStyle(
+        fontSize: compact ? 9 : 11,
+        color: _cs.onSurface.withValues(alpha: 0.7));
+    Widget tagChip(String t) => Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: _cs.surfaceContainerHigh,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: _cs.outlineVariant),
+          ),
+          child: Text(t, style: tagStyle),
+        );
+    final tags = meta.tags.isEmpty
+        ? const SizedBox.shrink()
+        : compact
+            ? SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    for (var i = 0; i < meta.tags.length; i++) ...[
+                      if (i > 0) const SizedBox(width: 6),
+                      tagChip(meta.tags[i]),
+                    ],
+                  ],
+                ),
+              )
+            : Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [for (final t in meta.tags) tagChip(t)],
+              );
+    return Container(
+      key: ValueKey('animMetaBlock-${v.id}'),
+      width: double.infinity,
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(
+        crossAxisAlignment:
+            compact ? CrossAxisAlignment.center : CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (meta.category.isNotEmpty && !compact)
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: _cs.primary.withValues(alpha: 0.16),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(meta.category,
+                  style: TextStyle(fontSize: 12, color: _cs.primary)),
+            ),
+          if (meta.description.isNotEmpty) ...[
+            if (meta.category.isNotEmpty && !compact)
+              const SizedBox(height: 6),
+            Text(
+              meta.description,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              textAlign: compact ? TextAlign.center : TextAlign.start,
+              style: descStyle,
+            ),
+          ],
+          if (meta.tags.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            tags,
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// v159 second pass — the LIST-card metadata block mirrors the
+  /// IMAGE card (`_metaCard` in main.dart) exactly: same container,
+  /// title row (the video's AI title + the same filled purple
+  /// uppercase pill + sparkle button), same source line, same
+  /// description sizing/behaviour, same tags behaviour, same
+  /// 'Aro dekho' toggle with the same show rule. Styling values
+  /// come from lib/meta_card_style.dart (shared with `_metaCard`)
+  /// so the two cards cannot drift apart again. Expanded state is
+  /// PER-VIDEO (`_expandedVideoMeta`) — the image card's single
+  /// shared bool cannot be reused across a list. The sparkle
+  /// regenerates the video's metadata via [_onMetadataTap] (the
+  /// injected `widget.onMetadata`); videos also come from the
+  /// signed-in Gemini web session, so the source line is the same
+  /// hardcoded 'gemini-web (cookie)' (SetMetadata has no source
+  /// field). The compact grid-tile variant stays compact (see
+  /// [_videoMetaBlock]).
+  Widget _videoMetaCard(AnimationVideo v, SetMetadata meta) {
+    final expanded = _expandedVideoMeta.contains(v.id);
+    final showToggle = metaShowsExpandToggle(
+        description: meta.description, tagCount: meta.tags.length);
+    return Container(
+      key: ValueKey('animMetaBlock-${v.id}'),
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: _cs.surfaceContainer,
+        borderRadius: BorderRadius.circular(kMetaCardRadius),
+      ),
+      padding: kMetaCardPadding,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Text(meta.title,
+                    style: const TextStyle(
+                        fontSize: 19, fontWeight: FontWeight.w700)),
+              ),
+              if (meta.category.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: kMetaCategoryPillColor,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(meta.category.toUpperCase(),
+                      style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.8,
+                          color: Colors.white)),
+                ),
+              ],
+              IconButton(
+                tooltip: 'Rewrite with AI',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _onMetadataTap(v),
+                icon: Icon(Icons.auto_awesome,
+                    size: 20, color: _cs.onSurfaceVariant),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text('gemini-web (cookie)',
+              style: TextStyle(
+                  fontSize: 13.5, color: _cs.onSurfaceVariant)),
+          if (meta.description.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(meta.description,
+                maxLines: expanded ? null : 2,
+                overflow:
+                    expanded ? TextOverflow.visible : TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 15,
+                    height: 1.35,
+                    color: _cs.onSurface)),
+          ],
+          if (meta.tags.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            if (expanded)
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [for (final tag in meta.tags) metaTagChip(tag)],
+              )
+            else
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    for (var i = 0; i < meta.tags.length; i++) ...[
+                      if (i > 0) const SizedBox(width: 8),
+                      metaTagChip(meta.tags[i]),
+                    ],
+                  ],
+                ),
+              ),
+          ],
+          if (showToggle) ...[
+            const SizedBox(height: 8),
+            GestureDetector(
+              key: ValueKey('animMetaExpandToggle-${v.id}'),
+              onTap: () => setState(() {
+                if (expanded) {
+                  _expandedVideoMeta.remove(v.id);
+                } else {
+                  _expandedVideoMeta.add(v.id);
+                }
+              }),
+              behavior: HitTestBehavior.opaque,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(expanded ? 'Kom dekho' : 'Aro dekho',
+                      style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: _cs.primary)),
+                  const SizedBox(width: 2),
+                  Icon(
+                      expanded
+                          ? Icons.keyboard_arrow_up
+                          : Icons.keyboard_arrow_down,
+                      size: 16,
+                      color: _cs.primary),
+                ],
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }

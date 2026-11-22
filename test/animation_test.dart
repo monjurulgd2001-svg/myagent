@@ -606,6 +606,8 @@ void main() {
                 accountName: 'zedge_1',
                 firebaseKey: '-Nkey1',
                 metadata: v.metadata,
+                thumbUrl: null,
+            coverError: null,
               ));
       expect(
           await engine.uploadVideoToPanel(engine.videos.first,
@@ -644,6 +646,8 @@ void main() {
                 accountName: 'zedge_1',
                 firebaseKey: '-N${v.id}',
                 metadata: v.metadata,
+                thumbUrl: null,
+            coverError: null,
               ));
       await engine.load();
       expect(await engine.uploadAllToPanel(), 2);
@@ -677,7 +681,10 @@ void main() {
       expect(record['type'], 'video/mp4');
       expect(record['isVideo'], isTrue);
       expect(record['isImage'], isFalse);
-      expect(record['contentType'], 'LIVE_WALLPAPER');
+      // v157 — the default panel section is Charging Animation
+      // (was hardcoded LIVE_WALLPAPER, which filed every
+      // animation under Live Wallpaper in the panel).
+      expect(record['contentType'], 'CHARGING_ANIMATION');
       expect(record['width'], 1620);
       expect(record['height'], 2880);
       expect(record['durationSec'], 6);
@@ -702,11 +709,16 @@ void main() {
 
     test('StudioEngine.uploadVideoToPanel posts MP4 to R2 + record',
         () async {
-      http.Request? r2Req;
+      final r2Reqs = <http.Request>[];
       http.Request? fbReq;
       final client = MockClient((req) async {
         if (req.url.host == 'worker.example.com') {
-          r2Req = req;
+          r2Reqs.add(req);
+          if (req.headers['X-File-Type'] == 'image/jpeg') {
+            return http.Response(
+                '{"url": "https://r2.example.com/zedge1/wallpaper/123_neon-blue-phone_thumb.jpg"}',
+                200);
+          }
           return http.Response(
               '{"url": "https://r2.example.com/zedge1/wallpaper/123_neon-blue-phone.mp4"}',
               200);
@@ -731,24 +743,37 @@ void main() {
           'defaultTarget': 'spread',
         }),
       });
-      final engine = StudioEngine(client: client);
+      // v159 second pass — the thumbnail guarantee: the upload
+      // now needs a real cover capture (the default returns null
+      // on this desktop host, which would block the upload).
+      final engine = StudioEngine(
+        client: client,
+        coverCapture: (path, {int timeMs = 1000}) async =>
+            Uint8List.fromList([0xFF, 0xD8, 0xFF, 0xD9]),
+      );
       final v = testVideo(metadata: fakeMeta());
       final r = await engine.uploadVideoToPanel(v);
       expect(r.accountName, 'zedge_1');
       expect(r.firebaseKey, '-Nkey1');
       expect(r.metadata?.title, 'Neon Blue Phone');
-      expect(r2Req?.headers['X-File-Type'], 'video/mp4');
-      expect(r2Req?.headers['X-File-Name'], contains('wallpaper/'));
-      expect(r2Req?.headers['X-File-Name'], endsWith('.mp4'));
+      // The MP4 went to R2 first, then the cover beside it.
+      final mp4Req = r2Reqs.firstWhere(
+          (req) => req.headers['X-File-Type'] == 'video/mp4');
+      expect(mp4Req.headers['X-File-Name'], contains('wallpaper/'));
+      expect(mp4Req.headers['X-File-Name'], endsWith('.mp4'));
+      expect(r.thumbUrl, contains('_thumb.jpg'));
       final record =
           jsonDecode(utf8.decode(fbReq!.bodyBytes)) as Map<String, dynamic>;
       expect(record['type'], 'video/mp4');
       expect(record['isVideo'], isTrue);
-      expect(record['contentType'], 'LIVE_WALLPAPER');
+      expect(record['contentType'], 'CHARGING_ANIMATION');
       expect(record['title'], 'Neon Blue Phone');
       expect(record['tagsList'], ['neon', 'phone', 'charging']);
       expect(record['status'], 'queued');
       expect(record['prompt'], 'neon blue phone');
+      // The record carries the cover: a panel card never ships
+      // without a thumbnail (v159 second-pass guarantee).
+      expect(record['thumbUrl'], r.thumbUrl);
     });
 
     test('StudioEngine.uploadVideoToPanel throws when unconfigured',
@@ -1139,6 +1164,11 @@ void main() {
       expect(find.byKey(const ValueKey('animMeta-v1')), findsOneWidget);
       expect(find.byKey(const ValueKey('animUpload-v1')), findsOneWidget);
       expect(find.byKey(const ValueKey('animUploadAll')), findsOneWidget);
+      // v156 — the metadata is attached to the card itself now
+      // (description + tags on the tile), not only behind the
+      // sparkle-icon dialog — so it is visible before any tap.
+      expect(find.text('A neon blue phone charging.'), findsOneWidget);
+      expect(find.text('neon'), findsOneWidget);
       // The card sits below the prompt card on the phone scroll
       // view — scroll it into view before tapping (otherwise the
       // tap misses and the dialog never opens).
@@ -1146,10 +1176,20 @@ void main() {
       await tester.pump(const Duration(milliseconds: 200));
       await tester.tap(find.byKey(const ValueKey('animMeta-v1')));
       await tester.pump();
-      expect(find.text('Neon Blue Phone'), findsOneWidget);
-      expect(find.text('DESIGNS'), findsOneWidget);
-      expect(find.text('A neon blue phone charging.'), findsOneWidget);
-      expect(find.text('neon'), findsOneWidget);
+      // The description + tag now appear twice (card + dialog),
+      // so scope the dialog assertions to the dialog itself.
+      final dialog = find.byType(AlertDialog);
+      expect(find.descendant(of: dialog, matching: find.text('Neon Blue Phone')),
+          findsOneWidget);
+      expect(find.descendant(of: dialog, matching: find.text('DESIGNS')),
+          findsOneWidget);
+      expect(
+          find.descendant(
+              of: dialog,
+              matching: find.text('A neon blue phone charging.')),
+          findsOneWidget);
+      expect(find.descendant(of: dialog, matching: find.text('neon')),
+          findsOneWidget);
       await tester.tap(find.text('Close'));
       await tester.pump();
       expect(find.text('Neon Blue Phone'), findsNothing);

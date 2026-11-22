@@ -26,6 +26,15 @@ let pendingVideo = null;
 // v151 — a queued video job older than this is dropped (Dart gave up
 // long before; it must not start hours later on its own).
 const VIDEO_QUEUE_MAX_MS = 240000;
+// v159: same queue for cover-frame captures: the hidden
+// file:// cover tab may still be loading when the app asks for a
+// frame. Jobs are delivered to the cover tab ONLY — never to a
+// Gemini tab (the backend session must stay on the Gemini page).
+let coverTab = null;
+let pendingCoverCapture = [];
+// v159: a queued cover job older than this is dropped (Dart gave
+// up long before; a late frame would answer a dead request id).
+const COVER_CAPTURE_MAX_MS = 120000;
 // v98: same queue for page-transport fetches (backendFetch): the
 // headless Gemini tab may still be loading when the first backend
 // job arrives. Jobs are delivered to ONE tab only — a setup/task
@@ -188,14 +197,45 @@ function fromApp(msg) {
         pendingSessionPage.push(sJob);
       }
       break;
+    case "coverCapture":
+      // v159: cover frame for a finished video, canvas-captured
+      // in a hidden file:// tab (Gecko software-decodes the MP4
+      // the phone's hardware decoder rejects). Sent ONLY to the
+      // cover tab — never to a Gemini tab. Queued when the tab
+      // is still loading; the app's own timeout bounds the wait.
+      const cJob = { type: "coverCapture", id: msg.id, path: msg.path, timeMs: msg.timeMs || 1000 };
+      if (coverTab) {
+        try { coverTab.postMessage(cJob); } catch (e) { pendingCoverCapture.push(Object.assign({}, cJob, { at: Date.now() })); }
+      } else {
+        pendingCoverCapture.push(Object.assign({}, cJob, { at: Date.now() }));
+      }
+      break;
   }
 }
 
 browser.runtime.onConnect.addListener((p) => {
-  if (p.name !== "ais-tab" && p.name !== "ais-gemini") return;
+  if (p.name !== "ais-tab" && p.name !== "ais-gemini" && p.name !== "ais-cover") return;
   p.isGemini = p.name === "ais-gemini";
-  tabs.add(p);
-  p.postMessage({ type: "basket", srcs: basket.srcs, v: basket.v, pages: basket.pages });
+  p.isCover = p.name === "ais-cover";
+  // v159: the cover tab is tracked on its own — it never joins
+  // `tabs`, so basket / status / toast broadcasts and the Gemini
+  // routing (video / backendFetch / sessionPage) can never reach
+  // it, and it can never steal a Gemini job.
+  if (p.isCover) {
+    coverTab = p;
+    // Deliver a queued cover job to the tab that just connected.
+    if (pendingCoverCapture.length > 0) {
+      const queued = pendingCoverCapture;
+      pendingCoverCapture = [];
+      for (const job of queued) {
+        if (Date.now() - (job.at || 0) > COVER_CAPTURE_MAX_MS) continue;
+        try { p.postMessage({ type: "coverCapture", id: job.id, path: job.path, timeMs: job.timeMs }); } catch (e) {}
+      }
+    }
+  } else {
+    tabs.add(p);
+    p.postMessage({ type: "basket", srcs: basket.srcs, v: basket.v, pages: basket.pages });
+  }
   // v89: deliver a queued video job to the first Gemini tab.
   if (pendingVideo && isGeminiTab(p)) {
     const pv = pendingVideo;
@@ -227,9 +267,9 @@ browser.runtime.onConnect.addListener((p) => {
       pendingSessionPage.push({ type: "sessionPage", id: m.id });
       return;
     }
-    if (m && (m.type === "q" || m.type === "backendFetch" || m.type === "sessionPage") && port) port.postMessage(m);
+    if (m && (m.type === "q" || m.type === "backendFetch" || m.type === "sessionPage" || m.type === "coverCapture") && port) port.postMessage(m);
   });
-  p.onDisconnect.addListener(() => tabs.delete(p));
+  p.onDisconnect.addListener(() => { tabs.delete(p); if (coverTab === p) coverTab = null; });
 });
 
 function connect() {

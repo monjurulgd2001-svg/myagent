@@ -484,6 +484,93 @@ object GeckoBridge {
         post(JSONObject().put("cmd", "videoCancel").put("jobId", jobId))
     }
 
+    // ------------------------------------------------- v159: cover frame
+    /**
+     * Cover frame for a finished animation video, captured through
+     * the headless browser instead of MediaMetadataRetriever.
+     *
+     * Live 2026-11-22: the hardware capture returned null for a
+     * valid Gemini MP4 (H.264 High @ Level 5.2, 1620x2880 @ 60fps)
+     * on TECNO CAMON 30S — the phone's hardware decoder cannot
+     * decode it, the same decoder that already failed video
+     * preview in v156. Gecko bundles its own software decoders,
+     * so the frame is drawn from the video in a hidden tab.
+     *
+     * A SEPARATE hidden session loads file://<mp4> — the backend
+     * session must stay on the Gemini page and is never navigated
+     * away. The extension's content script (matches <all_urls>)
+     * runs on the file page too and answers `coverCapture` from
+     * background.js; the frame comes back as a JPEG data: URL and
+     * is decoded here to bytes. Answers null (ByteArray? = null)
+     * on any failure or timeout — Dart uploads the video without
+     * a cover and logs the reason. One fresh session per capture:
+     * a stale tab would answer for the wrong file.
+     */
+    private var coverSession: GeckoSession? = null
+
+    fun captureVideoCover(context: Context, json: String, result: MethodChannel.Result) {
+        val o = try {
+            JSONObject(json)
+        } catch (_: Exception) {
+            result.success(null)
+            return
+        }
+        val path = o.optString("path")
+        val timeMs = o.optInt("timeMs", 1000)
+        if (path.isEmpty()) {
+            result.success(null)
+            return
+        }
+        try {
+            coverSession?.close()
+        } catch (_: Exception) {
+        }
+        coverSession = null
+        val session = GeckoSession(
+            GeckoSessionSettings.Builder()
+                .usePrivateMode(false)
+                .useTrackingProtection(false)
+                .build()
+        )
+        session.open(runtime(context))
+        session.setActive(true)
+        coverSession = session
+        var answered = false
+        val answer: (ByteArray?) -> Unit = { bytes ->
+            if (!answered) {
+                answered = true
+                try {
+                    session.close()
+                } catch (_: Exception) {
+                }
+                if (coverSession === session) coverSession = null
+                result.success(bytes)
+            }
+        }
+        // 60s: the local file loads fast, but the first load also
+        // spins up the content process + software decoder, and the
+        // extension queues the job until the cover tab connects.
+        request(context, JSONObject().put("cmd", "coverCapture")
+            .put("path", path).put("timeMs", timeMs), 60000) { reply ->
+            val data = reply?.optString("data")
+            if (reply == null || data.isNullOrEmpty() ||
+                !data.startsWith("data:image/jpeg;base64,")) {
+                Log.w("GeckoBridge", "coverCapture failed: " +
+                    (reply?.optString("error") ?: "no reply"))
+                answer(null)
+                return@request
+            }
+            try {
+                answer(android.util.Base64.decode(
+                    data.substringAfter(','), android.util.Base64.DEFAULT))
+            } catch (e: Exception) {
+                Log.w("GeckoBridge", "coverCapture bad data: $e")
+                answer(null)
+            }
+        }
+        session.loadUri(android.net.Uri.fromFile(java.io.File(path)).toString())
+    }
+
     /** v136: runs a video job inside the 100% INVISIBLE headless
      *  GeckoSession (no Activity, no visible browser window) so
      *  Gemini's own JS handles chooseServer, encrypted f4/f5 tokens,

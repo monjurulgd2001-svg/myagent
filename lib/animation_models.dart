@@ -70,6 +70,20 @@ AnimationModel animationModelById(String id) => kAnimationModels.firstWhere(
       orElse: () => kAnimationModels[2],
     );
 
+/// v159 second pass — file-size ask: the user ordered generated
+/// files to stay within 5–10 MB; the live "Copper Pine Energy
+/// Surge" clip came back 36,279,534 bytes (29 Mbps H.264). The MP4
+/// is rendered by GEMINI's encoder, not the app — the app cannot
+/// re-encode it on the phone (no ffmpeg in the app; Android
+/// MediaCodec cannot even decode these files; a browser
+/// MediaRecorder re-encode would change the format to WebM,
+/// breaking the MP4 the panel/Zedge bot expects) — so the prompt
+/// ASKS for an efficiently compressed small file. It is an ask,
+/// not a guarantee: the card measures the real size and names it
+/// when Gemini gives a bigger file (see sizeNote).
+const String kAnimationSizeAsk =
+    ', efficiently compressed small file under 10 MB, mobile-optimized H.264';
+
 /// The Zedge spec the section appends to every animation prompt
 /// (mirrors the prompt the user sent Neon himself: "1620x2880 9:16
 /// 60fps creative thought, realistic no logo"). The loop phrase
@@ -156,8 +170,39 @@ AnimationMood animationMoodById(String id) =>
 const List<int> kAnimationDurations = [6, 8, 10];
 const int kDefaultAnimationDurationSec = 10;
 
+/// v159 second pass — the file-size target (user order 2026-11-22:
+/// generated files must stay within 5–10 MB; the live "Copper Pine
+/// Energy Surge" clip came back 36,279,534 bytes). Decimal MB, so
+/// the card's number matches the byte count he knows (36.3 MB for
+/// that file). The target is an ASK in the prompt (see
+/// kAnimationSizeAsk) and a NOTE on the card (see sizeNote) — the
+/// app cannot force Gemini's encoder, and size never blocks the
+/// video itself (unlike the thumbnail guarantee).
+const int kVideoTargetMaxSizeBytes = 10 * 1000 * 1000;
+
 /// v88 — seamless loop on by default (today's behaviour).
 const bool kDefaultAnimationSeamless = true;
+
+/// v157 — the panel section a finished video uploads to. The
+/// panel has no generic "Animation" type: its video types are
+/// only Live Wallpaper and Charging Animation, and it files by
+/// the record's contentType verbatim — so the choice lives on
+/// the video and is written into the queue record at upload
+/// time. Default is Charging Animation (user decision
+/// 2026-11-22: per-video choice, not all-to-Charging).
+const String kVideoPanelTypeCharging = 'CHARGING_ANIMATION';
+const String kVideoPanelTypeLive = 'LIVE_WALLPAPER';
+const String kDefaultVideoPanelType = kVideoPanelTypeCharging;
+
+/// Normalises any stored/unknown panel type to one of the two
+/// the panel knows — unknown values fall back to Charging
+/// Animation instead of mis-filing the video.
+String normalizeVideoPanelType(String? raw) =>
+    raw == kVideoPanelTypeLive ? kVideoPanelTypeLive : kVideoPanelTypeCharging;
+
+/// Short label for the panel-type chips on the video card.
+String videoPanelTypeLabel(String type) =>
+    type == kVideoPanelTypeLive ? 'Live Wallpaper' : 'Charging Animation';
 
 /// v88 — copyright-risk terms. If the prompt names one of these,
 /// the video could be a copy of someone's brand, character or
@@ -300,6 +345,14 @@ String buildAnimationPrompt(
   } else {
     out.write(kAnimationSpecSuffix);
   }
+  // v159 second pass — the size ask rides on EVERY prompt (both
+  // branches: the size branch above skips the spec suffix, so
+  // this lives outside the if/else). Short, so it does not dilute
+  // the rest of the prompt; skipped only when the user already
+  // asked for a small file themselves.
+  if (!lower.contains('under 10 mb') && !lower.contains('10 mb')) {
+    out.write(kAnimationSizeAsk);
+  }
   if (fpsRetry) {
     out.write(', IMPORTANT: render this at 60 frames per second '
         '(60fps) — smooth high-frame-rate motion, NOT 30fps');
@@ -339,6 +392,16 @@ class AnimationVideo {
   final int fps;
   final double durationSec;
   final int sizeBytes;
+  // v157 — the panel section this video uploads to (per-video
+  // choice on the card, default Charging Animation). Persisted
+  // with the video so Upload-all uses each video's own choice.
+  final String panelType;
+  // v158 — the panel cover URL for this video (uploaded beside
+  // the MP4 as the record's thumbUrl). Persisted with the video
+  // so a re-upload/retry reuses the same cover instead of
+  // capturing and uploading the frame again. Empty when the
+  // video has never carried a cover.
+  final String thumbUrl;
   final DateTime createdAt;
   final SetMetadata? metadata;
   final Map<String, dynamic>? uploadedToPanel;
@@ -357,6 +420,8 @@ class AnimationVideo {
     this.fps = 60,
     this.durationSec = 0,
     this.sizeBytes = 0,
+    this.panelType = kDefaultVideoPanelType,
+    this.thumbUrl = '',
     required this.createdAt,
     this.metadata,
     this.uploadedToPanel,
@@ -371,6 +436,14 @@ class AnimationVideo {
     double? durationSec,
     int? width,
     int? height,
+    // v159 second pass — the measured file size (load() re-probes
+    // it from the file; without this the size could never be
+    // corrected after the fact).
+    int? sizeBytes,
+    // v157 — the per-video panel section choice.
+    String? panelType,
+    // v158 — the cached panel cover URL (reused on re-upload).
+    String? thumbUrl,
   }) =>
       AnimationVideo(
         id: id,
@@ -385,7 +458,9 @@ class AnimationVideo {
         height: height ?? this.height,
         fps: fps ?? this.fps,
         durationSec: durationSec ?? this.durationSec,
-        sizeBytes: sizeBytes,
+        sizeBytes: sizeBytes ?? this.sizeBytes,
+        panelType: panelType ?? this.panelType,
+        thumbUrl: thumbUrl ?? this.thumbUrl,
         createdAt: createdAt,
         metadata: metadata ?? this.metadata,
         uploadedToPanel: uploadedToPanel ?? this.uploadedToPanel,
@@ -419,18 +494,40 @@ class AnimationVideo {
   double get displayDurationSec =>
       durationSec > 0 ? durationSec : requestedDurationSec.toDouble();
 
+  /// v159 second pass — honest size note: the clip was ASKED for
+  /// under 10 MB (see kAnimationSizeAsk), but Gemini's encoder
+  /// decides — so a file over the target says so on the card
+  /// instead of the size being silently accepted. Empty when the
+  /// file is within target (or the size was never measured).
+  /// The video itself stays usable: size never blocks anything
+  /// (unlike the thumbnail guarantee).
+  bool get isOverTargetSize => sizeBytes > kVideoTargetMaxSizeBytes;
+
+  /// The measured file size in decimal MB ("36.3 MB" for the live
+  /// 36,279,534-byte file) — decimal, so the card's number matches
+  /// the byte count. Empty when the size was never measured.
+  String get sizeLabel => sizeBytes > 0
+      ? '${(sizeBytes / 1000000).toStringAsFixed(1)} MB'
+      : '';
+
+  String get sizeNote => isOverTargetSize
+      ? 'Gemini 10 MB-er boro file diyeche — $sizeLabel (10 MB chawa hoyechilo)'
+      : '';
+
   String get specLine {
     // v154 — duration = what was produced (else what was asked);
     // fps = the file's REAL fps, left out entirely when it was
     // never measured (fps 0) instead of claiming a hardcoded 60 —
     // live 2026-11-22 the file was 30fps while the card said 60fps.
+    // v159 second pass — the size is the MEASURED file size in
+    // decimal MB (36,279,534 bytes reads "36.3 MB"); the model
+    // field is set at save time (_finishBytes) and re-probed on
+    // load, so the card never shows a size that was only asked for.
     final dur = displayDurationSec > 0
         ? '${displayDurationSec.toStringAsFixed(0)}s · '
         : '';
     final fpsPart = fps > 0 ? ' · ${fps}fps' : '';
-    final size = sizeBytes > 0
-        ? ' · ${(sizeBytes / 1048576).toStringAsFixed(1)} MB'
-        : '';
+    final size = sizeLabel.isEmpty ? '' : ' · $sizeLabel';
     return '$dur${width}x$height$fpsPart$size';
   }
 
@@ -460,6 +557,8 @@ class AnimationVideo {
         'fps': fps,
         'durationSec': durationSec,
         'sizeBytes': sizeBytes,
+        'panelType': panelType,
+        'thumbUrl': thumbUrl,
         'createdAt': createdAt.toIso8601String(),
         if (metadata != null) 'metadata': metadata!.toJson(),
         if (uploadedToPanel != null) 'uploadedToPanel': uploadedToPanel,
@@ -495,6 +594,8 @@ class AnimationVideo {
         fps: (j['fps'] as num?)?.toInt() ?? 60,
         durationSec: (j['durationSec'] as num?)?.toDouble() ?? 0,
         sizeBytes: (j['sizeBytes'] as num?)?.toInt() ?? 0,
+        panelType: normalizeVideoPanelType(j['panelType']?.toString()),
+        thumbUrl: (j['thumbUrl'] ?? '').toString(),
         createdAt: DateTime.tryParse((j['createdAt'] ?? '').toString()) ??
             DateTime.fromMillisecondsSinceEpoch(0),
         metadata: meta,

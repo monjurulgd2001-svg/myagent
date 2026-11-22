@@ -2,11 +2,15 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:ui';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
+import '../mp4_info.dart';
 import '../video_playback.dart';
+import 'gecko_video_view.dart';
+import 'video_preview_wrapper.dart';
 
 /// Realistic phone mockup preview: shows a generated wallpaper as it
 /// would look on a device — plain wallpaper, lock screen, home screen,
@@ -187,11 +191,18 @@ Future<void> showDevicePreview(
 /// MP4 plays (looping, muted) in the mockup's screen area, so he
 /// sees the live wallpaper on a device. [onOpenInBrowser] is the
 /// fallback (in-app browser) when the in-frame player cannot play.
+///
+/// v156 — [videoBrowserViewBuilder] is the test seam for the
+/// decoder fallback: when the phone's hardware decoder rejects the
+/// video, the mockup embeds the in-app browser engine (GeckoView)
+/// instead. Defaults to the real [GeckoVideoView]; tests inject a
+/// fake widget so no Android platform view is created.
 Future<void> showDeviceVideoPreview(
   BuildContext context, {
   required String videoPath,
   required String title,
   VoidCallback? onOpenInBrowser,
+  Widget Function(String fileUrl)? videoBrowserViewBuilder,
 }) {
   return showDialog(
     context: context,
@@ -199,6 +210,7 @@ Future<void> showDeviceVideoPreview(
       videoPath: videoPath,
       title: title,
       onOpenInBrowser: onOpenInBrowser,
+      videoBrowserViewBuilder: videoBrowserViewBuilder,
     ),
   );
 }
@@ -215,6 +227,11 @@ class _DevicePreviewDialog extends StatefulWidget {
 
   /// v141 — fallback when the in-frame player cannot play the video.
   final VoidCallback? onOpenInBrowser;
+
+  /// v156 — test seam for the decoder fallback's embedded browser
+  /// view (defaults to the real GeckoVideoView).
+  final Widget Function(String fileUrl)? videoBrowserViewBuilder;
+
   const _DevicePreviewDialog({
     this.imageUrl,
     required this.title,
@@ -222,6 +239,7 @@ class _DevicePreviewDialog extends StatefulWidget {
     this.initialIndex = 0,
     this.videoPath,
     this.onOpenInBrowser,
+    this.videoBrowserViewBuilder,
   }) : assert(imageUrl != null || videoPath != null,
             'Device preview needs an image or a video');
 
@@ -240,6 +258,25 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
   bool _videoReady = false;
   bool _videoPlaying = false;
   String? _videoError;
+
+  /// v156 — decoder fallback: the phone's hardware decoder
+  /// (ExoPlayer/MediaCodec) rejected the video, so the mockup
+  /// plays it in the embedded browser engine (GeckoView) instead.
+  /// [_decoderNote] is the Banglish explanation + the measured
+  /// codec line shown with it. [_fallbackDone] guards the
+  /// switch so it fires exactly once (init error + runtime
+  /// error can both arrive for the same failure).
+  /// v159 second pass — [_browserFallbackUrl] is the wrapper page
+  /// URL the browser view loads (see video_preview_wrapper.dart),
+  /// and [_browserFallbackWrapperPath] is the sidecar file behind
+  /// it, deleted when the dialog closes. The note itself is NEVER
+  /// drawn over the video anymore — it lives under the mockup
+  /// (the hint line) instead.
+  bool _browserFallback = false;
+  String? _decoderNote;
+  String? _browserFallbackUrl;
+  String? _browserFallbackWrapperPath;
+  bool _fallbackDone = false;
 
   String get _currentImageUrl {
     final s = widget.stages;
@@ -270,7 +307,17 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
 
   @override
   void dispose() {
+    _videoCtl?.removeListener(_onVideoValue);
     _videoCtl?.dispose();
+    // v159 second pass — the preview wrapper is a sidecar of this
+    // dialog; remove it when the dialog closes (best effort — the
+    // video file itself is never touched).
+    final wrapperPath = _browserFallbackWrapperPath;
+    if (wrapperPath != null) {
+      try {
+        File(wrapperPath).deleteSync();
+      } catch (_) {}
+    }
     _foldCtl.dispose();
     super.dispose();
   }
@@ -279,6 +326,15 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
   /// (looping, muted — a live wallpaper has no sound). A failure
   /// (e.g. no player on Windows) lands in [_videoError] and the
   /// dialog offers the in-app browser fallback instead.
+  ///
+  /// v156 — a DECODER failure (the phone's hardware decoder
+  /// rejects the stream — live 2026-11-22:
+  /// MediaCodecVideoRenderer error on TECNO CAMON 30S) switches
+  /// the mockup to the embedded browser engine instead, so the
+  /// preview still plays ON THE DEVICE, inside the phone frame.
+  /// The switch also catches errors that arrive after init, via
+  /// [_onVideoValue] (video_player reports those as
+  /// value.hasError, not as a thrown exception).
   Future<void> _initVideo() async {
     final path = widget.videoPath;
     if (path == null) return;
@@ -296,6 +352,8 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
     _videoCtl = ctl;
     try {
       await ctl.initialize();
+      if (!mounted) return;
+      ctl.addListener(_onVideoValue);
       await ctl.setLooping(true);
       await ctl.setVolume(0);
       await ctl.play();
@@ -306,8 +364,82 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
       });
     } catch (e) {
       if (!mounted) return;
+      // A decoder error never shows the raw PlatformException as
+      // the end state — the mockup switches to the browser view.
+      if (isDecoderError(e.toString())) {
+        _enterBrowserFallback(e.toString());
+        return;
+      }
       setState(() => _videoError = e.toString());
     }
+  }
+
+  /// Runtime player errors (after init succeeded): the platform
+  /// reports them as value.hasError. A decoder error switches to
+  /// the browser view; any other error shows the error screen.
+  void _onVideoValue() {
+    final ctl = _videoCtl;
+    if (ctl == null || !ctl.value.hasError) return;
+    final desc = ctl.value.errorDescription ?? '';
+    if (!mounted) return;
+    if (isDecoderError(desc)) {
+      _enterBrowserFallback(desc);
+      return;
+    }
+    setState(() => _videoError = desc);
+  }
+
+  /// v156 — switch the mockup's screen to the embedded browser
+  /// engine (GeckoView) and explain why, with the file's measured
+  /// codec line so the next diagnosis is grounded. Fires once.
+  /// The failed video_player controller is released; the browser
+  /// view plays the same local file. Never throws. Synchronous
+  /// (see readMp4MoovBytes): the probe must complete in the
+  /// dialog's fake-async test zone as well as on the device.
+  /// v159 second pass — the browser view loads the WRAPPER page
+  /// (see video_preview_wrapper.dart), not the raw MP4 URL: the
+  /// wrapper's cover-fit <video> fills the screen with no browser
+  /// chrome and no black bars. The decoder note is kept for the
+  /// hint line UNDER the mockup — it is never drawn over the
+  /// video anymore.
+  void _enterBrowserFallback(String rawError) {
+    if (_fallbackDone) return;
+    _fallbackDone = true;
+    final path = widget.videoPath;
+    String codecLine = 'Codec jana jayni';
+    if (path != null) {
+      final moov = readMp4MoovBytes(path);
+      if (moov != null) {
+        final codec = readMp4VideoCodec(moov);
+        final info = readMp4Info(moov);
+        if (codec != null) {
+          final fps =
+              info != null && info.fps > 0 ? ' · ${info.fps}fps' : '';
+          codecLine = '${codec.label}$fps';
+        }
+      }
+    }
+    // v159 second pass — wrapper page beside the MP4 (best
+    // effort: null falls back to the raw MP4 URL, old behaviour).
+    final wrapperUrl = path == null ? null : writeVideoPreviewWrapper(path);
+    final wrapperPath = wrapperUrl == null
+        ? null
+        : Uri.tryParse(wrapperUrl)?.toFilePath();
+    if (!mounted) return;
+    _videoCtl?.dispose();
+    _videoCtl = null;
+    if (!mounted) return;
+    setState(() {
+      _browserFallback = true;
+      _browserFallbackUrl = wrapperUrl;
+      _browserFallbackWrapperPath = wrapperPath;
+      _videoError = null;
+      _videoReady = false;
+      _videoPlaying = false;
+      _decoderNote = 'Phone-er decoder video-ta chalate pareni '
+          '($codecLine) — tai browser view-e cholche. Video-te tap '
+          'korle play/pause hobe.';
+    });
   }
 
   Future<void> _toggleVideo() async {
@@ -332,6 +464,31 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
   /// (cover-fit, like a real live wallpaper), a loader while it
   /// starts, or the error + browser fallback when it cannot play.
   Widget get _videoScreen {
+    // v156 — decoder fallback: the phone's hardware decoder
+    // rejected the file, so the mockup plays it in the embedded
+    // browser engine (GeckoView) — still ON THE DEVICE, inside
+    // the phone frame. The browser view has its own tap controls;
+    // the dialog's play/pause button stays disabled (it drives
+    // video_player, not the browser view).
+    // v159 second pass — the video area is COMPLETELY CLEAN: no
+    // text is ever drawn over the video (the old black54 note bar
+    // collided with the viewer's controls and covered the video).
+    // The browser view loads the WRAPPER page (cover-fit <video>,
+    // no browser chrome), not the raw MP4 URL — Gecko's built-in
+    // media viewer is never shown. The decoder note lives under
+    // the mockup (the hint line), never on the picture.
+    if (_browserFallback) {
+      final path = widget.videoPath!;
+      final fileUrl =
+          _browserFallbackUrl ?? Uri.file(path).toString();
+      final browserView = widget.videoBrowserViewBuilder?.call(fileUrl) ??
+          GeckoVideoView(fileUrl: fileUrl);
+      return Container(
+        key: const ValueKey('deviceVideoBrowserFallback'),
+        color: Colors.black,
+        child: browserView,
+      );
+    }
     if (_videoError != null) {
       return Container(
         color: Colors.black,
@@ -460,7 +617,17 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
     // Keep the zoomed phone inside the dialog width (no overflow clipping).
     final fitCap = clampDouble(
         (MediaQuery.of(context).size.width - 64) / _phoneWidth, 0.6, 2.0);
-    final effZoom = clampDouble(_zoom, 0.6, fitCap);
+    // v159 second pass — and inside the dialog HEIGHT: the header,
+    // chip rows, controls, hint and buttons around the phone take
+    // ~420dp, plus the 24dp shadow slack in the phone-area box, so
+    // on a short phone viewport the frame is shrunk to fit instead
+    // of the dialog scrolling with the frame cut off behind the
+    // controls (live 2026-11-22: big black area on top, bottom cut
+    // off). The scroll view stays as a safety net for very short
+    // viewports.
+    final heightCap = clampDouble(
+        (MediaQuery.of(context).size.height - 444) / 560, 0.6, 2.0);
+    final effZoom = clampDouble(_zoom, 0.6, min(fitCap, heightCap));
     return Dialog(
       insetPadding: const EdgeInsets.all(16),
       child: SingleChildScrollView(
@@ -555,13 +722,24 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
                         _rotX += d.delta.dy * 0.012;
                       }),
                       onDoubleTap: _resetView,
-                      child: Transform.scale(
-                        scale: effZoom,
-                        alignment: Alignment.center,
-                        child: _PhoneFrame(
-                          imageUrl: widget.videoPath == null
-                              ? _currentImageUrl
-                              : null,
+                      // v159 second pass — layout-affecting scale:
+                      // Transform.scale only shrinks the PAINTING
+                      // while the frame still lays out 572 tall,
+                      // so a small effZoom squashed the frame and
+                      // its screen content overflowed (lock overlay
+                      // +158px in the test viewport). FittedBox
+                      // scales the layout too, so the phone really
+                      // is effZoom-sized (572 must match
+                      // _PhoneFrame._h).
+                      child: SizedBox(
+                        width: _phoneWidth * effZoom,
+                        height: 572 * effZoom,
+                        child: FittedBox(
+                          fit: BoxFit.contain,
+                          child: _PhoneFrame(
+                            imageUrl: widget.videoPath == null
+                                ? _currentImageUrl
+                                : null,
                           screenChild: widget.videoPath == null
                               ? null
                               : _videoScreen,
@@ -579,6 +757,7 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
                   ),
                 ),
               ),
+            ),
               const SizedBox(height: 8),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -636,7 +815,14 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
               Text(
                   widget.videoPath == null
                       ? 'Drag to rotate 360 deg. Scroll or use the buttons to zoom. Double-tap to reset.'
-                      : 'Video-te tap korle play/pause hobe — lock/home mode-e dekhle live wallpaper kemon lagbe bujha jabe.',
+                      : _browserFallback
+                          // v159 second pass — the decoder note
+                          // (with the measured codec line) lives
+                          // HERE, under the mockup — never drawn
+                          // over the video.
+                          ? _decoderNote ??
+                              'Browser view-e cholche — video-te tap korle play/pause hobe.'
+                          : 'Video-te tap korle play/pause hobe — lock/home mode-e dekhle live wallpaper kemon lagbe bujha jabe.',
                   textAlign: TextAlign.center,
                   style: textTheme.bodySmall?.copyWith(
                       color: Theme.of(context).colorScheme.outline)),
