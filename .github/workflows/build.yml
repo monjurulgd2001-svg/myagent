@@ -79,8 +79,8 @@ jobs:
                   }
               }
           }
-          gradle.allprojects { prj ->
-              prj.buildscript {
+          gradle.allprojects {
+              buildscript {
                   repositories {
                       maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
                       google()
@@ -88,24 +88,36 @@ jobs:
                       gradlePluginPortal()
                   }
               }
-              // NORMAL dependency repos: used by Flutter's included ':gradle'
-              // build (flutter_tools/gradle) for :gradle:compileKotlin
-              // (kotlin-stdlib, asm, javawriter...). Previously only
-              // repo.maven.apache.org was tried there.
-              prj.repositories {
-                  maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
-                  google()
-                  mavenCentral()
-              }
           }
           EOF
+
+      - name: Patch Flutter's own Gradle tool to use the Maven mirror
+        # The failing task was :gradle:compileKotlin = Flutter SDK's
+        # packages/flutter_tools/gradle build. It declares its OWN
+        # repositories (google + mavenCentral), which an init script
+        # cannot safely override (Gradle: "prefer settings repositories").
+        # So we put the Google Maven Central mirror in front of
+        # mavenCentral() inside the SDK files themselves.
+        run: |
+          FR="${FLUTTER_ROOT:-$(dirname "$(dirname "$(which flutter)")")}"
+          GD="$FR/packages/flutter_tools/gradle"
+          echo "Flutter SDK: $FR"
+          ls -la "$GD"
+          for f in "$GD"/*.kts "$GD"/*.gradle; do
+            [ -f "$f" ] || continue
+            if grep -q 'mavenCentral()' "$f"; then
+              sed -i 's|^\([[:space:]]*\)mavenCentral()|\1maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }\n\1mavenCentral()|' "$f"
+              echo "Patched $f"
+              grep -n -B1 -A1 'maven-central.storage' "$f"
+            fi
+          done
 
       - name: Build release APK
         # arm64 only: the built-in GeckoView engine is bundled for
         # arm64-v8a (every Android 8+ phone from the last years).
         run: |
           flutter build apk --release --target-platform android-arm64 || {
-            echo "First attempt failed (likely flaky Maven download) - retrying in 30s..."
+            echo "First attempt failed - retrying in 30s (see first error above)..."
             sleep 30
             flutter build apk --release --target-platform android-arm64
           }
