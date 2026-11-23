@@ -1,0 +1,24 @@
+allprojects {
+    repositories {
+        google()
+        // Google's Maven Central mirror first (see settings.gradle):
+        // avoids the repo.maven.apache.org -> GitHub redirect that
+        // timed out (504) and killed a CI build on 2026-11-09.
+        maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
+        mavenCentral()
+        // GeckoView (built-in Firefox engine for the Gemini sign-in).
+        maven { url = uri("https://maven.mozilla.org/maven2/") }
+    }
+}
+
+rootProject.buildDir = "../build"
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(":app")
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}
